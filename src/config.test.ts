@@ -29,6 +29,7 @@ const DEFAULTS: Config = {
   hostfwdPortRange: { low: 1024, high: 65535 },
   allowHostNet: false,
   eventBufferSize: 256,
+  allowRawArgs: false,
 };
 
 describe('loadConfig', () => {
@@ -262,6 +263,15 @@ describe('loadConfig', () => {
       );
       expect(() => loadConfig({ QMP_MCP_EVENT_BUFFER_SIZE: '0' })).toThrowError(
         /QMP_MCP_EVENT_BUFFER_SIZE/,
+      );
+    });
+
+    it('reads QMP_MCP_ALLOW_RAW_ARGS, defaulting closed and failing closed on garbage', () => {
+      expect(loadConfig({}).allowRawArgs).toBe(false);
+      expect(loadConfig({ QMP_MCP_ALLOW_RAW_ARGS: 'true' }).allowRawArgs).toBe(true);
+      expect(loadConfig({ QMP_MCP_ALLOW_RAW_ARGS: 'false' }).allowRawArgs).toBe(false);
+      expect(() => loadConfig({ QMP_MCP_ALLOW_RAW_ARGS: 'yes' })).toThrowError(
+        /QMP_MCP_ALLOW_RAW_ARGS must be "true" or "false"/,
       );
     });
   });
