@@ -28,6 +28,13 @@ import {
   resolveMaxVcpus,
 } from '../config.js';
 import { logger } from '../logger.js';
+import {
+  buildPolicy,
+  CommandPolicyError,
+  decideCommand,
+  type ResolvedPolicy,
+  resolveCommandPolicy,
+} from '../policy/command-policy.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
 import {
@@ -122,6 +129,13 @@ export interface OrchestratorOptions {
    * is enforced (the singleton always injects it).
    */
   maxVcpus?: number;
+  /**
+   * The resolved Command Policy that governs which QMP commands the generic
+   * {@link Orchestrator.executeCommand} path may run (ADR-0003). Optional: when
+   * omitted, the built-in default-safe allowlist is used (the singleton injects
+   * the env/file-resolved policy).
+   */
+  commandPolicy?: ResolvedPolicy;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -165,6 +179,8 @@ export async function defaultSocketOccupied(path: string): Promise<boolean> {
 export class Orchestrator {
   #driver: QemuDriver;
   #options: OrchestratorOptions;
+  /** The Command Policy gating {@link executeCommand}; defaults to the allowlist. */
+  #commandPolicy: ResolvedPolicy;
   #state: InstanceState = 'NONE';
   #process?: InstanceProcess;
   #spec?: HardwareSpec;
@@ -179,6 +195,8 @@ export class Orchestrator {
   constructor(driver: QemuDriver, options: OrchestratorOptions) {
     this.#driver = driver;
     this.#options = options;
+    // Resolve the policy once: an omitted policy means the built-in allowlist.
+    this.#commandPolicy = options.commandPolicy ?? buildPolicy();
   }
 
   /** Return the current Instance view. Reports `NONE` when nothing is running. */
@@ -409,6 +427,24 @@ export class Orchestrator {
   }
 
   /**
+   * Run a generic QMP command against the running Instance, gated by the Command
+   * Policy (ADR-0003). The command name is checked FIRST: a denied command throws
+   * a {@link CommandPolicyError} and never reaches the QMP Session — fail-closed,
+   * and so a hard-denied command is refused even with no Instance running. Only an
+   * allowed command requires (and is forwarded to) the live Session, returning its
+   * QMP `return` value. The forwarded name is the normalised one, so trailing
+   * whitespace never reaches QEMU.
+   */
+  async executeCommand(command: string, args?: Record<string, unknown>): Promise<unknown> {
+    const verdict = decideCommand(this.#commandPolicy, command);
+    if (!verdict.allowed) {
+      throw new CommandPolicyError(verdict.reason, verdict.hardDenied);
+    }
+    const process = this.#requireInstance(`execute the QMP command "${verdict.command}"`);
+    return process.execute(verdict.command, args);
+  }
+
+  /**
    * Return the live {@link InstanceProcess} for an action that requires a running
    * Instance, or throw an actionable {@link LifecycleError} naming the action when
    * none exists. The handle is only present in RUNNING/PAUSED, so this also
@@ -455,6 +491,10 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Enforce the env-configurable memory/vCPU caps before launch (issue #9).
   maxMemoryMb: resolveMaxMemoryMb(process.env),
   maxVcpus: resolveMaxVcpus(process.env),
+  // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
+  // allowlist plus QMP_MCP_ALLOW/DENY and the optional QMP_MCP_POLICY_FILE
+  // overrides, with the immutable hard denylist always in force (ADR-0003, #11).
+  commandPolicy: resolveCommandPolicy(process.env),
   // `/dev/kvm` probe (single source of truth) from the hardware-spec module.
   kvmAvailable: probeKvm,
   socketOccupied: defaultSocketOccupied,
