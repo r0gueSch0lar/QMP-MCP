@@ -4,15 +4,18 @@
  *
  *   NONE → STARTING → RUNNING ⇄ PAUSED → STOPPED → NONE
  *
- * This slice implements the create/destroy transitions (NONE → STARTING →
- * RUNNING → STOPPED → NONE); PAUSED is reserved for the pause/resume slice.
+ * It implements create/destroy (NONE → STARTING → RUNNING → STOPPED → NONE), the
+ * RUNNING ⇄ PAUSED pause/resume transitions, and the in-place control commands
+ * (reset, ACPI powerdown, block/CPU queries, screendump) — each issued to the
+ * current Instance's QMP Session through its {@link InstanceProcess}.
  *
  * The Orchestrator depends on the {@link QemuDriver} port by constructor
  * injection, so its whole lifecycle is testable against the fake driver. The
  * process-global {@link orchestrator} singleton wires in the real driver.
  */
 
-import { stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -37,8 +40,9 @@ import {
 } from './hardware-spec.js';
 
 /**
- * The lifecycle states an Instance moves through. `PAUSED` is part of the
- * model but only reachable once the pause/resume slice lands.
+ * The lifecycle states an Instance moves through. `PAUSED` is entered by
+ * {@link Orchestrator.pauseInstance} (QMP `stop`) and left by
+ * {@link Orchestrator.resumeInstance} (QMP `cont`).
  */
 export type InstanceState = 'NONE' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'STOPPED';
 
@@ -60,6 +64,21 @@ export interface CreateInstanceResult {
   accel: Accel;
   /** Why that accelerator was chosen — reported to the agent (ADR-0008). */
   accelReason: string;
+}
+
+/**
+ * A captured Instance screenshot. The image bytes are returned inline (base64)
+ * rather than as a host path: the agent never learns or controls where the file
+ * lived, and the server deletes it after reading (see
+ * {@link Orchestrator.screendump}).
+ */
+export interface ScreendumpResult {
+  /** MIME type of the captured image. */
+  mimeType: string;
+  /** Base64-encoded image bytes, ready to hand back as MCP image content. */
+  data: string;
+  /** Size of the decoded image in bytes. */
+  bytes: number;
 }
 
 /** Knobs the Orchestrator needs that are not part of the Hardware Spec. */
@@ -297,12 +316,112 @@ export class Orchestrator {
    * when no Instance is running.
    */
   async getStatus(): Promise<unknown> {
+    return this.#requireInstance('query its status').execute('query-status');
+  }
+
+  /**
+   * Pause the running Instance's Guest CPUs via QMP `stop`, moving the lifecycle
+   * RUNNING → PAUSED (reflected by `get_status`/`query-status`, which then reports
+   * `paused`). Idempotent: pausing an already-PAUSED Instance re-issues the
+   * harmless `stop` and stays PAUSED. Rejects when no Instance is running.
+   */
+  async pauseInstance(): Promise<{ state: 'PAUSED' }> {
+    const process = this.#requireInstance('pause it');
+    await process.execute('stop');
+    this.#state = 'PAUSED';
+    logger.info('Instance PAUSED (QMP stop)');
+    return { state: 'PAUSED' };
+  }
+
+  /**
+   * Resume the Instance's Guest CPUs via QMP `cont`, moving the lifecycle
+   * PAUSED → RUNNING. Idempotent: resuming an already-RUNNING Instance re-issues
+   * the harmless `cont` and stays RUNNING. Rejects when no Instance is running.
+   */
+  async resumeInstance(): Promise<{ state: 'RUNNING' }> {
+    const process = this.#requireInstance('resume it');
+    await process.execute('cont');
+    this.#state = 'RUNNING';
+    logger.info('Instance RUNNING (QMP cont)');
+    return { state: 'RUNNING' };
+  }
+
+  /**
+   * Hard-reset the Instance via QMP `system_reset` (equivalent to the reset
+   * button). This reboots the Guest in place; it does not change the lifecycle
+   * state. Rejects when no Instance is running.
+   */
+  async resetInstance(): Promise<{ state: InstanceState }> {
+    const process = this.#requireInstance('reset it');
+    await process.execute('system_reset');
+    logger.info('Instance reset (QMP system_reset)');
+    return { state: this.#state };
+  }
+
+  /**
+   * Request a graceful Guest shutdown via QMP `system_powerdown` (sends an ACPI
+   * power-button event). This only *asks* the Guest to power off; the Instance
+   * keeps running until the Guest acts, so the lifecycle state is unchanged.
+   * Rejects when no Instance is running.
+   */
+  async powerdownInstance(): Promise<{ state: InstanceState }> {
+    const process = this.#requireInstance('power it down');
+    await process.execute('system_powerdown');
+    logger.info('Instance ACPI powerdown requested (QMP system_powerdown)');
+    return { state: this.#state };
+  }
+
+  /** Return the live QMP `query-block` result. Rejects when no Instance runs. */
+  async queryBlock(): Promise<unknown> {
+    return this.#requireInstance('list its block devices').execute('query-block');
+  }
+
+  /** Return the live QMP `query-cpus-fast` result. Rejects when no Instance runs. */
+  async queryCpus(): Promise<unknown> {
+    return this.#requireInstance('query its CPUs').execute('query-cpus-fast');
+  }
+
+  /**
+   * Capture a screenshot of the Instance's display via QMP `screendump` and
+   * return the image inline.
+   *
+   * SECURITY: QMP `screendump` writes an arbitrary host file at the path it is
+   * given, so the `filename` is ALWAYS server-chosen — a fresh, unique file under
+   * a server-controlled directory — and never agent-supplied (the method takes no
+   * path input). The bytes are read back, returned as base64, and the temp file is
+   * deleted, so the agent never learns or controls a host path. Rejects when no
+   * Instance is running.
+   */
+  async screendump(): Promise<ScreendumpResult> {
+    const process = this.#requireInstance('capture a screendump');
+    const dir = join(tmpdir(), 'qmp-mcp', 'screendumps');
+    await mkdir(dir, { recursive: true });
+    // Server-chosen, unguessable, single-use path — NOT influenced by the agent.
+    const filename = join(dir, `screendump-${randomUUID()}.png`);
+    try {
+      await process.execute('screendump', { filename, format: 'png' });
+      const bytes = await readFile(filename);
+      return { mimeType: 'image/png', data: bytes.toString('base64'), bytes: bytes.length };
+    } finally {
+      // Best-effort cleanup: never leave the captured frame on the host.
+      await rm(filename, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Return the live {@link InstanceProcess} for an action that requires a running
+   * Instance, or throw an actionable {@link LifecycleError} naming the action when
+   * none exists. The handle is only present in RUNNING/PAUSED, so this also
+   * fail-closes the STARTING/STOPPED/NONE cases.
+   */
+  #requireInstance(action: string): InstanceProcess {
     if (!this.#process) {
       throw new LifecycleError(
-        'No Instance is running. Create one with create_instance before querying its status.',
+        `No Instance is running, so there is nothing to ${action}. ` +
+          'Create one with create_instance first.',
       );
     }
-    return this.#process.execute('query-status');
+    return this.#process;
   }
 
   /** Reconcile state when the process exits without an explicit destroy. */

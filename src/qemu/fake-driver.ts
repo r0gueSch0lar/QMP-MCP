@@ -10,17 +10,31 @@ import type { InstanceProcess, LaunchRequest, QemuDriver, QmpEvent } from './dri
 /** Tunes how the fake behaves for a given test. */
 export interface FakeQemuDriverOptions {
   /**
-   * Canned responses keyed by QMP command name. `query-status` defaults to a
-   * running VM. A handler may be a value or a function of the command args.
+   * Canned responses keyed by QMP command name. A handler may be a value or a
+   * function of the command args (so a test can inspect what was sent, e.g. the
+   * server-chosen `screendump` filename). `query-status` needs no canned response:
+   * the fake answers it from a simulated run-state that `stop`/`cont` flip, so
+   * `get_status` reflects a pause without the test wiring it up. An explicit
+   * `query-status` entry still overrides that simulated default.
    */
   responses?: Record<string, unknown | ((args?: Record<string, unknown>) => unknown)>;
   /** When set, {@link QemuDriver.launch} rejects with this error. */
   launchError?: Error;
 }
 
+/**
+ * Commands every fake Instance answers out of the box. The lifecycle power
+ * commands (`stop`/`cont`/`system_reset`/`system_powerdown`) return QMP's empty
+ * success `{}` so a test need only assert they were *issued*; `stop`/`cont` also
+ * flip the simulated run-state (see {@link FakeInstanceProcess}). `query-status`
+ * is intentionally absent — it is answered dynamically from that run-state.
+ */
 const DEFAULT_RESPONSES: Record<string, unknown> = {
   qmp_capabilities: {},
-  'query-status': { status: 'running', running: true, singlestep: false },
+  stop: {},
+  cont: {},
+  system_reset: {},
+  system_powerdown: {},
 };
 
 /**
@@ -58,6 +72,8 @@ export class FakeInstanceProcess implements InstanceProcess {
   #responses: Record<string, unknown | ((args?: Record<string, unknown>) => unknown)>;
   #listeners = new Set<(event: QmpEvent) => void>();
   #resolveExited!: () => void;
+  /** Simulated Guest-CPU run-state: `stop` pauses it, `cont` resumes it. */
+  #running = true;
 
   constructor(responses: Record<string, unknown | ((args?: Record<string, unknown>) => unknown)>) {
     this.#responses = responses;
@@ -69,13 +85,21 @@ export class FakeInstanceProcess implements InstanceProcess {
   async execute(command: string, args?: Record<string, unknown>): Promise<unknown> {
     if (this.closed) throw new Error('Instance is closed.');
     this.executed.push({ command, args });
-    if (!(command in this.#responses)) {
-      throw new Error(`FakeInstanceProcess has no canned response for QMP command "${command}".`);
+    // Keep the simulated run-state consistent so a later `query-status` reflects
+    // the pause/resume the Orchestrator just performed (mirrors real QEMU).
+    if (command === 'stop') this.#running = false;
+    else if (command === 'cont') this.#running = true;
+    if (command in this.#responses) {
+      const response = this.#responses[command];
+      return typeof response === 'function'
+        ? (response as (args?: Record<string, unknown>) => unknown)(args)
+        : response;
     }
-    const response = this.#responses[command];
-    return typeof response === 'function'
-      ? (response as (args?: Record<string, unknown>) => unknown)(args)
-      : response;
+    // No explicit canned response: answer `query-status` from the run-state.
+    if (command === 'query-status') {
+      return { status: this.#running ? 'running' : 'paused', running: this.#running };
+    }
+    throw new Error(`FakeInstanceProcess has no canned response for QMP command "${command}".`);
   }
 
   onEvent(listener: (event: QmpEvent) => void): () => void {
