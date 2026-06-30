@@ -12,9 +12,14 @@
 
 import { accessSync, constants } from 'node:fs';
 import { z } from 'zod';
+import { IMAGE_FORMATS, ImageStoreError, resolveImagePath } from './image-store.js';
 
 /** Concrete accelerators QEMU can be launched with. */
 export type Accel = 'kvm' | 'tcg';
+
+/** Guest-visible disk controller a disk attaches through. */
+export const DISK_INTERFACES = ['virtio', 'ide', 'scsi'] as const;
+export type DiskInterface = (typeof DISK_INTERFACES)[number];
 
 /**
  * The requested accelerator. `auto` probes `/dev/kvm` and falls back to TCG;
@@ -28,16 +33,57 @@ export type AccelMode = (typeof ACCEL_MODES)[number];
  * rejected (`.strict()`) so a typo fails closed rather than being silently
  * ignored. Every field has a default, so an empty spec is valid.
  */
+/**
+ * A single guest disk. The image is referenced by NAME within the Image Store
+ * (ADR-0006), never by host path. `format` is part of the spec so it can be
+ * pinned explicitly into the argv — QEMU's format auto-probing is a known
+ * security footgun and is never relied upon.
+ */
+export const diskSchema = z
+  .object({
+    image: z
+      .string()
+      .min(1)
+      .describe('Name of a disk image in the Image Store (a bare name, never a host path).'),
+    interface: z
+      .enum(DISK_INTERFACES)
+      .default('virtio')
+      .describe("Disk controller: 'virtio' (default), 'ide', or 'scsi'."),
+    format: z
+      .enum(IMAGE_FORMATS)
+      .default('qcow2')
+      .describe("Image format pinned explicitly into the argv: 'qcow2' (default) or 'raw'."),
+    readonly: z.boolean().default(false).describe('Attach the disk read-only.'),
+  })
+  .strict();
+
+/** A validated disk entry (all defaults resolved). */
+export type Disk = z.infer<typeof diskSchema>;
+
+/**
+ * Conservative charset for `-machine`/`-cpu` model names: a leading alphanumeric
+ * then alphanumerics, dot, underscore, plus, or hyphen. It excludes the comma,
+ * space, and `=` that QEMU treats as QemuOpts property separators — a comma in
+ * `machine` would otherwise inject extra `-machine` properties. Raw multi-property
+ * machine/cpu strings are exactly the raw-args this design forbids.
+ */
+const VALID_MACHINE_CPU = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+
+const machineCpuMessage =
+  'must match ^[A-Za-z0-9][A-Za-z0-9._+-]* — letters, digits, dot, underscore, plus, ' +
+  "or hyphen, with no leading hyphen and no comma, space, or '=' (these could inject " +
+  'QEMU -machine/-cpu properties).';
+
 export const hardwareSpecSchema = z
   .object({
     machine: z
       .string()
-      .min(1)
+      .regex(VALID_MACHINE_CPU, `machine ${machineCpuMessage}`)
       .default('q35')
       .describe('QEMU machine type, e.g. "q35" (default) or "pc".'),
     cpu: z
       .string()
-      .min(1)
+      .regex(VALID_MACHINE_CPU, `cpu ${machineCpuMessage}`)
       .default('max')
       .describe('CPU model passed to -cpu, e.g. "max" (default) or "host".'),
     vcpus: z.number().int().min(1).max(255).default(1).describe('Number of virtual CPUs (1-255).'),
@@ -54,6 +100,10 @@ export const hardwareSpecSchema = z
       .describe(
         "Accelerator: 'auto' probes /dev/kvm and falls back to TCG, 'kvm' requires /dev/kvm, 'tcg' is software emulation.",
       ),
+    disks: z
+      .array(diskSchema)
+      .default([])
+      .describe('Guest disks, each referencing an image by name in the Image Store.'),
   })
   .strict();
 
@@ -167,6 +217,58 @@ export interface ArgvOptions {
   accel: Accel;
   /** Absolute path of the server-managed QMP UNIX socket. */
   qmpSocketPath: string;
+  /**
+   * Absolute path of the Image Store directory (ADR-0006). Required only when the
+   * spec has disks; each disk's image name is resolved against it. Omitting it
+   * for a spec that has disks fails closed.
+   */
+  imageDir?: string;
+}
+
+/**
+ * Comma-escape a value interpolated into a QemuOpts property string
+ * (`-drive`/`-machine`), where a literal comma must be doubled (`,,`). This is
+ * defense-in-depth: the validators already reject commas in agent-controlled
+ * names, but the resolved file path is host/Store-derived, so escaping it here
+ * guarantees a comma in the Image Store path can never split off an extra
+ * property no matter what the path contains.
+ */
+function escapeQemuOptsValue(value: string): string {
+  return value.replaceAll(',', ',,');
+}
+
+/**
+ * Resolve a disk's image name to a safe in-Store path and render a `-drive`
+ * argument pair. The format is taken from the validated spec and written as an
+ * explicit `format=` — QEMU's auto-probing is never relied upon. Any out-of-store,
+ * absolute, traversal, or symlink-escape reference is rejected here (argv time)
+ * as a {@link HardwareSpecError}.
+ */
+function buildDriveArgs(disk: Disk, imageDir: string | undefined): [string, string] {
+  if (imageDir === undefined || imageDir.trim() === '') {
+    throw new HardwareSpecError(
+      `Disk "${disk.image}" was requested but the Image Store directory is not configured. ` +
+        `Set QMP_MCP_IMAGE_DIR to the Image Store path.`,
+    );
+  }
+  let path: string;
+  try {
+    path = resolveImagePath(disk.image, imageDir);
+  } catch (err) {
+    const detail = err instanceof ImageStoreError ? err.message : String(err);
+    throw new HardwareSpecError(`Invalid disk reference: ${detail}`);
+  }
+  // Explicit format= defeats QEMU format auto-probing (a known security footgun).
+  // The path is comma-escaped so it cannot inject extra -drive properties; format
+  // and interface are closed enums, so they carry no comma to escape.
+  const parts = [
+    `file=${escapeQemuOptsValue(path)}`,
+    `format=${disk.format}`,
+    `if=${disk.interface}`,
+    'media=disk',
+  ];
+  if (disk.readonly) parts.push('readonly=on');
+  return ['-drive', parts.join(',')];
 }
 
 /**
@@ -179,9 +281,9 @@ export interface ArgvOptions {
  * code runs. The QMP monitor is exposed on a UNIX socket the server owns.
  */
 export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
-  return [
+  const argv = [
     '-machine',
-    `${spec.machine},accel=${options.accel}`,
+    `${escapeQemuOptsValue(spec.machine)},accel=${options.accel}`,
     '-cpu',
     spec.cpu,
     '-smp',
@@ -191,7 +293,10 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
     '-nodefaults',
     '-nographic',
     '-S',
-    '-qmp',
-    `unix:${options.qmpSocketPath},server=on,wait=off`,
   ];
+  for (const disk of spec.disks) {
+    argv.push(...buildDriveArgs(disk, options.imageDir));
+  }
+  argv.push('-qmp', `unix:${options.qmpSocketPath},server=on,wait=off`);
+  return argv;
 }

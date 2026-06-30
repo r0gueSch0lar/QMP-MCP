@@ -1,5 +1,10 @@
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { type Config, ConfigError, loadConfig } from './config.js';
+
+/** The host-agnostic default Image Store dir for an empty environment. */
+const DEFAULT_IMAGE_DIR = join(tmpdir(), 'qmp-mcp', 'images');
 
 /** The full default config when the environment is empty (stdio, no auth). */
 const DEFAULTS: Config = {
@@ -13,6 +18,8 @@ const DEFAULTS: Config = {
   apiKeys: [],
   jwtSecret: undefined,
   allowInsecure: false,
+  imageDir: DEFAULT_IMAGE_DIR,
+  maxDiskGb: 64,
 };
 
 describe('loadConfig', () => {
@@ -183,6 +190,31 @@ describe('loadConfig', () => {
       expect(() =>
         loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_ALLOW_INSECURE: 'yes' }),
       ).toThrowError(/QMP_MCP_ALLOW_INSECURE must be "true" or "false"/);
+    });
+  });
+
+  describe('Image Store (ADR-0006)', () => {
+    it('defaults the Image Store dir host-agnostically and the size cap to 64 GiB', () => {
+      const config = loadConfig({});
+      expect(config.imageDir).toBe(DEFAULT_IMAGE_DIR);
+      expect(config.maxDiskGb).toBe(64);
+    });
+
+    it('takes an explicit QMP_MCP_IMAGE_DIR verbatim, trimmed', () => {
+      expect(loadConfig({ QMP_MCP_IMAGE_DIR: ' /srv/images ' }).imageDir).toBe('/srv/images');
+    });
+
+    it('derives the default dir from XDG_DATA_HOME, then HOME', () => {
+      expect(loadConfig({ XDG_DATA_HOME: '/x/data' }).imageDir).toBe('/x/data/qmp-mcp/images');
+      expect(loadConfig({ HOME: '/home/u' }).imageDir).toBe('/home/u/.local/share/qmp-mcp/images');
+    });
+
+    it('reads QMP_MCP_MAX_DISK_GB and fails closed on a non-positive-integer value', () => {
+      expect(loadConfig({ QMP_MCP_MAX_DISK_GB: '128' }).maxDiskGb).toBe(128);
+      expect(() => loadConfig({ QMP_MCP_MAX_DISK_GB: 'big' })).toThrowError(
+        /QMP_MCP_MAX_DISK_GB must be a positive integer/,
+      );
+      expect(() => loadConfig({ QMP_MCP_MAX_DISK_GB: '0' })).toThrowError(/QMP_MCP_MAX_DISK_GB/);
     });
   });
 
