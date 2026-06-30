@@ -86,6 +86,18 @@ export interface Config {
    */
   maxDiskGb: number;
   /**
+   * Hard cap, in MiB, on a Hardware Spec's `memoryMb` (`QMP_MCP_MAX_MEMORY_MB`,
+   * default 4096). A spec requesting more guest RAM is rejected before qemu is
+   * spawned, naming this cap (issue #9).
+   */
+  maxMemoryMb: number;
+  /**
+   * Hard cap on a Hardware Spec's `vcpus` (`QMP_MCP_MAX_VCPUS`, default 2). A
+   * spec requesting more virtual CPUs is rejected before qemu is spawned, naming
+   * this cap (issue #9).
+   */
+  maxVcpus: number;
+  /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (`QMP_MCP_HOSTFWD_PORT_RANGE`, default 1024-65535). A forward to a
    * host port outside it is rejected naming the range (ADR-0009).
@@ -248,6 +260,24 @@ export function resolveMaxDiskGb(env: NodeJS.ProcessEnv): number {
 }
 
 /**
+ * Resolve the maximum guest-memory cap in MiB (`QMP_MCP_MAX_MEMORY_MB`, default
+ * 4096). Positive-integer, fail-closed on garbage. Exported so the Orchestrator
+ * singleton and {@link loadConfig} share one source of truth (issue #9).
+ */
+export function resolveMaxMemoryMb(env: NodeJS.ProcessEnv): number {
+  return parsePositiveInt('QMP_MCP_MAX_MEMORY_MB', env.QMP_MCP_MAX_MEMORY_MB, 4096);
+}
+
+/**
+ * Resolve the maximum vCPU cap (`QMP_MCP_MAX_VCPUS`, default 2). Positive-integer,
+ * fail-closed on garbage. Exported so the Orchestrator singleton and
+ * {@link loadConfig} share one source of truth (issue #9).
+ */
+export function resolveMaxVcpus(env: NodeJS.ProcessEnv): number {
+  return parsePositiveInt('QMP_MCP_MAX_VCPUS', env.QMP_MCP_MAX_VCPUS, 2);
+}
+
+/**
  * Resolve the user-mode port-forward host-port range (`QMP_MCP_HOSTFWD_PORT_RANGE`,
  * default {@link DEFAULT_HOSTFWD_PORT_RANGE}). Exported so the Orchestrator
  * singleton and {@link loadConfig} share one source of truth (ADR-0009).
@@ -346,6 +376,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     imageDir: resolveImageDir(env),
     isoDir: resolveIsoDir(env),
     maxDiskGb: resolveMaxDiskGb(env),
+    maxMemoryMb: resolveMaxMemoryMb(env),
+    maxVcpus: resolveMaxVcpus(env),
     hostfwdPortRange: resolveHostfwdPortRange(env),
     allowHostNet: resolveAllowHostNet(env),
   };

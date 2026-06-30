@@ -109,6 +109,73 @@ describe('buildArgv', () => {
   });
 });
 
+describe('buildArgv resource caps (issue #9)', () => {
+  it('rejects memoryMb over QMP_MCP_MAX_MEMORY_MB, naming the cap and requested/allowed', () => {
+    const call = () =>
+      buildArgv(spec({ memoryMb: 8192 }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        maxMemoryMb: 4096,
+      });
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/memoryMb 8192 exceeds QMP_MCP_MAX_MEMORY_MB=4096/);
+  });
+
+  it('accepts memoryMb at the cap, emitting -m unchanged', () => {
+    const argv = buildArgv(spec({ memoryMb: 4096 }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      maxMemoryMb: 4096,
+    });
+    expect(argv[argv.indexOf('-m') + 1]).toBe('4096');
+  });
+
+  it('accepts memoryMb under the cap', () => {
+    const argv = buildArgv(spec({ memoryMb: 2048 }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      maxMemoryMb: 4096,
+    });
+    expect(argv[argv.indexOf('-m') + 1]).toBe('2048');
+  });
+
+  it('rejects vcpus over QMP_MCP_MAX_VCPUS, naming the cap and requested/allowed', () => {
+    const call = () =>
+      buildArgv(spec({ vcpus: 8 }), { accel: 'tcg', qmpSocketPath: SOCK, maxVcpus: 2 });
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/vcpus 8 exceeds QMP_MCP_MAX_VCPUS=2/);
+  });
+
+  it('accepts vcpus at the cap, emitting -smp unchanged', () => {
+    const argv = buildArgv(spec({ vcpus: 2 }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      maxVcpus: 2,
+    });
+    expect(argv[argv.indexOf('-smp') + 1]).toBe('2');
+  });
+
+  it('admits a larger spec when a higher cap is injected', () => {
+    // The cap is injected (env-configurable), so raising it admits a bigger spec.
+    const argv = buildArgv(spec({ memoryMb: 32768, vcpus: 16 }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      maxMemoryMb: 65536,
+      maxVcpus: 32,
+    });
+    expect(argv[argv.indexOf('-m') + 1]).toBe('32768');
+    expect(argv[argv.indexOf('-smp') + 1]).toBe('16');
+  });
+
+  it('skips the checks when no caps are injected (caps live outside the schema)', () => {
+    // Without injected caps there is no enforcement — the Orchestrator always
+    // injects them, so create_instance stays fail-closed.
+    expect(() =>
+      buildArgv(spec({ memoryMb: 1_000_000, vcpus: 200 }), { accel: 'tcg', qmpSocketPath: SOCK }),
+    ).not.toThrow();
+  });
+});
+
 describe('buildArgv disks', () => {
   let store: string;
 
