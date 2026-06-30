@@ -106,7 +106,16 @@ docker-build:
     DOCKER_TLS_VERIFY: "1"
     DOCKER_CERT_PATH: "/certs/client"
   before_script:
-    - docker info
+    # Wait for the dind daemon: its TLS certs (/certs/client) are written
+    # asynchronously, so a single early `docker info` races and fails with
+    # "open /certs/client/ca.pem: no such file or directory".
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        echo "waiting for dockerd (dind) to be ready ($i/30)..."
+        sleep 2
+      done
+      docker info
   script:
     - docker build -t "qmp-mcp:${CI_COMMIT_SHORT_SHA}" .
     - |
