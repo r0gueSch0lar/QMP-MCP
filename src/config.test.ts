@@ -24,6 +24,8 @@ const DEFAULTS: Config = {
   imageDir: DEFAULT_IMAGE_DIR,
   isoDir: DEFAULT_ISO_DIR,
   maxDiskGb: 64,
+  maxMemoryMb: 4096,
+  maxVcpus: 2,
   hostfwdPortRange: { low: 1024, high: 65535 },
   allowHostNet: false,
 };
@@ -221,6 +223,34 @@ describe('loadConfig', () => {
         /QMP_MCP_MAX_DISK_GB must be a positive integer/,
       );
       expect(() => loadConfig({ QMP_MCP_MAX_DISK_GB: '0' })).toThrowError(/QMP_MCP_MAX_DISK_GB/);
+    });
+  });
+
+  describe('resource caps (issue #9)', () => {
+    it('defaults the memory cap to 4096 MiB and the vCPU cap to 2', () => {
+      const config = loadConfig({});
+      expect(config.maxMemoryMb).toBe(4096);
+      expect(config.maxVcpus).toBe(2);
+    });
+
+    it('reads QMP_MCP_MAX_MEMORY_MB and fails closed on a non-positive-integer value', () => {
+      // A higher env cap admits a larger spec.
+      expect(loadConfig({ QMP_MCP_MAX_MEMORY_MB: '32768' }).maxMemoryMb).toBe(32768);
+      expect(() => loadConfig({ QMP_MCP_MAX_MEMORY_MB: 'lots' })).toThrowError(
+        /QMP_MCP_MAX_MEMORY_MB must be a positive integer/,
+      );
+      expect(() => loadConfig({ QMP_MCP_MAX_MEMORY_MB: '0' })).toThrowError(
+        /QMP_MCP_MAX_MEMORY_MB/,
+      );
+    });
+
+    it('reads QMP_MCP_MAX_VCPUS and fails closed on a non-positive-integer value', () => {
+      // A higher env cap admits a larger spec.
+      expect(loadConfig({ QMP_MCP_MAX_VCPUS: '16' }).maxVcpus).toBe(16);
+      expect(() => loadConfig({ QMP_MCP_MAX_VCPUS: 'many' })).toThrowError(
+        /QMP_MCP_MAX_VCPUS must be a positive integer/,
+      );
+      expect(() => loadConfig({ QMP_MCP_MAX_VCPUS: '0' })).toThrowError(/QMP_MCP_MAX_VCPUS/);
     });
   });
 

@@ -90,6 +90,20 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(orch.getInstance().state).toBe('NONE');
   });
 
+  it('rejects an over-cap spec before launching, naming the cap (issue #9)', async () => {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver, { maxMemoryMb: 4096, maxVcpus: 2 });
+    await expect(orch.createInstance({ memoryMb: 8192 })).rejects.toThrowError(
+      /memoryMb 8192 exceeds QMP_MCP_MAX_MEMORY_MB=4096/,
+    );
+    await expect(orch.createInstance({ vcpus: 4 })).rejects.toThrowError(
+      /vcpus 4 exceeds QMP_MCP_MAX_VCPUS=2/,
+    );
+    // Fail-closed: no qemu was launched and the Instance stays NONE.
+    expect(driver.launches).toHaveLength(0);
+    expect(orch.getInstance().state).toBe('NONE');
+  });
+
   it('get_status returns the live QMP query-status result', async () => {
     const driver = new FakeQemuDriver({
       responses: { 'query-status': { status: 'prelaunch', running: false } },
