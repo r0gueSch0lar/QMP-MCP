@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   AccelError,
   buildArgv,
@@ -23,7 +26,21 @@ describe('parseHardwareSpec', () => {
       vcpus: 1,
       memoryMb: 256,
       accel: 'auto',
+      disks: [],
     });
+  });
+
+  it('defaults a disk entry (interface=virtio, format=qcow2, readonly=false)', () => {
+    const parsed = parseHardwareSpec({ disks: [{ image: 'root.qcow2' }] });
+    expect(parsed.disks).toEqual([
+      { image: 'root.qcow2', interface: 'virtio', format: 'qcow2', readonly: false },
+    ]);
+  });
+
+  it('rejects an unknown field inside a disk, failing closed', () => {
+    expect(() => parseHardwareSpec({ disks: [{ image: 'd', path: '/x' }] })).toThrow(
+      HardwareSpecError,
+    );
   });
 
   it('rejects an unknown field, failing closed', () => {
@@ -37,6 +54,18 @@ describe('parseHardwareSpec', () => {
 
   it('coerces nothing: a non-integer vcpu count is rejected', () => {
     expect(() => parseHardwareSpec({ vcpus: 1.5 })).toThrowError(/vcpus/);
+  });
+
+  it('rejects a machine value with an injected QemuOpts property (comma)', () => {
+    // "q35,accel=tcg" would override accel and inject -machine properties.
+    expect(() => parseHardwareSpec({ machine: 'q35,accel=tcg' })).toThrowError(HardwareSpecError);
+    expect(() => parseHardwareSpec({ machine: 'q35,accel=tcg' })).toThrowError(/machine/);
+  });
+
+  it('rejects a cpu value with an injected property (comma) and accepts a plain model', () => {
+    expect(() => parseHardwareSpec({ cpu: 'host,+vmx' })).toThrowError(/cpu/);
+    expect(() => parseHardwareSpec({ machine: 'q35', cpu: 'max' })).not.toThrow();
+    expect(parseHardwareSpec({ machine: 'q35', cpu: 'max' }).machine).toBe('q35');
   });
 });
 
@@ -74,6 +103,133 @@ describe('buildArgv', () => {
   it('is pure: same inputs yield an equal argv', () => {
     const opts = { accel: 'tcg', qmpSocketPath: SOCK } as const;
     expect(buildArgv(spec(), opts)).toEqual(buildArgv(spec(), opts));
+  });
+});
+
+describe('buildArgv disks', () => {
+  let store: string;
+
+  beforeAll(async () => {
+    store = await mkdtemp(join(tmpdir(), 'hw-disks-'));
+    await writeFile(join(store, 'root.qcow2'), '');
+  });
+
+  afterAll(async () => {
+    await rm(store, { recursive: true, force: true });
+  });
+
+  it('emits a -drive with an explicit format for a valid in-store disk', () => {
+    const argv = buildArgv(spec({ disks: [{ image: 'root.qcow2' }] }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      imageDir: store,
+    });
+    const drive = argv[argv.indexOf('-drive') + 1] ?? '';
+    expect(drive).toContain(`file=${join(store, 'root.qcow2')}`);
+    // Format is pinned explicitly — never left to QEMU's auto-probing.
+    expect(drive).toContain('format=qcow2');
+    expect(drive).toContain('if=virtio');
+    expect(drive).not.toContain('readonly=on');
+  });
+
+  it('marks a readonly disk and honours the interface', () => {
+    const argv = buildArgv(
+      spec({ disks: [{ image: 'root.qcow2', interface: 'ide', readonly: true }] }),
+      { accel: 'tcg', qmpSocketPath: SOCK, imageDir: store },
+    );
+    const drive = argv[argv.indexOf('-drive') + 1] ?? '';
+    expect(drive).toContain('if=ide');
+    expect(drive).toContain('readonly=on');
+  });
+
+  it('rejects an absolute disk reference at argv time', () => {
+    expect(() =>
+      buildArgv(spec({ disks: [{ image: '/etc/passwd' }] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        imageDir: store,
+      }),
+    ).toThrow(HardwareSpecError);
+  });
+
+  it('rejects a `..` traversal disk reference at argv time', () => {
+    expect(() =>
+      buildArgv(spec({ disks: [{ image: '../escape.qcow2' }] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        imageDir: store,
+      }),
+    ).toThrowError(/separator|valid file name/);
+  });
+
+  it('rejects an out-of-store (non-existent name) reference only via containment, and fails closed without an Image Store dir', () => {
+    expect(() =>
+      buildArgv(spec({ disks: [{ image: 'root.qcow2' }] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      }),
+    ).toThrowError(/QMP_MCP_IMAGE_DIR/);
+  });
+
+  it('rejects a symlink that escapes the Store at argv time', async () => {
+    await symlink('/etc/passwd', join(store, 'evil.qcow2'));
+    expect(() =>
+      buildArgv(spec({ disks: [{ image: 'evil.qcow2' }] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        imageDir: store,
+      }),
+    ).toThrowError(/symlink escape/);
+  });
+});
+
+describe('buildArgv -drive option injection', () => {
+  // The Store dir path deliberately contains a comma so we exercise the
+  // comma-escaping of the host-derived file path (defense in depth).
+  let store: string;
+
+  beforeAll(async () => {
+    store = await mkdtemp(join(tmpdir(), 'hw,disks-'));
+    await writeFile(join(store, 'root.qcow2'), '');
+  });
+
+  afterAll(async () => {
+    await rm(store, { recursive: true, force: true });
+  });
+
+  it('rejects a disk name carrying an extra property, so -drive cannot gain one', () => {
+    // Without the allowlist, "root.qcow2,readonly=on" would inject readonly=on.
+    expect(() =>
+      buildArgv(spec({ disks: [{ image: 'root.qcow2,readonly=on' }] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        imageDir: store,
+      }),
+    ).toThrowError(HardwareSpecError);
+  });
+
+  it('comma-escapes the resolved file path so the path cannot split into extra props', () => {
+    const path = join(store, 'root.qcow2');
+    expect(path).toContain(','); // sanity: the Store path really has a comma
+    const argv = buildArgv(spec({ disks: [{ image: 'root.qcow2' }] }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      imageDir: store,
+    });
+    const drive = argv[argv.indexOf('-drive') + 1] ?? '';
+    // The literal comma in the path is doubled; the property list is exactly the
+    // four intended properties — no extra property is introduced by the path.
+    expect(drive).toBe(`file=${path.replaceAll(',', ',,')},format=qcow2,if=virtio,media=disk`);
+    // A QemuOpts parser splits on a *single* comma (a doubled comma is a literal
+    // comma); doing so must yield exactly the four intended key=value tokens.
+    expect(drive.replaceAll(',,', ' ').split(',')).toHaveLength(4);
+  });
+
+  it('comma-escapes the -machine value so machine cannot gain a property', () => {
+    // machine itself is allowlisted, but verify the interpolation is escaped too:
+    // a hypothetical comma in the value is doubled rather than splitting.
+    const argv = buildArgv(spec({ machine: 'q35' }), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv[argv.indexOf('-machine') + 1]).toBe('q35,accel=tcg');
   });
 });
 
