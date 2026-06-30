@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MCPServer } from 'mcp-framework';
 import { type Config, ConfigError, loadConfig } from './config.js';
+import { orchestrator } from './instance/orchestrator.js';
 import { logger, setLogLevel } from './logger.js';
 
 /** Directory of the compiled entrypoint (i.e. `dist`). */
@@ -62,8 +63,39 @@ async function main(): Promise<void> {
     logging: true,
   });
 
+  // ADR-0004: the Instance's lifetime is the server's lifetime. On shutdown we
+  // must tear down qemu, or it is orphaned (or lingers holding the QMP socket).
+  // One-shot and idempotent: every trigger awaits the same teardown so the
+  // process never exits while qemu is still being stopped.
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (reason: string): Promise<void> => {
+    if (!shutdownPromise) {
+      shutdownPromise = (async () => {
+        if (orchestrator.getInstance().state === 'NONE') return;
+        logger.info(`shutting down (${reason}): destroying the running Instance`);
+        try {
+          await orchestrator.destroyInstance();
+        } catch (err) {
+          logger.error(
+            `failed to destroy the Instance during shutdown: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      })();
+    }
+    return shutdownPromise;
+  };
+  // SIGINT/SIGTERM stop the server (the framework also handles these to unwind
+  // its transports); our handler guarantees qemu is destroyed first.
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
   logger.info('starting qmp-mcp (transport=stdio)');
+  // start() resolves when the server stops (signal, or stdin/transport close),
+  // so this also covers the stdin end hook. Tear down the Instance before exit.
   await server.start();
+  await shutdown('server stopped');
 }
 
 main().catch((err: unknown) => {
