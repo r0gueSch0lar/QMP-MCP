@@ -15,6 +15,7 @@
 import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolveImageDir } from '../config.js';
 import { logger } from '../logger.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
@@ -59,6 +60,12 @@ export interface OrchestratorOptions {
   binary: string;
   /** Server-managed path of the QMP UNIX socket. */
   qmpSocketPath: string;
+  /**
+   * Absolute path of the Image Store directory (ADR-0006). Disk names in the
+   * spec are resolved against it when building the argv. Optional: a diskless
+   * spec never needs it.
+   */
+  imageDir?: string;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -167,7 +174,11 @@ export class Orchestrator {
         );
       }
 
-      const argv = buildArgv(spec, { accel: resolution.accel, qmpSocketPath });
+      const argv = buildArgv(spec, {
+        accel: resolution.accel,
+        qmpSocketPath,
+        imageDir: this.#options.imageDir,
+      });
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
       let process: InstanceProcess;
@@ -273,6 +284,8 @@ export class Orchestrator {
 export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   binary: 'qemu-system-x86_64',
   qmpSocketPath: defaultQmpSocketPath(),
+  // Resolve disk names against the configured Image Store (ADR-0006).
+  imageDir: resolveImageDir(process.env),
   // `/dev/kvm` probe (single source of truth) from the hardware-spec module.
   kvmAvailable: probeKvm,
   socketOccupied: defaultSocketOccupied,
