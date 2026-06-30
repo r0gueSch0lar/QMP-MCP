@@ -13,6 +13,7 @@
 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DEFAULT_EVENT_BUFFER_SIZE } from './instance/event-buffer.js';
 
 export type TransportMode = 'stdio' | 'http' | 'both';
 export type LogLevel = 'debug' | 'info' | 'warning' | 'error';
@@ -110,6 +111,13 @@ export interface Config {
    * host privileges incompatible with the non-root posture (ADR-0008/0009).
    */
   allowHostNet: boolean;
+  /**
+   * Capacity of the Event Buffer — the bounded ring of recent QMP async events
+   * the agent reads via `get_events`/`wait_for_event` (`QMP_MCP_EVENT_BUFFER_SIZE`,
+   * default {@link DEFAULT_EVENT_BUFFER_SIZE}). Once full, the oldest event is
+   * evicted, so the buffer never grows without bound (issue #12).
+   */
+  eventBufferSize: number;
 }
 
 /**
@@ -300,6 +308,20 @@ export function resolveAllowHostNet(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve the Event Buffer capacity (`QMP_MCP_EVENT_BUFFER_SIZE`, default
+ * {@link DEFAULT_EVENT_BUFFER_SIZE}). Positive-integer, fail-closed on garbage.
+ * Exported so the Orchestrator singleton and {@link loadConfig} share one source
+ * of truth (issue #12).
+ */
+export function resolveEventBufferSize(env: NodeJS.ProcessEnv): number {
+  return parsePositiveInt(
+    'QMP_MCP_EVENT_BUFFER_SIZE',
+    env.QMP_MCP_EVENT_BUFFER_SIZE,
+    DEFAULT_EVENT_BUFFER_SIZE,
+  );
+}
+
+/**
  * Split a comma-separated list env var into trimmed, non-empty entries.
  * Undefined yields an empty list.
  */
@@ -380,5 +402,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     maxVcpus: resolveMaxVcpus(env),
     hostfwdPortRange: resolveHostfwdPortRange(env),
     allowHostNet: resolveAllowHostNet(env),
+    eventBufferSize: resolveEventBufferSize(env),
   };
 }
