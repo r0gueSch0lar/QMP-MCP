@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -177,6 +177,163 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     // Crucially: only one qemu was ever launched.
     expect(driver.launches).toHaveLength(1);
     expect(orch.getInstance().state).toBe('RUNNING');
+  });
+});
+
+describe('Orchestrator control commands (fake driver)', () => {
+  /** Create an Instance and hand back the orchestrator + its fake process. */
+  async function running(options: Partial<OrchestratorOptions> = {}, driverOptions = {}) {
+    const driver = new FakeQemuDriver(driverOptions);
+    const orch = makeOrchestrator(driver, options);
+    await orch.createInstance({});
+    // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
+    const process = driver.lastProcess!;
+    return { orch, process };
+  }
+
+  /** The QMP command names issued on the fake process, in order. */
+  const commands = (process: { executed: Array<{ command: string }> }): string[] =>
+    process.executed.map((e) => e.command);
+
+  it('pause issues QMP stop and moves RUNNING -> PAUSED (reflected by get_status)', async () => {
+    const { orch, process } = await running();
+    expect(orch.getInstance().state).toBe('RUNNING');
+
+    const result = await orch.pauseInstance();
+
+    expect(result).toEqual({ state: 'PAUSED' });
+    expect(orch.getInstance().state).toBe('PAUSED');
+    expect(commands(process)).toContain('stop');
+    // get_status (live query-status) reflects the pause.
+    expect(await orch.getStatus()).toMatchObject({ status: 'paused', running: false });
+  });
+
+  it('resume issues QMP cont and moves PAUSED -> RUNNING (reflected by get_status)', async () => {
+    const { orch, process } = await running();
+    await orch.pauseInstance();
+
+    const result = await orch.resumeInstance();
+
+    expect(result).toEqual({ state: 'RUNNING' });
+    expect(orch.getInstance().state).toBe('RUNNING');
+    expect(commands(process)).toEqual(expect.arrayContaining(['stop', 'cont']));
+    expect(await orch.getStatus()).toMatchObject({ status: 'running', running: true });
+  });
+
+  it('pause is idempotent: pausing an already-PAUSED Instance stays PAUSED', async () => {
+    const { orch } = await running();
+    await orch.pauseInstance();
+    await expect(orch.pauseInstance()).resolves.toEqual({ state: 'PAUSED' });
+    expect(orch.getInstance().state).toBe('PAUSED');
+  });
+
+  it('resume is idempotent: resuming a RUNNING Instance stays RUNNING', async () => {
+    const { orch } = await running();
+    await expect(orch.resumeInstance()).resolves.toEqual({ state: 'RUNNING' });
+    expect(orch.getInstance().state).toBe('RUNNING');
+  });
+
+  it('reset issues QMP system_reset and leaves the lifecycle state unchanged', async () => {
+    const { orch, process } = await running();
+    const result = await orch.resetInstance();
+    expect(result).toEqual({ state: 'RUNNING' });
+    expect(orch.getInstance().state).toBe('RUNNING');
+    expect(commands(process)).toContain('system_reset');
+  });
+
+  it('powerdown issues QMP system_powerdown and leaves the lifecycle state unchanged', async () => {
+    const { orch, process } = await running();
+    const result = await orch.powerdownInstance();
+    expect(result).toEqual({ state: 'RUNNING' });
+    expect(orch.getInstance().state).toBe('RUNNING');
+    expect(commands(process)).toContain('system_powerdown');
+  });
+
+  it('list_block_devices issues query-block and returns the canned result', async () => {
+    const canned = [{ device: 'virtio0', inserted: { file: 'disk.qcow2' } }];
+    const { orch, process } = await running({}, { responses: { 'query-block': canned } });
+    expect(await orch.queryBlock()).toEqual(canned);
+    expect(commands(process)).toContain('query-block');
+  });
+
+  it('query_cpus issues query-cpus-fast and returns the canned result', async () => {
+    const canned = [{ 'cpu-index': 0, 'thread-id': 4242, target: 'x86_64' }];
+    const { orch, process } = await running({}, { responses: { 'query-cpus-fast': canned } });
+    expect(await orch.queryCpus()).toEqual(canned);
+    expect(commands(process)).toContain('query-cpus-fast');
+  });
+
+  it('screendump issues QMP screendump to a SERVER-chosen path and returns image content', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    // The fake plays qemu: it writes the image to whatever path the SERVER chose.
+    const { orch, process } = await running(
+      {},
+      {
+        responses: {
+          screendump: async (args?: Record<string, unknown>) => {
+            await writeFile(args?.filename as string, png);
+            return {};
+          },
+        },
+      },
+    );
+
+    const result = await orch.screendump();
+
+    // Image is returned inline (base64 PNG), not as a host path.
+    expect(result).toEqual({
+      mimeType: 'image/png',
+      data: png.toString('base64'),
+      bytes: png.length,
+    });
+
+    // The filename was server-chosen, under a server-controlled directory, and
+    // the method takes no path input, so the agent cannot influence it.
+    const call = process.executed.find((e) => e.command === 'screendump');
+    const filename = call?.args?.filename as string;
+    expect(filename.startsWith(join(tmpdir(), 'qmp-mcp', 'screendumps'))).toBe(true);
+    expect(filename.endsWith('.png')).toBe(true);
+    expect(call?.args?.format).toBe('png');
+
+    // The temp file is cleaned up after the bytes are read back.
+    await expect(stat(filename)).rejects.toThrow();
+  });
+
+  it('screendump paths are unguessable and unique per capture', async () => {
+    const seen = new Set<string>();
+    const { orch, process } = await running(
+      {},
+      {
+        responses: {
+          screendump: async (args?: Record<string, unknown>) => {
+            await writeFile(args?.filename as string, Buffer.from('x'));
+            return {};
+          },
+        },
+      },
+    );
+    await orch.screendump();
+    await orch.screendump();
+    for (const e of process.executed) {
+      if (e.command === 'screendump') seen.add(e.args?.filename as string);
+    }
+    expect(seen.size).toBe(2);
+  });
+
+  it('every control command rejects (actionably) when no Instance is running', async () => {
+    const orch = makeOrchestrator(new FakeQemuDriver());
+    for (const op of [
+      () => orch.pauseInstance(),
+      () => orch.resumeInstance(),
+      () => orch.resetInstance(),
+      () => orch.powerdownInstance(),
+      () => orch.queryBlock(),
+      () => orch.queryCpus(),
+      () => orch.screendump(),
+    ]) {
+      await expect(op()).rejects.toBeInstanceOf(LifecycleError);
+      await expect(op()).rejects.toThrow(/create_instance/);
+    }
   });
 });
 
