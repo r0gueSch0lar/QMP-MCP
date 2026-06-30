@@ -24,6 +24,8 @@ const DEFAULTS: Config = {
   imageDir: DEFAULT_IMAGE_DIR,
   isoDir: DEFAULT_ISO_DIR,
   maxDiskGb: 64,
+  hostfwdPortRange: { low: 1024, high: 65535 },
+  allowHostNet: false,
 };
 
 describe('loadConfig', () => {
@@ -237,6 +239,55 @@ describe('loadConfig', () => {
     it('derives the default dir from XDG_DATA_HOME, then HOME', () => {
       expect(loadConfig({ XDG_DATA_HOME: '/x/data' }).isoDir).toBe('/x/data/qmp-mcp/isos');
       expect(loadConfig({ HOME: '/home/u' }).isoDir).toBe('/home/u/.local/share/qmp-mcp/isos');
+    });
+  });
+
+  describe('guest networking (ADR-0009)', () => {
+    it('defaults the host-forward range to the non-privileged 1024-65535 and host net off', () => {
+      const config = loadConfig({});
+      expect(config.hostfwdPortRange).toEqual({ low: 1024, high: 65535 });
+      expect(config.allowHostNet).toBe(false);
+    });
+
+    it('reads a valid QMP_MCP_HOSTFWD_PORT_RANGE', () => {
+      expect(loadConfig({ QMP_MCP_HOSTFWD_PORT_RANGE: '2000-3000' }).hostfwdPortRange).toEqual({
+        low: 2000,
+        high: 3000,
+      });
+      // a single-port range (low == high) is allowed
+      expect(loadConfig({ QMP_MCP_HOSTFWD_PORT_RANGE: '8080-8080' }).hostfwdPortRange).toEqual({
+        low: 8080,
+        high: 8080,
+      });
+    });
+
+    it.each([
+      'abc',
+      '1024',
+      '1024-',
+      '-65535',
+      '0-65535',
+      '1024-70000',
+      '3000-2000',
+      '1024-65535-2',
+      ' 1024 - 2048 ',
+    ])('fails closed on the invalid range %p, naming the variable', (range) => {
+      let thrown: unknown;
+      try {
+        loadConfig({ QMP_MCP_HOSTFWD_PORT_RANGE: range });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message).toContain('QMP_MCP_HOSTFWD_PORT_RANGE');
+    });
+
+    it('reads QMP_MCP_ALLOW_HOST_NET as a boolean and fails closed on garbage', () => {
+      expect(loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'true' }).allowHostNet).toBe(true);
+      expect(loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'False' }).allowHostNet).toBe(false);
+      expect(() => loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'yes' })).toThrowError(
+        /QMP_MCP_ALLOW_HOST_NET must be "true" or "false"/,
+      );
     });
   });
 

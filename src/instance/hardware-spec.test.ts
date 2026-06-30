@@ -27,6 +27,9 @@ describe('parseHardwareSpec', () => {
       memoryMb: 256,
       accel: 'auto',
       disks: [],
+      // Networking defaults to user-mode (SLiRP) with an allowlisted NIC and no
+      // port-forwards (ADR-0009).
+      network: { mode: 'user', model: 'virtio-net-pci', hostForwards: [] },
     });
   });
 
@@ -350,6 +353,288 @@ describe('buildArgv boot order', () => {
     // The schema is the choke point: a comma/extra-option value cannot be turned
     // into a HardwareSpec, so buildArgv never sees it.
     expect(() => spec({ boot: 'c,menu=on' })).toThrowError(HardwareSpecError);
+  });
+});
+
+describe('parseHardwareSpec network', () => {
+  it('defaults to a single user-mode virtio NIC with no forwards', () => {
+    expect(parseHardwareSpec({}).network).toEqual({
+      mode: 'user',
+      model: 'virtio-net-pci',
+      hostForwards: [],
+    });
+  });
+
+  it('defaults a port-forward proto to tcp', () => {
+    const parsed = parseHardwareSpec({
+      network: { hostForwards: [{ hostPort: 8022, guestPort: 22 }] },
+    });
+    expect(parsed.network.hostForwards).toEqual([{ hostPort: 8022, guestPort: 22, proto: 'tcp' }]);
+  });
+
+  it('rejects a non-allowlisted NIC model, failing closed', () => {
+    expect(() => parseHardwareSpec({ network: { model: 'pcnet' } })).toThrowError(
+      HardwareSpecError,
+    );
+    expect(() => parseHardwareSpec({ network: { model: 'pcnet' } })).toThrowError(/model/);
+  });
+
+  it('rejects a NIC model carrying an injected -device property (comma)', () => {
+    // Without the allowlist, "virtio-net-pci,addr=0x4" would inject an extra
+    // -device property; the closed enum makes that impossible.
+    expect(() => parseHardwareSpec({ network: { model: 'virtio-net-pci,addr=0x4' } })).toThrowError(
+      HardwareSpecError,
+    );
+  });
+
+  it('rejects an injected mode value (comma/option), failing closed', () => {
+    // "user,smb=on" would enable the SLiRP SMB server; the closed enum refuses it.
+    expect(() => parseHardwareSpec({ network: { mode: 'user,smb=on' } })).toThrowError(
+      HardwareSpecError,
+    );
+  });
+
+  it('rejects an unknown field on network and on a port-forward, failing closed', () => {
+    expect(() => parseHardwareSpec({ network: { foo: 'bar' } })).toThrowError(HardwareSpecError);
+    expect(() =>
+      parseHardwareSpec({
+        network: { hostForwards: [{ hostPort: 2000, guestPort: 22, extra: 1 }] },
+      }),
+    ).toThrowError(HardwareSpecError);
+  });
+
+  it('rejects a non-enum protocol', () => {
+    expect(() =>
+      parseHardwareSpec({
+        network: { hostForwards: [{ hostPort: 2000, guestPort: 22, proto: 'icmp' }] },
+      }),
+    ).toThrowError(HardwareSpecError);
+  });
+
+  it('rejects an out-of-range / zero / negative / non-integer guestPort', () => {
+    for (const guestPort of [0, -1, 1.5, 70000]) {
+      expect(() =>
+        parseHardwareSpec({ network: { hostForwards: [{ hostPort: 2000, guestPort }] } }),
+      ).toThrowError(/guestPort/);
+    }
+  });
+
+  it('rejects an out-of-range / zero / negative / non-integer hostPort at parse time', () => {
+    for (const hostPort of [0, -1, 1.5, 70000]) {
+      expect(() =>
+        parseHardwareSpec({ network: { hostForwards: [{ hostPort, guestPort: 22 }] } }),
+      ).toThrowError(/hostPort/);
+    }
+  });
+});
+
+describe('buildArgv network', () => {
+  it('emits a default user-mode NIC with an allowlisted model', () => {
+    const argv = buildArgv(spec(), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe('user,id=net0');
+    expect(argv[argv.indexOf('-device') + 1]).toBe('virtio-net-pci,netdev=net0');
+  });
+
+  it('honours an allowlisted NIC model', () => {
+    const argv = buildArgv(spec({ network: { mode: 'user', model: 'e1000', hostForwards: [] } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(argv[argv.indexOf('-device') + 1]).toBe('e1000,netdev=net0');
+  });
+
+  it('emits hostfwd entries built from validated ints for valid port-forwards', () => {
+    const argv = buildArgv(
+      spec({
+        network: {
+          mode: 'user',
+          model: 'virtio-net-pci',
+          hostForwards: [
+            { hostPort: 8022, guestPort: 22, proto: 'tcp' },
+            { hostPort: 15353, guestPort: 53, proto: 'udp' },
+          ],
+        },
+      }),
+      { accel: 'tcg', qmpSocketPath: SOCK, hostfwdPortRange: { low: 1024, high: 65535 } },
+    );
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe(
+      'user,id=net0,hostfwd=tcp:127.0.0.1:8022-:22,hostfwd=udp:127.0.0.1:15353-:53',
+    );
+    expect(argv[argv.indexOf('-device') + 1]).toBe('virtio-net-pci,netdev=net0');
+  });
+
+  it('binds each forward to 127.0.0.1 (loopback), never 0.0.0.0 — no host-LAN exposure', () => {
+    const argv = buildArgv(
+      spec({
+        network: {
+          mode: 'user',
+          model: 'virtio-net-pci',
+          hostForwards: [{ hostPort: 8080, guestPort: 80, proto: 'tcp' }],
+        },
+      }),
+      { accel: 'tcg', qmpSocketPath: SOCK, hostfwdPortRange: { low: 1024, high: 65535 } },
+    );
+    const netdev = argv[argv.indexOf('-netdev') + 1] ?? '';
+    // The host address sits between proto and host port; pinning it to loopback
+    // keeps the forward off the host LAN (ADR-0009 zero host exposure).
+    expect(netdev).toBe('user,id=net0,hostfwd=tcp:127.0.0.1:8080-:80');
+    expect(netdev).toContain('hostfwd=tcp:127.0.0.1:8080-:80');
+    // The old empty-host-address form (which binds 0.0.0.0) must be gone.
+    expect(netdev).not.toContain('hostfwd=tcp::8080');
+    expect(netdev).not.toContain('0.0.0.0');
+  });
+
+  it('rejects a hostPort outside the configured range, naming the range and the value', () => {
+    const call = () =>
+      buildArgv(
+        spec({
+          network: {
+            mode: 'user',
+            model: 'virtio-net-pci',
+            hostForwards: [{ hostPort: 80, guestPort: 80 }],
+          },
+        }),
+        {
+          accel: 'tcg',
+          qmpSocketPath: SOCK,
+          hostfwdPortRange: { low: 1024, high: 65535 },
+        },
+      );
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/1024-65535/);
+    expect(call).toThrowError(/\b80\b/);
+    expect(call).toThrowError(/QMP_MCP_HOSTFWD_PORT_RANGE/);
+  });
+
+  it('enforces a custom range that excludes low/privileged ports', () => {
+    const range = { low: 2000, high: 3000 };
+    expect(() =>
+      buildArgv(
+        spec({
+          network: {
+            mode: 'user',
+            model: 'virtio-net-pci',
+            hostForwards: [{ hostPort: 1500, guestPort: 22 }],
+          },
+        }),
+        {
+          accel: 'tcg',
+          qmpSocketPath: SOCK,
+          hostfwdPortRange: range,
+        },
+      ),
+    ).toThrowError(/2000-3000/);
+    const argv = buildArgv(
+      spec({
+        network: {
+          mode: 'user',
+          model: 'virtio-net-pci',
+          hostForwards: [{ hostPort: 2500, guestPort: 22 }],
+        },
+      }),
+      { accel: 'tcg', qmpSocketPath: SOCK, hostfwdPortRange: range },
+    );
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe('user,id=net0,hostfwd=tcp:127.0.0.1:2500-:22');
+  });
+
+  it('falls back to the default 1024-65535 range when none is configured', () => {
+    // 80 is privileged and outside the default range, so it is rejected even
+    // when the caller passes no explicit range.
+    expect(() =>
+      buildArgv(
+        spec({
+          network: {
+            mode: 'user',
+            model: 'virtio-net-pci',
+            hostForwards: [{ hostPort: 80, guestPort: 80 }],
+          },
+        }),
+        {
+          accel: 'tcg',
+          qmpSocketPath: SOCK,
+        },
+      ),
+    ).toThrowError(/1024-65535/);
+  });
+
+  it('rejects tap mode by default, naming QMP_MCP_ALLOW_HOST_NET', () => {
+    const call = () =>
+      buildArgv(spec({ network: { mode: 'tap', model: 'virtio-net-pci', hostForwards: [] } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      });
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/QMP_MCP_ALLOW_HOST_NET/);
+  });
+
+  it('rejects bridge mode by default', () => {
+    expect(() =>
+      buildArgv(spec({ network: { mode: 'bridge', model: 'virtio-net-pci', hostForwards: [] } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      }),
+    ).toThrowError(/QMP_MCP_ALLOW_HOST_NET/);
+  });
+
+  it('emits a tap netdev when host networking is enabled', () => {
+    const argv = buildArgv(
+      spec({ network: { mode: 'tap', model: 'virtio-net-pci', hostForwards: [] } }),
+      {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        allowHostNet: true,
+      },
+    );
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe('tap,id=net0');
+    expect(argv[argv.indexOf('-device') + 1]).toBe('virtio-net-pci,netdev=net0');
+  });
+
+  it('emits a bridge netdev when host networking is enabled', () => {
+    const argv = buildArgv(
+      spec({ network: { mode: 'bridge', model: 'e1000', hostForwards: [] } }),
+      {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        allowHostNet: true,
+      },
+    );
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe('bridge,id=net0');
+    expect(argv[argv.indexOf('-device') + 1]).toBe('e1000,netdev=net0');
+  });
+
+  it('rejects hostForwards with tap mode even when host networking is enabled', () => {
+    // hostForwards are user-mode only; supplying them with tap/bridge must fail
+    // closed with an actionable message rather than being silently dropped.
+    const call = () =>
+      buildArgv(
+        spec({
+          network: {
+            mode: 'tap',
+            model: 'virtio-net-pci',
+            hostForwards: [{ hostPort: 8022, guestPort: 22 }],
+          },
+        }),
+        { accel: 'tcg', qmpSocketPath: SOCK, allowHostNet: true },
+      );
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/hostForwards are only valid for user-mode/);
+    expect(call).toThrowError(/mode "user"/);
+  });
+
+  it('rejects hostForwards with bridge mode even when host networking is enabled', () => {
+    const call = () =>
+      buildArgv(
+        spec({
+          network: {
+            mode: 'bridge',
+            model: 'e1000',
+            hostForwards: [{ hostPort: 9090, guestPort: 90 }],
+          },
+        }),
+        { accel: 'tcg', qmpSocketPath: SOCK, allowHostNet: true },
+      );
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/hostForwards are only valid for user-mode/);
   });
 });
 
