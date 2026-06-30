@@ -42,6 +42,7 @@
   "homepage": "http://gitlab/foo/qmp-mcp#readme",
   "dependencies": {
     "mcp-framework": "^0.2.22",
+    "yaml": "^2.9.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

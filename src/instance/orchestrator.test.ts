@@ -2,6 +2,7 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { buildPolicy, CommandPolicyError } from '../policy/command-policy.js';
 import { FakeQemuDriver } from '../qemu/fake-driver.js';
 import { HardwareSpecError } from './hardware-spec.js';
 import {
@@ -334,6 +335,91 @@ describe('Orchestrator control commands (fake driver)', () => {
       await expect(op()).rejects.toBeInstanceOf(LifecycleError);
       await expect(op()).rejects.toThrow(/create_instance/);
     }
+  });
+});
+
+describe('Orchestrator generic execute (Command Policy, fake driver)', () => {
+  /** Create an Instance and hand back the orchestrator + its fake process. */
+  async function running(options: Partial<OrchestratorOptions> = {}, driverOptions = {}) {
+    const driver = new FakeQemuDriver(driverOptions);
+    const orch = makeOrchestrator(driver, options);
+    await orch.createInstance({});
+    // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
+    const process = driver.lastProcess!;
+    return { orch, process };
+  }
+
+  const commands = (process: { executed: Array<{ command: string }> }): string[] =>
+    process.executed.map((e) => e.command);
+
+  it('forwards an ALLOWED command to the QMP session and returns its result', async () => {
+    const canned = [{ bus: 0, devices: [] }];
+    const { orch, process } = await running({}, { responses: { 'query-pci': canned } });
+
+    expect(await orch.executeCommand('query-pci')).toEqual(canned);
+    expect(commands(process)).toContain('query-pci');
+  });
+
+  it('passes arguments through to the QMP session for an allowed command', async () => {
+    const { orch, process } = await running(
+      { commandPolicy: buildPolicy({ allow: ['query-rocker'] }) },
+      { responses: { 'query-rocker': (args?: Record<string, unknown>) => ({ echoed: args }) } },
+    );
+
+    expect(await orch.executeCommand('query-rocker', { name: 'sw1' })).toEqual({
+      echoed: { name: 'sw1' },
+    });
+    expect(process.executed.find((e) => e.command === 'query-rocker')?.args).toEqual({
+      name: 'sw1',
+    });
+  });
+
+  it('a DENIED command never reaches the session and reports a hard denial', async () => {
+    const { orch, process } = await running();
+    await expect(orch.executeCommand('human-monitor-command')).rejects.toBeInstanceOf(
+      CommandPolicyError,
+    );
+    await expect(orch.executeCommand('human-monitor-command')).rejects.toThrow(/hard denylist/i);
+    // Fail-closed: it was never issued to QEMU.
+    expect(commands(process)).not.toContain('human-monitor-command');
+  });
+
+  it('DENIES screendump through the generic path, closing the arbitrary host-file write (#11)', async () => {
+    const { orch, process } = await running();
+    // screendump writes an arbitrary host file at its `filename` arg; the generic
+    // policy gates command NAMES not arguments, so it must be default-denied here
+    // and the agent-chosen path must never reach QEMU.
+    const err = await orch
+      .executeCommand('screendump', { filename: '/home/user/.ssh/authorized_keys' })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CommandPolicyError);
+    // Default-deny (not allowlisted) — the dedicated screendump tool still serves
+    // it with a server-chosen path, so this is not a hard denial.
+    expect((err as CommandPolicyError).hardDenied).toBe(false);
+    // Fail-closed: it never reached the QMP session, so no host file was written.
+    expect(commands(process)).not.toContain('screendump');
+  });
+
+  it('an allow override cannot resurrect a hard-denied command through the orchestrator', async () => {
+    const { orch, process } = await running({
+      commandPolicy: buildPolicy({ allow: ['migrate'] }),
+    });
+    const err = await orch.executeCommand('migrate').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CommandPolicyError);
+    expect((err as CommandPolicyError).hardDenied).toBe(true);
+    expect(commands(process)).not.toContain('migrate');
+  });
+
+  it('rejects a non-allowlisted command before requiring an Instance', async () => {
+    const orch = makeOrchestrator(new FakeQemuDriver());
+    // No Instance running, but the policy denies it first — fail-closed.
+    await expect(orch.executeCommand('totally-made-up')).rejects.toBeInstanceOf(CommandPolicyError);
+  });
+
+  it('rejects an allowed command with an actionable LifecycleError when no Instance is running', async () => {
+    const orch = makeOrchestrator(new FakeQemuDriver());
+    await expect(orch.executeCommand('query-status')).rejects.toBeInstanceOf(LifecycleError);
+    await expect(orch.executeCommand('query-status')).rejects.toThrow(/create_instance/);
   });
 });
 
