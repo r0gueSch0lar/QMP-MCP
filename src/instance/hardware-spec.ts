@@ -241,6 +241,14 @@ export const hardwareSpecSchema = z
     network: networkSchema
       .default({})
       .describe('Guest NIC; defaults to user-mode (SLiRP) networking with no port-forwards.'),
+    extraArgs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Raw QEMU arguments appended verbatim to the generated argv. Opt-in escape hatch ' +
+          '(ADR-0002): REFUSED unless QMP_MCP_ALLOW_RAW_ARGS=true. Host-compromise-equivalent — ' +
+          'intended only for trusted single-tenant hosts; omit it in the default safe-by-construction mode.',
+      ),
   })
   .strict();
 
@@ -395,6 +403,15 @@ export interface ArgvOptions {
    * check (issue #9).
    */
   maxVcpus?: number;
+  /**
+   * Whether the raw-args escape hatch is enabled (`QMP_MCP_ALLOW_RAW_ARGS`). When
+   * true, a spec's `extraArgs` are appended verbatim to the generated argv; when
+   * false (the default) a spec carrying `extraArgs` is REFUSED with an actionable
+   * {@link HardwareSpecError} naming the flag, rather than silently dropped — raw
+   * args are host-compromise-equivalent, so this fails closed (ADR-0002). The
+   * Orchestrator always injects the env-resolved value.
+   */
+  allowRawArgs?: boolean;
 }
 
 /**
@@ -626,5 +643,21 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   // Guest NIC: user-mode (SLiRP) by default; tap/bridge only when env-gated on.
   argv.push(...buildNetworkArgs(spec.network, options));
   argv.push('-qmp', `unix:${options.qmpSocketPath},server=on,wait=off`);
+  // extraArgs (ADR-0002): the opt-in raw-args escape hatch. Raw QEMU arguments are
+  // host-compromise-equivalent (e.g. `-drive file=/etc/shadow`, host `-netdev`
+  // backends), so when a spec carries extraArgs but QMP_MCP_ALLOW_RAW_ARGS is not
+  // enabled we REFUSE — fail-closed and explicit — rather than silently dropping
+  // them. When enabled, they are appended verbatim after the generated argv.
+  if (spec.extraArgs !== undefined && spec.extraArgs.length > 0) {
+    if (options.allowRawArgs !== true) {
+      throw new HardwareSpecError(
+        `extraArgs were supplied, but the raw-args escape hatch is disabled. Raw QEMU arguments are ` +
+          `host-compromise-equivalent, so they are refused by default (ADR-0002). Set ` +
+          `QMP_MCP_ALLOW_RAW_ARGS=true to opt in (trusted single-tenant hosts only), or remove ` +
+          `extraArgs and express the hardware through the Hardware Spec.`,
+      );
+    }
+    argv.push(...spec.extraArgs);
+  }
   return argv;
 }
