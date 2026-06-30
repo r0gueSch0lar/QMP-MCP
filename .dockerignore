@@ -1,0 +1,30 @@
+# Keep the build context small and reproducible: dependencies and build output are
+# regenerated inside the image (npm ci + npm run build), never copied from the host.
+node_modules
+dist
+coverage
+.npm
+*.log
+*.tsbuildinfo
+
+# Version control and CI metadata.
+.git
+.gitignore
+.gitlab-ci.yml
+
+# Local dev infrastructure (git-excluded) — NEVER part of the production image.
+Dockerfile
+Dockerfile.dev
+compose.yaml
+docker-compose.yml
+.dockerignore
+
+# Tests are not shipped in the runtime image (tsc excludes them from dist anyway).
+**/*.test.ts
+
+# Docs, samples, and env files not needed to build the server.
+docs
+*.md
+.env
+.env.*
+policy.example.yaml

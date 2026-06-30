@@ -118,6 +118,14 @@ export interface Config {
    * evicted, so the buffer never grows without bound (issue #12).
    */
   eventBufferSize: number;
+  /**
+   * When true, a Hardware Spec's `extraArgs` (raw QEMU arguments) are appended to
+   * the generated argv (`QMP_MCP_ALLOW_RAW_ARGS`). Default false: raw args are
+   * host-compromise-equivalent, so a spec carrying `extraArgs` is REFUSED unless
+   * this is explicitly enabled — the gated escape hatch for trusted single-tenant
+   * hosts (ADR-0002).
+   */
+  allowRawArgs: boolean;
 }
 
 /**
@@ -322,6 +330,17 @@ export function resolveEventBufferSize(env: NodeJS.ProcessEnv): number {
 }
 
 /**
+ * Resolve whether the raw-args escape hatch is enabled (`QMP_MCP_ALLOW_RAW_ARGS`,
+ * default false). When false a Hardware Spec carrying `extraArgs` is refused;
+ * when true those raw QEMU arguments are appended to the generated argv (ADR-0002).
+ * Exported so the Orchestrator singleton and {@link loadConfig} share one source
+ * of truth.
+ */
+export function resolveAllowRawArgs(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_ALLOW_RAW_ARGS', env.QMP_MCP_ALLOW_RAW_ARGS, false);
+}
+
+/**
  * Split a comma-separated list env var into trimmed, non-empty entries.
  * Undefined yields an empty list.
  */
@@ -403,5 +422,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     hostfwdPortRange: resolveHostfwdPortRange(env),
     allowHostNet: resolveAllowHostNet(env),
     eventBufferSize: resolveEventBufferSize(env),
+    allowRawArgs: resolveAllowRawArgs(env),
   };
 }
