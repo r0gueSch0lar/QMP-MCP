@@ -3,13 +3,13 @@
  * holds guest disk images. Disks are referenced by *name* within it, never by
  * host path; new blank images may be created inside it via `qemu-img create`.
  *
- * This module is the security boundary. {@link resolveImagePath} is the airtight
- * containment check: a deterministic function of `(name, storeDir)` (plus the
- * live filesystem) that maps a disk name to a safe absolute path inside the Store
- * or throws an actionable {@link ImageStoreError}. It rejects absolute paths,
- * `..`/path-separator traversal, and symlink escape (a symlink whose real target
- * leaves the Store). It is exported standalone so every traversal case is unit
- * testable without spawning anything.
+ * This module is the read-write half of the security boundary. The airtight
+ * containment check — name validation plus realpath-containment — lives in the
+ * shared {@link resolveInStore} (see `store-path.ts`), which the read-only ISO
+ * Store reuses verbatim so the two stores cannot drift. {@link resolveImagePath}
+ * and {@link assertValidImageName} are thin Image-Store-flavoured wrappers over
+ * it, kept exported so every traversal case stays unit testable without spawning
+ * anything.
  *
  * Subdirectory policy: disk names are a SINGLE path segment — no `/` or `\`, and
  * never `.`/`..`. Nested names are rejected. This keeps the Store flat, makes the
@@ -18,10 +18,11 @@
  */
 
 import { type ChildProcess, spawn } from 'node:child_process';
-import { type Dirent, lstatSync, realpathSync } from 'node:fs';
+import { type Dirent, lstatSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { isAbsolute, join, sep } from 'node:path';
+import { join } from 'node:path';
 import { resolveImageDir, resolveMaxDiskGb } from '../config.js';
+import { assertValidStoreName, resolveInStore, type StoreLabels } from './store-path.js';
 
 /** Disk image formats this server will create and pin explicitly into argv. */
 export const IMAGE_FORMATS = ['qcow2', 'raw'] as const;
@@ -40,109 +41,36 @@ export class ImageStoreError extends Error {
 }
 
 /**
- * Conservative single-segment allowlist for disk image names: a leading
- * alphanumeric followed by alphanumerics, dot, underscore, or hyphen. This is
- * the security-critical rule — it excludes the comma, `=`, `:`, space, and
- * leading `-` that would otherwise let a name inject extra `-drive`/QemuOpts
- * properties (QEMU parses `-drive` values as comma-separated key=value props).
+ * Image-Store wording for the shared {@link resolveInStore} boundary. Supplying
+ * {@link ImageStoreError} keeps every traversal/injection failure surfacing as an
+ * `ImageStoreError`, exactly as before the resolver was factored out.
  */
-const VALID_IMAGE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const IMAGE_LABELS: StoreLabels = {
+  store: 'Image Store',
+  entry: 'Disk image',
+  envVar: 'QMP_MCP_IMAGE_DIR',
+  error: ImageStoreError,
+};
 
 /**
- * Validate that a disk name is a single, safe path segment. Pure and
- * filesystem-free: rejects empties, NUL bytes, absolute paths, `.`/`..`, and any
- * name containing a path separator with their own actionable messages, then
- * enforces the {@link VALID_IMAGE_NAME} allowlist (no comma/`=`/`:`/space/leading
- * dash — values that would inject QemuOpts properties downstream). Throws an
- * actionable {@link ImageStoreError}.
+ * Validate that a disk name is a single, safe path segment — the
+ * Image-Store-flavoured view of the shared {@link assertValidStoreName}. Rejects
+ * empties, NUL bytes, absolute paths, `.`/`..`, path separators, and any name
+ * outside the option-injection-safe allowlist, throwing an actionable
+ * {@link ImageStoreError}.
  */
 export function assertValidImageName(name: string): void {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new ImageStoreError('Disk image name must be a non-empty string.');
-  }
-  if (name.includes('\0')) {
-    throw new ImageStoreError(`Disk image name "${name}" contains a NUL byte.`);
-  }
-  if (isAbsolute(name)) {
-    throw new ImageStoreError(
-      `Disk image name "${name}" must be a bare name inside the Image Store, not an absolute path.`,
-    );
-  }
-  if (name === '.' || name === '..') {
-    throw new ImageStoreError(`Disk image name "${name}" is not a valid file name.`);
-  }
-  if (name.includes('/') || name.includes('\\')) {
-    throw new ImageStoreError(
-      `Disk image name "${name}" must not contain a path separator; subdirectories are not allowed in the Image Store.`,
-    );
-  }
-  if (!VALID_IMAGE_NAME.test(name)) {
-    throw new ImageStoreError(
-      `Disk image name "${name}" must match ${VALID_IMAGE_NAME.source} — a single ` +
-        `segment of letters, digits, dot, underscore, or hyphen, with no leading hyphen ` +
-        `and no comma, '=', ':', or spaces (these could inject QEMU -drive properties).`,
-    );
-  }
+  assertValidStoreName(name, IMAGE_LABELS);
 }
 
 /**
  * Resolve a disk name against the Image Store directory and return its safe
- * absolute path, or throw {@link ImageStoreError}. The containment guarantee:
- *
- *  1. The name passes {@link assertValidImageName} (single safe segment).
- *  2. The Store directory's real (symlink-resolved) path is computed; a missing
- *     Store fails closed with an actionable message.
- *  3. If the target already exists, its real path must stay within the Store's
- *     real path — so a symlink (or dangling symlink) at the leaf that points
- *     outside the Store is rejected rather than followed.
- *
- * Because the name is a single non-`..` segment joined onto the *canonical*
- * Store path, a not-yet-existing target cannot escape; the realpath check closes
- * the symlink-at-the-leaf hole for targets that do exist.
+ * absolute path, or throw {@link ImageStoreError}. A one-line delegation to the
+ * shared {@link resolveInStore} containment boundary (same logic the ISO Store
+ * uses), specialised only by {@link IMAGE_LABELS}.
  */
 export function resolveImagePath(name: string, storeDir: string): string {
-  // NOTE: residual resolve->use TOCTOU and hardlink-to-target hardening (O_NOFOLLOW
-  // / fd plumbing) is out of the agent threat model — the agent cannot plant
-  // symlinks/hardlinks; it only writes via `qemu-img create`. Deliberately not done.
-  assertValidImageName(name);
-
-  let realStore: string;
-  try {
-    realStore = realpathSync(storeDir);
-  } catch {
-    throw new ImageStoreError(
-      `Image Store directory "${storeDir}" does not exist or is not accessible. ` +
-        `Create it or set QMP_MCP_IMAGE_DIR to an existing directory.`,
-    );
-  }
-
-  const candidate = join(realStore, name);
-
-  // Only existing leaves can introduce a symlink escape; a missing leaf is safe
-  // by construction (single segment under the canonical Store path).
-  let exists = true;
-  try {
-    lstatSync(candidate);
-  } catch {
-    exists = false;
-  }
-  if (exists) {
-    let real: string;
-    try {
-      real = realpathSync(candidate);
-    } catch {
-      throw new ImageStoreError(
-        `Disk image "${name}" is a dangling symlink; refusing to follow it out of the Image Store.`,
-      );
-    }
-    if (real !== candidate && !real.startsWith(realStore + sep)) {
-      throw new ImageStoreError(
-        `Disk image "${name}" resolves outside the Image Store (symlink escape); refusing.`,
-      );
-    }
-  }
-
-  return candidate;
+  return resolveInStore(name, storeDir, IMAGE_LABELS);
 }
 
 /** A disk image present in the Store, as reported by {@link ImageStore.list}. */

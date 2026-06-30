@@ -15,7 +15,7 @@
 import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveImageDir } from '../config.js';
+import { resolveImageDir, resolveIsoDir } from '../config.js';
 import { logger } from '../logger.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
@@ -66,6 +66,12 @@ export interface OrchestratorOptions {
    * spec never needs it.
    */
   imageDir?: string;
+  /**
+   * Absolute path of the read-only ISO Store directory (ADR-0006). A cdrom's ISO
+   * name in the spec is resolved against it when building the argv. Optional: a
+   * spec with no cdrom never needs it.
+   */
+  isoDir?: string;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -178,6 +184,7 @@ export class Orchestrator {
         accel: resolution.accel,
         qmpSocketPath,
         imageDir: this.#options.imageDir,
+        isoDir: this.#options.isoDir,
       });
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
@@ -286,6 +293,8 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   qmpSocketPath: defaultQmpSocketPath(),
   // Resolve disk names against the configured Image Store (ADR-0006).
   imageDir: resolveImageDir(process.env),
+  // Resolve cdrom ISO names against the configured read-only ISO Store (ADR-0006).
+  isoDir: resolveIsoDir(process.env),
   // `/dev/kvm` probe (single source of truth) from the hardware-spec module.
   kvmAvailable: probeKvm,
   socketOccupied: defaultSocketOccupied,
