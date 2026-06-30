@@ -233,6 +233,126 @@ describe('buildArgv -drive option injection', () => {
   });
 });
 
+describe('parseHardwareSpec cdrom & boot', () => {
+  it('leaves cdrom and boot absent for an empty spec', () => {
+    const parsed = parseHardwareSpec({});
+    expect(parsed.cdrom).toBeUndefined();
+    expect(parsed.boot).toBeUndefined();
+  });
+
+  it('accepts a cdrom referencing an ISO by name', () => {
+    expect(parseHardwareSpec({ cdrom: { iso: 'debian.iso' } }).cdrom).toEqual({
+      iso: 'debian.iso',
+    });
+  });
+
+  it('rejects an unknown field inside cdrom, failing closed', () => {
+    expect(() => parseHardwareSpec({ cdrom: { iso: 'd.iso', file: '/x' } })).toThrow(
+      HardwareSpecError,
+    );
+  });
+
+  it('accepts a valid boot order of drive letters', () => {
+    expect(parseHardwareSpec({ boot: 'd' }).boot).toBe('d');
+    expect(parseHardwareSpec({ boot: 'dc' }).boot).toBe('dc');
+    expect(parseHardwareSpec({ boot: 'cdn' }).boot).toBe('cdn');
+  });
+
+  it('rejects a boot value carrying an extra -boot option (comma/space/=)', () => {
+    expect(() => parseHardwareSpec({ boot: 'c,menu=on' })).toThrowError(/boot/);
+    expect(() => parseHardwareSpec({ boot: 'd order=c' })).toThrowError(/boot/);
+    expect(() => parseHardwareSpec({ boot: 'c,reboot-timeout=-1' })).toThrowError(
+      HardwareSpecError,
+    );
+  });
+
+  it('rejects boot drive letters outside the allowlist', () => {
+    expect(() => parseHardwareSpec({ boot: 'z' })).toThrowError(/boot/);
+    expect(() => parseHardwareSpec({ boot: '' })).toThrowError(/boot/);
+  });
+});
+
+describe('buildArgv cdrom (read-only ISO Store)', () => {
+  let isoDir: string;
+
+  beforeAll(async () => {
+    isoDir = await mkdtemp(join(tmpdir(), 'hw-iso-'));
+    await writeFile(join(isoDir, 'debian.iso'), '');
+  });
+
+  afterAll(async () => {
+    await rm(isoDir, { recursive: true, force: true });
+  });
+
+  it('emits a read-only cdrom -drive with an explicit raw format', () => {
+    const argv = buildArgv(spec({ cdrom: { iso: 'debian.iso' } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      isoDir,
+    });
+    const drive = argv[argv.indexOf('-drive') + 1] ?? '';
+    expect(drive).toContain(`file=${join(isoDir, 'debian.iso')}`);
+    expect(drive).toContain('media=cdrom');
+    expect(drive).toContain('readonly=on');
+    // ISO format is pinned explicitly — never left to QEMU's auto-probing.
+    expect(drive).toContain('format=raw');
+  });
+
+  it('fails closed naming QMP_MCP_ISO_DIR when no ISO Store is configured', () => {
+    expect(() =>
+      buildArgv(spec({ cdrom: { iso: 'debian.iso' } }), { accel: 'tcg', qmpSocketPath: SOCK }),
+    ).toThrowError(/QMP_MCP_ISO_DIR/);
+  });
+
+  it('rejects an absolute / `..` / out-of-store ISO reference at argv time', () => {
+    expect(() =>
+      buildArgv(spec({ cdrom: { iso: '/etc/passwd' } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        isoDir,
+      }),
+    ).toThrowError(HardwareSpecError);
+    expect(() =>
+      buildArgv(spec({ cdrom: { iso: '../escape.iso' } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        isoDir,
+      }),
+    ).toThrowError(/separator|valid file name/);
+  });
+
+  it('rejects an ISO name carrying an extra -drive property (comma)', () => {
+    // The cdrom.iso is validated by the same allowlist as disks; "x.iso,media=disk"
+    // could otherwise turn the read-only cdrom into a writable disk.
+    expect(() =>
+      buildArgv(spec({ cdrom: { iso: 'debian.iso,media=disk' } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        isoDir,
+      }),
+    ).toThrowError(HardwareSpecError);
+  });
+});
+
+describe('buildArgv boot order', () => {
+  it('emits a valid boot order as a single -boot order= token', () => {
+    const argv = buildArgv(spec({ boot: 'dc' }), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv).toContain('-boot');
+    expect(argv[argv.indexOf('-boot') + 1]).toBe('order=dc');
+  });
+
+  it('omits -boot entirely when no boot order is requested', () => {
+    const argv = buildArgv(spec(), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv).not.toContain('-boot');
+  });
+
+  it('an injected boot value never reaches argv (rejected at parse)', () => {
+    // The schema is the choke point: a comma/extra-option value cannot be turned
+    // into a HardwareSpec, so buildArgv never sees it.
+    expect(() => spec({ boot: 'c,menu=on' })).toThrowError(HardwareSpecError);
+  });
+});
+
 describe('resolveAccel', () => {
   it('auto chooses KVM when /dev/kvm is available and reports it', () => {
     const r = resolveAccel('auto', () => true);
