@@ -379,6 +379,22 @@ export interface ArgvOptions {
    * refused with an actionable error unless this is explicitly enabled (ADR-0009).
    */
   allowHostNet?: boolean;
+  /**
+   * Hard cap, in MiB, on the spec's `memoryMb` (`QMP_MCP_MAX_MEMORY_MB`). The cap
+   * is env-configurable, so it is INJECTED here rather than baked into the schema
+   * as a static zod max. A spec over the cap is rejected at argv time (before qemu
+   * is spawned) naming the cap and the requested-vs-allowed values. Omitting it
+   * skips the check — the Orchestrator always injects it, so create_instance is
+   * fail-closed (issue #9).
+   */
+  maxMemoryMb?: number;
+  /**
+   * Hard cap on the spec's `vcpus` (`QMP_MCP_MAX_VCPUS`). Injected for the same
+   * reason as {@link maxMemoryMb}; a spec over the cap is rejected at argv time
+   * naming the cap and the requested-vs-allowed values. Omitting it skips the
+   * check (issue #9).
+   */
+  maxVcpus?: number;
 }
 
 /**
@@ -541,6 +557,31 @@ function buildNetworkArgs(network: Network, options: ArgvOptions): string[] {
 }
 
 /**
+ * Enforce the env-configurable resource caps on a validated spec (issue #9). The
+ * caps live OUTSIDE the schema (they are operator policy, configured per
+ * deployment), so they are injected via {@link ArgvOptions} and checked here
+ * rather than as static zod maxes. A spec over a cap is rejected with a
+ * {@link HardwareSpecError} that NAMES the cap variable and the
+ * requested-vs-allowed values, e.g. "memoryMb 32768 exceeds
+ * QMP_MCP_MAX_MEMORY_MB=4096". An omitted cap skips its check; the Orchestrator
+ * always injects both, so create_instance is fail-closed before qemu is spawned.
+ */
+function assertWithinResourceCaps(spec: HardwareSpec, options: ArgvOptions): void {
+  if (options.maxMemoryMb !== undefined && spec.memoryMb > options.maxMemoryMb) {
+    throw new HardwareSpecError(
+      `memoryMb ${spec.memoryMb} exceeds QMP_MCP_MAX_MEMORY_MB=${options.maxMemoryMb}. ` +
+        `Request ${options.maxMemoryMb} MiB or less, or raise QMP_MCP_MAX_MEMORY_MB.`,
+    );
+  }
+  if (options.maxVcpus !== undefined && spec.vcpus > options.maxVcpus) {
+    throw new HardwareSpecError(
+      `vcpus ${spec.vcpus} exceeds QMP_MCP_MAX_VCPUS=${options.maxVcpus}. ` +
+        `Request ${options.maxVcpus} vCPU(s) or less, or raise QMP_MCP_MAX_VCPUS.`,
+    );
+  }
+}
+
+/**
  * Generate the full `qemu-system-*` argv (excluding the program name) from a
  * validated Hardware Spec. Pure: same inputs always yield the same array.
  *
@@ -548,8 +589,15 @@ function buildNetworkArgs(network: Network, options: ArgvOptions): string[] {
  * drop QEMU's implicit devices, and `-S` freezes the vCPUs at startup so the
  * Instance reaches a deterministic, agent-inspectable state before any Guest
  * code runs. The QMP monitor is exposed on a UNIX socket the server owns.
+ *
+ * Before generating argv it enforces the injected resource caps
+ * ({@link assertWithinResourceCaps}), so an over-cap spec fails closed here
+ * rather than reaching qemu.
  */
 export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
+  // Resource caps (memory/vCPUs) are operator policy, injected from config and
+  // checked before anything else so an over-cap spec never reaches qemu.
+  assertWithinResourceCaps(spec, options);
   const argv = [
     '-machine',
     `${escapeQemuOptsValue(spec.machine)},accel=${options.accel}`,
