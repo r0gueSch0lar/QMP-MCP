@@ -176,6 +176,57 @@ describe('buildArgv resource caps (issue #9)', () => {
   });
 });
 
+describe('buildArgv extraArgs (ADR-0002 raw-args escape hatch)', () => {
+  it('appends extraArgs verbatim to the generated argv when allowRawArgs is true', () => {
+    const argv = buildArgv(spec({ extraArgs: ['-vga', 'std'] }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      allowRawArgs: true,
+    });
+    // Appended after the generated argv (which always ends with the -qmp pair).
+    expect(argv.slice(-2)).toEqual(['-vga', 'std']);
+    // The generated argv is otherwise intact.
+    expect(argv[argv.indexOf('-qmp') + 1]).toBe(`unix:${SOCK},server=on,wait=off`);
+  });
+
+  it('rejects a spec carrying extraArgs when allowRawArgs is not enabled, naming the flag', () => {
+    const call = () =>
+      buildArgv(spec({ extraArgs: ['-drive', 'file=/etc/shadow'] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      });
+    expect(call).toThrowError(HardwareSpecError);
+    expect(call).toThrowError(/QMP_MCP_ALLOW_RAW_ARGS/);
+  });
+
+  it('rejects extraArgs when allowRawArgs is explicitly false (fail-closed, not silently dropped)', () => {
+    expect(() =>
+      buildArgv(spec({ extraArgs: ['-snapshot'] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        allowRawArgs: false,
+      }),
+    ).toThrowError(/QMP_MCP_ALLOW_RAW_ARGS/);
+  });
+
+  it('is a no-op when extraArgs is absent or empty, regardless of allowRawArgs', () => {
+    const base = buildArgv(spec(), { accel: 'tcg', qmpSocketPath: SOCK });
+    // Absent extraArgs: identical argv with the hatch open.
+    expect(buildArgv(spec(), { accel: 'tcg', qmpSocketPath: SOCK, allowRawArgs: true })).toEqual(
+      base,
+    );
+    // An empty extraArgs array appends nothing and is never refused.
+    expect(buildArgv(spec({ extraArgs: [] }), { accel: 'tcg', qmpSocketPath: SOCK })).toEqual(base);
+    expect(
+      buildArgv(spec({ extraArgs: [] }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        allowRawArgs: true,
+      }),
+    ).toEqual(base);
+  });
+});
+
 describe('buildArgv disks', () => {
   let store: string;
 

@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import {
   type PortRange,
   resolveAllowHostNet,
+  resolveAllowRawArgs,
   resolveEventBufferSize,
   resolveHostfwdPortRange,
   resolveImageDir,
@@ -136,6 +137,14 @@ export interface OrchestratorOptions {
    * is enforced (the singleton always injects it).
    */
   maxVcpus?: number;
+  /**
+   * Whether the raw-args escape hatch is enabled (`QMP_MCP_ALLOW_RAW_ARGS`,
+   * ADR-0002). When true a spec's `extraArgs` are appended to the generated argv;
+   * when false (the default) a spec carrying `extraArgs` is rejected before qemu
+   * is spawned. Optional: omitted means the hatch is closed (the singleton always
+   * injects the env-resolved value).
+   */
+  allowRawArgs?: boolean;
   /**
    * The resolved Command Policy that governs which QMP commands the generic
    * {@link Orchestrator.executeCommand} path may run (ADR-0003). Optional: when
@@ -287,6 +296,7 @@ export class Orchestrator {
         allowHostNet: this.#options.allowHostNet,
         maxMemoryMb: this.#options.maxMemoryMb,
         maxVcpus: this.#options.maxVcpus,
+        allowRawArgs: this.#options.allowRawArgs,
       });
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
@@ -567,6 +577,9 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Enforce the env-configurable memory/vCPU caps before launch (issue #9).
   maxMemoryMb: resolveMaxMemoryMb(process.env),
   maxVcpus: resolveMaxVcpus(process.env),
+  // Gate the raw-args escape hatch: a spec's extraArgs are refused unless
+  // QMP_MCP_ALLOW_RAW_ARGS=true (ADR-0002).
+  allowRawArgs: resolveAllowRawArgs(process.env),
   // Bound the Event Buffer of recent QMP async events (issue #12).
   eventBufferSize: resolveEventBufferSize(process.env),
   // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
