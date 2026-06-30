@@ -64,23 +64,23 @@ build:
     expire_in: 1 week
 
 # Auto-merge the merge request once this pipeline (lint -> typecheck -> test ->
-# build) has passed. This job runs only on merge-request pipelines and only when
-# an AUTO_MERGE_TOKEN CI/CD variable is set (a project access token with `api`
-# scope and the Maintainer role). Without that token the job is skipped and
-# nothing auto-merges.
+# build) has passed. Auto-merge is opt-in per MR: the job runs only when ALL of
+# the following hold:
+#   - the pipeline is a merge-request pipeline, AND
+#   - the MR carries the `auto-merge` label, AND
+#   - an AUTO_MERGE_TOKEN CI/CD variable is set (a project access token with
+#     `api` scope and the Maintainer role).
+# Otherwise the job is skipped and nothing auto-merges. To auto-merge every green
+# MR instead of opting in per MR, drop the $CI_MERGE_REQUEST_LABELS clause.
 #
 # It sets "merge when pipeline succeeds": because this job sits in the final
 # stage, all earlier stages have already passed, so the MR merges as soon as the
 # pipeline finishes green.
-#
-# To restrict auto-merge to explicitly opted-in MRs, append
-#   && $CI_MERGE_REQUEST_LABELS =~ /(^|,)auto-merge(,|$)/
-# to the rule below and add the `auto-merge` label to the MR.
 auto-merge:
   stage: auto-merge
   image: alpine:latest
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $AUTO_MERGE_TOKEN'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $AUTO_MERGE_TOKEN && $CI_MERGE_REQUEST_LABELS =~ /(^|,)auto-merge(,|$)/'
   before_script:
     - apk add --no-cache curl
   script:
