@@ -16,6 +16,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     apiKeys: ['k1', 'k2'],
     jwtSecret: undefined,
     allowInsecure: false,
+    imageDir: '/tmp/qmp-mcp/images',
+    maxDiskGb: 64,
     ...overrides,
   };
 }
