@@ -11,6 +11,9 @@
  * server is booted.
  */
 
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 export type TransportMode = 'stdio' | 'http' | 'both';
 export type LogLevel = 'debug' | 'info' | 'warning' | 'error';
 /** Which auth provider guards the HTTP transport. */
@@ -45,6 +48,17 @@ export interface Config {
   jwtSecret: string | undefined;
   /** When true, the HTTP transport runs unauthenticated (local dev only). */
   allowInsecure: boolean;
+  /**
+   * Absolute path of the read-write Image Store directory (ADR-0006): the single
+   * allowlisted directory guest disk images live in and are created into. Disks
+   * are referenced by name within it, never by host path.
+   */
+  imageDir: string;
+  /**
+   * Hard cap, in GiB, on the virtual size of a disk image {@link createImage}
+   * may allocate. A larger request is rejected naming this cap.
+   */
+  maxDiskGb: number;
 }
 
 /**
@@ -115,6 +129,43 @@ function parseBoolean(varName: string, raw: string | undefined, fallback: boolea
   if (value === 'true') return true;
   if (value === 'false') return false;
   throw new ConfigError(`${varName} must be "true" or "false" (got "${raw}").`);
+}
+
+/**
+ * Parse a positive-integer env var (e.g. a size cap). Treats undefined or empty
+ * as unset and returns the fallback; otherwise requires a base-10 integer >= 1
+ * and fails closed on anything else rather than silently coercing.
+ */
+function parsePositiveInt(varName: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim();
+  if (!/^\d+$/.test(value) || Number(value) < 1) {
+    throw new ConfigError(`${varName} must be a positive integer >= 1 (got "${raw}").`);
+  }
+  return Number(value);
+}
+
+/**
+ * Resolve the Image Store directory (ADR-0006/0007). An explicit
+ * `QMP_MCP_IMAGE_DIR` wins; otherwise a host-agnostic default is derived from the
+ * XDG/HOME data dirs (and finally the OS temp dir), so the bare-metal default
+ * never assumes the Docker filesystem layout — the container image overrides it
+ * via env. Exported so the Image Store singleton and {@link loadConfig} share one
+ * source of truth.
+ */
+export function resolveImageDir(env: NodeJS.ProcessEnv): string {
+  const explicit = env.QMP_MCP_IMAGE_DIR?.trim();
+  if (explicit) return explicit;
+  const xdg = env.XDG_DATA_HOME?.trim();
+  if (xdg) return join(xdg, 'qmp-mcp', 'images');
+  const home = env.HOME?.trim();
+  if (home) return join(home, '.local', 'share', 'qmp-mcp', 'images');
+  return join(tmpdir(), 'qmp-mcp', 'images');
+}
+
+/** Resolve the maximum disk size cap in GiB (`QMP_MCP_MAX_DISK_GB`, default 64). */
+export function resolveMaxDiskGb(env: NodeJS.ProcessEnv): number {
+  return parsePositiveInt('QMP_MCP_MAX_DISK_GB', env.QMP_MCP_MAX_DISK_GB, 64);
 }
 
 /**
@@ -191,5 +242,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     apiKeys,
     jwtSecret,
     allowInsecure,
+    imageDir: resolveImageDir(env),
+    maxDiskGb: resolveMaxDiskGb(env),
   };
 }
