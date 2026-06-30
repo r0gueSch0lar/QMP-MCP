@@ -1,0 +1,53 @@
+{
+  "name": "qmp-mcp",
+  "version": "0.1.0",
+  "description": "Secure MCP server that builds, launches, drives, and tears down a single QEMU VM via QMP.",
+  "type": "module",
+  "bin": {
+    "qmp-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "qemu",
+    "qmp",
+    "model-context-protocol",
+    "virtualization"
+  ],
+  "license": "MIT",
+  "author": "foo",
+  "repository": {
+    "type": "git",
+    "url": "git+http://gitlab/foo/qmp-mcp.git"
+  },
+  "bugs": {
+    "url": "http://gitlab/foo/qmp-mcp/-/issues"
+  },
+  "homepage": "http://gitlab/foo/qmp-mcp#readme",
+  "dependencies": {
+    "mcp-framework": "^0.2.22",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.0"
+  }
+}
