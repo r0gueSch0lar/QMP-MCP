@@ -1,24 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import { type Config, ConfigError, loadConfig } from './config.js';
 
+/** The full default config when the environment is empty (stdio, no auth). */
+const DEFAULTS: Config = {
+  transport: 'stdio',
+  logLevel: 'info',
+  httpHost: '127.0.0.1',
+  httpPort: 8080,
+  httpEndpoint: '/mcp',
+  allowedOrigins: ['http://localhost:8080', 'http://127.0.0.1:8080'],
+  authMode: 'apikey',
+  apiKeys: [],
+  jwtSecret: undefined,
+  allowInsecure: false,
+};
+
 describe('loadConfig', () => {
-  it('defaults to stdio transport and info log level when env is empty', () => {
-    const config: Config = loadConfig({});
-    expect(config).toEqual({ transport: 'stdio', logLevel: 'info' });
+  it('defaults to a stdio, no-auth config when env is empty', () => {
+    expect(loadConfig({})).toEqual(DEFAULTS);
   });
 
   it('reads valid values and normalises case', () => {
-    expect(loadConfig({ QMP_MCP_TRANSPORT: 'HTTP', QMP_MCP_LOG_LEVEL: 'Debug' })).toEqual({
-      transport: 'http',
-      logLevel: 'debug',
+    const config = loadConfig({
+      QMP_MCP_TRANSPORT: 'HTTP',
+      QMP_MCP_LOG_LEVEL: 'Debug',
+      QMP_MCP_AUTH: 'ApiKey',
+      QMP_MCP_API_KEYS: 'k1',
     });
+    expect(config.transport).toBe('http');
+    expect(config.logLevel).toBe('debug');
+    expect(config.authMode).toBe('apikey');
   });
 
   it('treats an empty string as unset and uses the default', () => {
-    expect(loadConfig({ QMP_MCP_TRANSPORT: '' })).toEqual({
-      transport: 'stdio',
-      logLevel: 'info',
-    });
+    expect(loadConfig({ QMP_MCP_TRANSPORT: '' })).toEqual(DEFAULTS);
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {
@@ -37,5 +52,143 @@ describe('loadConfig', () => {
     expect(thrown).toBeInstanceOf(ConfigError);
     expect((thrown as Error).message).toContain('QMP_MCP_LOG_LEVEL');
     expect((thrown as Error).message).toContain('debug, info, warning, error');
+  });
+
+  describe('HTTP host/port/endpoint', () => {
+    it('uses safe defaults (127.0.0.1:8080 /mcp) when unset', () => {
+      const config = loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_API_KEYS: 'k' });
+      expect(config.httpHost).toBe('127.0.0.1');
+      expect(config.httpPort).toBe(8080);
+      expect(config.httpEndpoint).toBe('/mcp');
+    });
+
+    it('reads host/port/endpoint from env and trims them', () => {
+      const config = loadConfig({
+        QMP_MCP_TRANSPORT: 'http',
+        QMP_MCP_API_KEYS: 'k',
+        QMP_MCP_HTTP_HOST: ' 0.0.0.0 ',
+        QMP_MCP_HTTP_PORT: '9000',
+        QMP_MCP_HTTP_ENDPOINT: ' /rpc ',
+      });
+      expect(config.httpHost).toBe('0.0.0.0');
+      expect(config.httpPort).toBe(9000);
+      expect(config.httpEndpoint).toBe('/rpc');
+    });
+
+    it('derives the default allowed origins from the configured port', () => {
+      const config = loadConfig({
+        QMP_MCP_TRANSPORT: 'http',
+        QMP_MCP_API_KEYS: 'k',
+        QMP_MCP_HTTP_PORT: '9000',
+      });
+      expect(config.allowedOrigins).toEqual(['http://localhost:9000', 'http://127.0.0.1:9000']);
+    });
+
+    it('lets an explicit allowed-origins list override the default', () => {
+      const config = loadConfig({
+        QMP_MCP_TRANSPORT: 'http',
+        QMP_MCP_API_KEYS: 'k',
+        QMP_MCP_HTTP_ALLOWED_ORIGINS: 'https://app.example.com, https://admin.example.com ',
+      });
+      expect(config.allowedOrigins).toEqual([
+        'https://app.example.com',
+        'https://admin.example.com',
+      ]);
+    });
+
+    it.each([
+      'abc',
+      '8080x',
+      '0',
+      '70000',
+      '-1',
+      '80.5',
+    ])('fails closed on the invalid port %p', (port) => {
+      expect(() =>
+        loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_API_KEYS: 'k', QMP_MCP_HTTP_PORT: port }),
+      ).toThrowError(/QMP_MCP_HTTP_PORT must be an integer port in 1\.\.65535/);
+    });
+  });
+
+  describe('API-key fail-closed (ADR-0005)', () => {
+    it('throws naming QMP_MCP_API_KEYS and QMP_MCP_ALLOW_INSECURE when http has no keys', () => {
+      let thrown: unknown;
+      try {
+        loadConfig({ QMP_MCP_TRANSPORT: 'http' });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message).toContain('QMP_MCP_API_KEYS');
+      expect((thrown as Error).message).toContain('QMP_MCP_ALLOW_INSECURE');
+    });
+
+    it('also fails closed for transport "both" with no keys', () => {
+      expect(() => loadConfig({ QMP_MCP_TRANSPORT: 'both' })).toThrowError(ConfigError);
+    });
+
+    it('treats a keys value of only commas/whitespace as empty and fails closed', () => {
+      expect(() =>
+        loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_API_KEYS: ' , ,, ' }),
+      ).toThrowError(ConfigError);
+    });
+
+    it('accepts http when keys are configured, parsing and trimming them', () => {
+      const config = loadConfig({
+        QMP_MCP_TRANSPORT: 'http',
+        QMP_MCP_API_KEYS: 'k1, k2 ,, k3 ',
+      });
+      expect(config.apiKeys).toEqual(['k1', 'k2', 'k3']);
+      expect(config.authMode).toBe('apikey');
+    });
+
+    it('permits unauthenticated http when QMP_MCP_ALLOW_INSECURE=true with no keys', () => {
+      const config = loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_ALLOW_INSECURE: 'true' });
+      expect(config.allowInsecure).toBe(true);
+      expect(config.apiKeys).toEqual([]);
+    });
+  });
+
+  describe('JWT fail-closed (ADR-0005)', () => {
+    it('throws naming QMP_MCP_JWT_SECRET when http+jwt has no secret', () => {
+      let thrown: unknown;
+      try {
+        loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_AUTH: 'jwt' });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message).toContain('QMP_MCP_JWT_SECRET');
+    });
+
+    it('treats a whitespace-only secret as unset and fails closed', () => {
+      expect(() =>
+        loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_AUTH: 'jwt', QMP_MCP_JWT_SECRET: '   ' }),
+      ).toThrowError(/QMP_MCP_JWT_SECRET/);
+    });
+
+    it('accepts http+jwt when the secret is set', () => {
+      const config = loadConfig({
+        QMP_MCP_TRANSPORT: 'http',
+        QMP_MCP_AUTH: 'jwt',
+        QMP_MCP_JWT_SECRET: 's3cr3t',
+      });
+      expect(config.authMode).toBe('jwt');
+      expect(config.jwtSecret).toBe('s3cr3t');
+    });
+  });
+
+  describe('insecure override', () => {
+    it('rejects a non-boolean QMP_MCP_ALLOW_INSECURE', () => {
+      expect(() =>
+        loadConfig({ QMP_MCP_TRANSPORT: 'http', QMP_MCP_ALLOW_INSECURE: 'yes' }),
+      ).toThrowError(/QMP_MCP_ALLOW_INSECURE must be "true" or "false"/);
+    });
+  });
+
+  it('does not require http auth when the transport is stdio', () => {
+    // stdio never exposes a network port, so missing http auth must not throw.
+    expect(() => loadConfig({ QMP_MCP_TRANSPORT: 'stdio' })).not.toThrow();
+    expect(loadConfig({ QMP_MCP_AUTH: 'jwt' }).authMode).toBe('jwt');
   });
 });
