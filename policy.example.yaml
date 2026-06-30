@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# qmp-mcp Command Policy — example file
+# ---------------------------------------------------------------------------
+# The Command Policy governs which QMP commands the generic `qmp_execute` tool
+# may run (ADR-0003). It has three layers, in strict precedence:
+#
+#   1. An IMMUTABLE HARD DENYLIST (highest precedence) — defined in the server's
+#      source, NOT here. Commands on it are ALWAYS refused and can NEVER be
+#      re-enabled by this file, by QMP_MCP_ALLOW, or by anything else. Listing
+#      one under `allow:` below has no effect (the server logs a warning and
+#      keeps it denied). The hard denylist currently includes, among others:
+#
+#        human-monitor-command            (runs arbitrary HMP — bypasses QMP)
+#        migrate / migrate-incoming       (exfiltrate/inject full VM state)
+#        migrate-set-parameters
+#        migrate-set-capabilities
+#        migrate-recover / migrate-pause  (steer an in-flight migration)
+#        migrate-continue / migrate-start-postcopy
+#        xen-save-devices-state           (serialise device state to a host fd)
+#        xen-load-devices-state
+#        dump-guest-memory / pmemsave     (copy guest/host memory to a host file)
+#        memsave
+#        object-add / blockdev-add        (wire up host-backed objects/backends)
+#        device_add / netdev_add
+#        chardev-add / chardev-change
+#        qom-set                          (write arbitrary QOM object properties)
+#        getfd / add-fd                   (pass host file descriptors to QEMU)
+#        drive-backup / blockdev-backup   (copy a guest disk to the host/network)
+#        drive-mirror / blockdev-mirror
+#        blockdev-create
+#        block-export-add
+#        nbd-server-start / nbd-server-add
+#        block-commit / block-stream      (mutate/grow a guest disk in place)
+#        block_resize
+#        blockdev-snapshot                (write a snapshot image to a host path)
+#        blockdev-snapshot-sync
+#        blockdev-snapshot-internal-sync
+#
+#      Each can exfiltrate guest/host memory, read or write arbitrary host files,
+#      open host resources, or run arbitrary HMP. This boundary is by design.
+#
+#   2. A curated DEFAULT-SAFE ALLOWLIST (built in) — read/query commands plus a
+#      few safe control commands (query-status, query-block, query-cpus-fast,
+#      query-version, stop, cont, system_reset, system_powerdown, …). Anything
+#      not on it is denied by default (default-deny). Note: `screendump` is NOT
+#      on it — it writes an arbitrary host file and is reachable only through the
+#      dedicated `screendump` tool, which server-controls the destination path.
+#
+#   3. OPERATOR OVERRIDES — the `allow:` and `deny:` lists in this file (and the
+#      QMP_MCP_ALLOW / QMP_MCP_DENY environment variables). They may ADD to or
+#      REMOVE from the allowlist, but can never resurrect a hard-denied command.
+#      When a command is in both an allow and a deny list, DENY WINS (fail-closed).
+#
+# To use this file: copy it, edit the lists, and point the server at it with
+#   QMP_MCP_POLICY_FILE=/path/to/policy.yaml
+# Command names are matched case- and whitespace-insensitively (`MIGRATE` and
+# ` migrate ` are the same as `migrate`). A missing or malformed file makes the
+# server fail closed at startup with an error naming QMP_MCP_POLICY_FILE.
+# ---------------------------------------------------------------------------
+
+# Commands to ADD to the default-safe allowlist. Use this to widen the generic
+# tool to extra read-only / introspection commands you trust. (Hard-denied
+# commands listed here are ignored and stay denied.)
+allow:
+  - query-pci
+  - query-fdsets
+  - query-tpm
+  - query-rocker
+
+# Commands to REMOVE from the allowlist, even if they are in the built-in
+# defaults. Use this to tighten the policy further than the defaults. (Example:
+# drop the ACPI power button so the generic tool can no longer ask the guest to
+# power off — it stays reachable through the dedicated powerdown tool.)
+deny:
+  - system_powerdown
