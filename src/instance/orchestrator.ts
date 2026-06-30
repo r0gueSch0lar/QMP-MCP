@@ -15,7 +15,13 @@
 import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveImageDir, resolveIsoDir } from '../config.js';
+import {
+  type PortRange,
+  resolveAllowHostNet,
+  resolveHostfwdPortRange,
+  resolveImageDir,
+  resolveIsoDir,
+} from '../config.js';
 import { logger } from '../logger.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
@@ -72,6 +78,17 @@ export interface OrchestratorOptions {
    * spec with no cdrom never needs it.
    */
   isoDir?: string;
+  /**
+   * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
+   * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
+   * inside the argv builder when omitted.
+   */
+  hostfwdPortRange?: PortRange;
+  /**
+   * Whether host-level (`tap`/`bridge`) networking is permitted (ADR-0009).
+   * Optional: defaults to false (host networking refused) when omitted.
+   */
+  allowHostNet?: boolean;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -185,6 +202,8 @@ export class Orchestrator {
         qmpSocketPath,
         imageDir: this.#options.imageDir,
         isoDir: this.#options.isoDir,
+        hostfwdPortRange: this.#options.hostfwdPortRange,
+        allowHostNet: this.#options.allowHostNet,
       });
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
@@ -295,6 +314,9 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   imageDir: resolveImageDir(process.env),
   // Resolve cdrom ISO names against the configured read-only ISO Store (ADR-0006).
   isoDir: resolveIsoDir(process.env),
+  // Bound user-mode port-forwards and gate host networking (ADR-0009).
+  hostfwdPortRange: resolveHostfwdPortRange(process.env),
+  allowHostNet: resolveAllowHostNet(process.env),
   // `/dev/kvm` probe (single source of truth) from the hardware-spec module.
   kvmAvailable: probeKvm,
   socketOccupied: defaultSocketOccupied,
