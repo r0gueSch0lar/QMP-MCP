@@ -12,6 +12,7 @@
 
 import { accessSync, constants } from 'node:fs';
 import { z } from 'zod';
+import { DEFAULT_HOSTFWD_PORT_RANGE, type PortRange } from '../config.js';
 import { IMAGE_FORMATS, ImageStoreError, resolveImagePath } from './image-store.js';
 import { IsoStoreError, resolveIsoPath } from './iso-store.js';
 
@@ -77,6 +78,96 @@ export const cdromSchema = z
 
 /** A validated CD-ROM entry. */
 export type Cdrom = z.infer<typeof cdromSchema>;
+
+/**
+ * Strict allowlist of guest NIC models the agent may pick (ADR-0009). The model
+ * is emitted verbatim into `-device <model>,netdev=...`, so it is a CLOSED enum,
+ * never a free string: a free string could carry a comma to inject extra
+ * `-device` properties (e.g. a second device, an `addr=`), or an unknown model.
+ * Keep this list short and boring — paravirtual `virtio-net-pci` plus two widely
+ * emulated legacy NICs for guests without virtio drivers.
+ */
+export const NIC_MODELS = ['virtio-net-pci', 'e1000', 'rtl8139'] as const;
+export type NicModel = (typeof NIC_MODELS)[number];
+
+/**
+ * Guest networking backend. `user` is QEMU user-mode networking (SLiRP): NAT'd
+ * outbound with the host network unexposed and inbound only via explicit
+ * port-forwards — the safe, unprivileged default (ADR-0009). `tap`/`bridge` put
+ * the guest on the host LAN and need host privileges, so they are env-gated off
+ * (see `QMP_MCP_ALLOW_HOST_NET`).
+ */
+export const NETWORK_MODES = ['user', 'tap', 'bridge'] as const;
+export type NetworkMode = (typeof NETWORK_MODES)[number];
+
+/** Transport protocol for a user-mode port-forward. */
+export const NET_PROTOCOLS = ['tcp', 'udp'] as const;
+export type NetProtocol = (typeof NET_PROTOCOLS)[number];
+
+/**
+ * A single user-mode port-forward: expose guest `guestPort` on host `hostPort`.
+ * Both ports are integers (1..65535) and `proto` is a closed enum, so the
+ * generated `hostfwd=` value carries no agent free-text — it is built from
+ * validated ints only. `hostPort` is additionally bounded to a configurable host
+ * range at argv time (see `QMP_MCP_HOSTFWD_PORT_RANGE`).
+ */
+export const hostForwardSchema = z
+  .object({
+    hostPort: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .describe('Host TCP/UDP port to bind (1-65535, and within QMP_MCP_HOSTFWD_PORT_RANGE).'),
+    guestPort: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .describe('Guest port the forward targets (1-65535).'),
+    proto: z
+      .enum(NET_PROTOCOLS)
+      .default('tcp')
+      .describe("Forward protocol: 'tcp' (default) or 'udp'."),
+  })
+  .strict();
+
+/** A validated port-forward (proto default resolved). */
+export type HostForward = z.infer<typeof hostForwardSchema>;
+
+/**
+ * The guest NIC. Defaults to a single user-mode (SLiRP) `virtio-net-pci` with no
+ * port-forwards: working outbound connectivity, zero host exposure, no privileges
+ * (ADR-0009). `model` and `mode` are closed enums (never free strings) so neither
+ * can inject extra `-device`/`-netdev` options. `hostForwards` apply only to
+ * `user` mode.
+ */
+export const networkSchema = z
+  .object({
+    mode: z
+      .enum(NETWORK_MODES)
+      .default('user')
+      .describe(
+        "Networking backend: 'user' (default, SLiRP NAT) or 'tap'/'bridge' (host networking, " +
+          'requires QMP_MCP_ALLOW_HOST_NET=true).',
+      ),
+    model: z
+      .enum(NIC_MODELS)
+      .default('virtio-net-pci')
+      .describe(
+        "Guest NIC model from a fixed allowlist: 'virtio-net-pci' (default), 'e1000', or 'rtl8139'.",
+      ),
+    hostForwards: z
+      .array(hostForwardSchema)
+      .default([])
+      .describe(
+        'User-mode inbound port-forwards (host port -> guest port). Only valid for mode "user".',
+      ),
+  })
+  .strict();
+
+/** A validated guest NIC (all defaults resolved). */
+export type Network = z.infer<typeof networkSchema>;
 
 /**
  * Strict allowlist for the `-boot order=` value: one or more of QEMU's legal boot
@@ -147,6 +238,9 @@ export const hardwareSpecSchema = z
       .describe(
         "Optional boot order as QEMU drive letters, e.g. 'd' (CD-ROM first) or 'dc'. Emitted as -boot order=.",
       ),
+    network: networkSchema
+      .default({})
+      .describe('Guest NIC; defaults to user-mode (SLiRP) networking with no port-forwards.'),
   })
   .strict();
 
@@ -272,6 +366,19 @@ export interface ArgvOptions {
    * for a spec that has a cdrom fails closed naming `QMP_MCP_ISO_DIR`.
    */
   isoDir?: string;
+  /**
+   * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
+   * within (`QMP_MCP_HOSTFWD_PORT_RANGE`). A forward outside it is rejected
+   * naming the range. Defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE} when omitted
+   * (ADR-0009).
+   */
+  hostfwdPortRange?: PortRange;
+  /**
+   * Whether host-level (`tap`/`bridge`) networking is permitted
+   * (`QMP_MCP_ALLOW_HOST_NET`). Defaults to false: a `tap`/`bridge` spec is
+   * refused with an actionable error unless this is explicitly enabled (ADR-0009).
+   */
+  allowHostNet?: boolean;
 }
 
 /**
@@ -355,6 +462,85 @@ function buildCdromArgs(cdrom: Cdrom, isoDir: string | undefined): [string, stri
 }
 
 /**
+ * Fixed id tying a `-netdev` backend to its `-device` NIC. A single NIC is
+ * supported per Instance in this slice, so a constant id is sufficient — and
+ * being a constant (not agent-controlled) it can carry no injected option.
+ */
+const NETDEV_ID = 'net0';
+
+/**
+ * Render the `-netdev`/`-device` pair for the guest NIC (ADR-0009).
+ *
+ * - `user` mode emits `-netdev user,id=net0[,hostfwd=...]` (SLiRP NAT) plus
+ *   `-device <model>,netdev=net0`. Each `hostForwards` entry becomes a
+ *   `hostfwd=<proto>:127.0.0.1:<hostPort>-:<guestPort>` built from validated
+ *   ints/enums only. The host address is pinned to `127.0.0.1` (loopback) so the
+ *   forward is reachable only from the host itself, never the host LAN — an empty
+ *   host-address field would bind `0.0.0.0` and contradict ADR-0009's zero host
+ *   exposure default. `hostPort` is bounded to `hostfwdPortRange` here (argv
+ *   time), and a port outside it is rejected with a {@link HardwareSpecError}
+ *   NAMING the range and the offending value.
+ * - `tap`/`bridge` mode is host networking and is REFUSED unless `allowHostNet`
+ *   is true; when allowed it emits `-netdev <mode>,id=net0` plus the same
+ *   `-device` (the operator is responsible for host privileges/configuration —
+ *   the server never configures the host). `hostForwards` are a user-mode-only
+ *   concept, so supplying them with `tap`/`bridge` is REFUSED rather than
+ *   silently ignored.
+ *
+ * The NIC `model` and `mode` are closed enums, so no agent free-text reaches the
+ * option string; the model is comma-escaped anyway as defense-in-depth so it can
+ * never split off an extra `-device`/`-netdev` property.
+ */
+function buildNetworkArgs(network: Network, options: ArgvOptions): string[] {
+  // model is an allowlisted enum; escape defensively so it can never inject an
+  // extra -device property no matter how the allowlist evolves.
+  const device = `${escapeQemuOptsValue(network.model)},netdev=${NETDEV_ID}`;
+
+  // hostForwards are a user-mode (SLiRP) concept only; QEMU has nowhere to apply
+  // them under tap/bridge. Refuse rather than silently drop them so the agent
+  // is told its forwards would not take effect (fail-closed, ADR-0009).
+  if (network.mode !== 'user' && network.hostForwards.length > 0) {
+    throw new HardwareSpecError(
+      `network.hostForwards are only valid for user-mode networking (mode "user"), but mode is ` +
+        `"${network.mode}". Host-level (${network.mode}) networking puts the guest on the host LAN, ` +
+        `where QEMU user-mode port-forwards do not apply. Remove hostForwards, or use mode "user".`,
+    );
+  }
+
+  if (network.mode === 'user') {
+    const range = options.hostfwdPortRange ?? DEFAULT_HOSTFWD_PORT_RANGE;
+    const netdevParts = ['user', `id=${NETDEV_ID}`];
+    for (const fwd of network.hostForwards) {
+      if (fwd.hostPort < range.low || fwd.hostPort > range.high) {
+        throw new HardwareSpecError(
+          `Host port-forward hostPort ${fwd.hostPort} is outside the allowed host-port range ` +
+            `${range.low}-${range.high} (QMP_MCP_HOSTFWD_PORT_RANGE). Choose a hostPort within ` +
+            `${range.low}-${range.high}, or widen the range via QMP_MCP_HOSTFWD_PORT_RANGE.`,
+        );
+      }
+      // proto is an enum and both ports are validated ints — no free-text here.
+      // The host address is pinned to 127.0.0.1 (loopback) so the forward is
+      // reachable only from the host itself, not the host LAN: an empty host
+      // address would bind 0.0.0.0 and break ADR-0009's zero host exposure.
+      netdevParts.push(`hostfwd=${fwd.proto}:127.0.0.1:${fwd.hostPort}-:${fwd.guestPort}`);
+    }
+    return ['-netdev', netdevParts.join(','), '-device', device];
+  }
+
+  // tap / bridge: host-level networking, env-gated off by default (ADR-0008/0009).
+  if (options.allowHostNet !== true) {
+    throw new HardwareSpecError(
+      `network.mode "${network.mode}" requests host-level (${network.mode}) networking, which puts the ` +
+        'guest on the host LAN and needs host privileges, so it is refused by default (ADR-0009). ' +
+        'Use mode "user" for default user-mode networking, or set QMP_MCP_ALLOW_HOST_NET=true to opt ' +
+        'in (the operator must provision the host bridge/tap; the server does not configure the host).',
+    );
+  }
+  // mode is an allowlisted enum; escape defensively as with the model.
+  return ['-netdev', `${escapeQemuOptsValue(network.mode)},id=${NETDEV_ID}`, '-device', device];
+}
+
+/**
  * Generate the full `qemu-system-*` argv (excluding the program name) from a
  * validated Hardware Spec. Pure: same inputs always yield the same array.
  *
@@ -389,6 +575,8 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
     // a second -boot option or an extra argv token.
     argv.push('-boot', `order=${escapeQemuOptsValue(spec.boot)}`);
   }
+  // Guest NIC: user-mode (SLiRP) by default; tap/bridge only when env-gated on.
+  argv.push(...buildNetworkArgs(spec.network, options));
   argv.push('-qmp', `unix:${options.qmpSocketPath},server=on,wait=off`);
   return argv;
 }
