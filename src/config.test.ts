@@ -6,6 +6,9 @@ import { type Config, ConfigError, loadConfig } from './config.js';
 /** The host-agnostic default Image Store dir for an empty environment. */
 const DEFAULT_IMAGE_DIR = join(tmpdir(), 'qmp-mcp', 'images');
 
+/** The host-agnostic default ISO Store dir for an empty environment. */
+const DEFAULT_ISO_DIR = join(tmpdir(), 'qmp-mcp', 'isos');
+
 /** The full default config when the environment is empty (stdio, no auth). */
 const DEFAULTS: Config = {
   transport: 'stdio',
@@ -19,6 +22,7 @@ const DEFAULTS: Config = {
   jwtSecret: undefined,
   allowInsecure: false,
   imageDir: DEFAULT_IMAGE_DIR,
+  isoDir: DEFAULT_ISO_DIR,
   maxDiskGb: 64,
 };
 
@@ -215,6 +219,24 @@ describe('loadConfig', () => {
         /QMP_MCP_MAX_DISK_GB must be a positive integer/,
       );
       expect(() => loadConfig({ QMP_MCP_MAX_DISK_GB: '0' })).toThrowError(/QMP_MCP_MAX_DISK_GB/);
+    });
+  });
+
+  describe('ISO Store (ADR-0006)', () => {
+    it('defaults the ISO Store dir host-agnostically, separate from the Image Store', () => {
+      const config = loadConfig({});
+      expect(config.isoDir).toBe(DEFAULT_ISO_DIR);
+      // The two stores are SEPARATE directories (read-write vs read-only).
+      expect(config.isoDir).not.toBe(config.imageDir);
+    });
+
+    it('takes an explicit QMP_MCP_ISO_DIR verbatim, trimmed', () => {
+      expect(loadConfig({ QMP_MCP_ISO_DIR: ' /srv/isos ' }).isoDir).toBe('/srv/isos');
+    });
+
+    it('derives the default dir from XDG_DATA_HOME, then HOME', () => {
+      expect(loadConfig({ XDG_DATA_HOME: '/x/data' }).isoDir).toBe('/x/data/qmp-mcp/isos');
+      expect(loadConfig({ HOME: '/home/u' }).isoDir).toBe('/home/u/.local/share/qmp-mcp/isos');
     });
   });
 

@@ -55,6 +55,12 @@ export interface Config {
    */
   imageDir: string;
   /**
+   * Absolute path of the read-only ISO Store directory (ADR-0006): the separate
+   * allowlisted directory installation/boot ISO media live in. ISOs are
+   * referenced by name within it, never by host path, and it is never written to.
+   */
+  isoDir: string;
+  /**
    * Hard cap, in GiB, on the virtual size of a disk image {@link createImage}
    * may allocate. A larger request is rejected naming this cap.
    */
@@ -163,6 +169,26 @@ export function resolveImageDir(env: NodeJS.ProcessEnv): string {
   return join(tmpdir(), 'qmp-mcp', 'images');
 }
 
+/**
+ * Resolve the read-only ISO Store directory (ADR-0006/0007). Mirrors
+ * {@link resolveImageDir} but is a SEPARATE directory (`isos`, not `images`) so
+ * install media and writable disks have different permissions: an explicit
+ * `QMP_MCP_ISO_DIR` wins; otherwise a host-agnostic default is derived from the
+ * XDG/HOME data dirs (and finally the OS temp dir), so the bare-metal default
+ * never assumes the Docker filesystem layout — the container image overrides it
+ * via env. Exported so the ISO Store and {@link loadConfig} share one source of
+ * truth.
+ */
+export function resolveIsoDir(env: NodeJS.ProcessEnv): string {
+  const explicit = env.QMP_MCP_ISO_DIR?.trim();
+  if (explicit) return explicit;
+  const xdg = env.XDG_DATA_HOME?.trim();
+  if (xdg) return join(xdg, 'qmp-mcp', 'isos');
+  const home = env.HOME?.trim();
+  if (home) return join(home, '.local', 'share', 'qmp-mcp', 'isos');
+  return join(tmpdir(), 'qmp-mcp', 'isos');
+}
+
 /** Resolve the maximum disk size cap in GiB (`QMP_MCP_MAX_DISK_GB`, default 64). */
 export function resolveMaxDiskGb(env: NodeJS.ProcessEnv): number {
   return parsePositiveInt('QMP_MCP_MAX_DISK_GB', env.QMP_MCP_MAX_DISK_GB, 64);
@@ -243,6 +269,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     jwtSecret,
     allowInsecure,
     imageDir: resolveImageDir(env),
+    isoDir: resolveIsoDir(env),
     maxDiskGb: resolveMaxDiskGb(env),
   };
 }

@@ -13,6 +13,7 @@
 import { accessSync, constants } from 'node:fs';
 import { z } from 'zod';
 import { IMAGE_FORMATS, ImageStoreError, resolveImagePath } from './image-store.js';
+import { IsoStoreError, resolveIsoPath } from './iso-store.js';
 
 /** Concrete accelerators QEMU can be launched with. */
 export type Accel = 'kvm' | 'tcg';
@@ -61,6 +62,38 @@ export const diskSchema = z
 export type Disk = z.infer<typeof diskSchema>;
 
 /**
+ * A CD-ROM drive backed by an ISO from the read-only ISO Store (ADR-0006). The
+ * ISO is referenced by NAME within the ISO Store, never by host path — the same
+ * containment boundary as disks, but against a separate, read-only directory.
+ */
+export const cdromSchema = z
+  .object({
+    iso: z
+      .string()
+      .min(1)
+      .describe('Name of an ISO in the read-only ISO Store (a bare name, never a host path).'),
+  })
+  .strict();
+
+/** A validated CD-ROM entry. */
+export type Cdrom = z.infer<typeof cdromSchema>;
+
+/**
+ * Strict allowlist for the `-boot order=` value: one or more of QEMU's legal boot
+ * drive letters — `a`/`b` (floppy), `c` (first disk), `d` (first CD-ROM),
+ * `n`-`p` (network). This is the security-critical rule for boot: it admits ONLY
+ * those letters, so a value can carry no comma, `=`, space, or other QemuOpts
+ * separator that would let it inject a second `-boot` option (e.g. `menu=on`,
+ * `reboot-timeout=`) or split off an extra argv token. The server always emits it
+ * as the single `order=<letters>` form.
+ */
+const VALID_BOOT_ORDER = /^[a-dnp]+$/;
+
+const bootOrderMessage =
+  'boot must match ^[a-dnp]+ — one or more QEMU boot drive letters (a/b floppy, c disk, ' +
+  "d cd-rom, n-p network), with no comma, '=', or spaces (these could inject extra -boot options).";
+
+/**
  * Conservative charset for `-machine`/`-cpu` model names: a leading alphanumeric
  * then alphanumerics, dot, underscore, plus, or hyphen. It excludes the comma,
  * space, and `=` that QEMU treats as QemuOpts property separators — a comma in
@@ -104,6 +137,16 @@ export const hardwareSpecSchema = z
       .array(diskSchema)
       .default([])
       .describe('Guest disks, each referencing an image by name in the Image Store.'),
+    cdrom: cdromSchema
+      .optional()
+      .describe('Optional CD-ROM drive backed by an ISO (by name) from the read-only ISO Store.'),
+    boot: z
+      .string()
+      .regex(VALID_BOOT_ORDER, bootOrderMessage)
+      .optional()
+      .describe(
+        "Optional boot order as QEMU drive letters, e.g. 'd' (CD-ROM first) or 'dc'. Emitted as -boot order=.",
+      ),
   })
   .strict();
 
@@ -223,6 +266,12 @@ export interface ArgvOptions {
    * for a spec that has disks fails closed.
    */
   imageDir?: string;
+  /**
+   * Absolute path of the read-only ISO Store directory (ADR-0006). Required only
+   * when the spec has a cdrom; the ISO name is resolved against it. Omitting it
+   * for a spec that has a cdrom fails closed naming `QMP_MCP_ISO_DIR`.
+   */
+  isoDir?: string;
 }
 
 /**
@@ -272,6 +321,40 @@ function buildDriveArgs(disk: Disk, imageDir: string | undefined): [string, stri
 }
 
 /**
+ * Resolve a CD-ROM's ISO name to a safe in-Store path and render a read-only
+ * `-drive ...,media=cdrom,readonly=on` argument pair. The ISO is resolved against
+ * the SEPARATE read-only ISO Store; `format=raw` is pinned explicitly (an ISO is
+ * a raw image — never rely on QEMU's auto-probing), and the path is comma-escaped
+ * so it cannot inject extra `-drive` properties. Any out-of-store, absolute,
+ * traversal, or symlink-escape reference is rejected here (argv time) as a
+ * {@link HardwareSpecError}; a cdrom with no ISO Store configured fails closed.
+ */
+function buildCdromArgs(cdrom: Cdrom, isoDir: string | undefined): [string, string] {
+  if (isoDir === undefined || isoDir.trim() === '') {
+    throw new HardwareSpecError(
+      `A CD-ROM with ISO "${cdrom.iso}" was requested but the ISO Store directory is not configured. ` +
+        `Set QMP_MCP_ISO_DIR to the read-only ISO Store path.`,
+    );
+  }
+  let path: string;
+  try {
+    path = resolveIsoPath(cdrom.iso, isoDir);
+  } catch (err) {
+    const detail = err instanceof IsoStoreError ? err.message : String(err);
+    throw new HardwareSpecError(`Invalid ISO reference: ${detail}`);
+  }
+  const parts = [
+    `file=${escapeQemuOptsValue(path)}`,
+    'media=cdrom',
+    'readonly=on',
+    // Explicit format= defeats QEMU format auto-probing (a known security footgun);
+    // an ISO is a raw image.
+    'format=raw',
+  ];
+  return ['-drive', parts.join(',')];
+}
+
+/**
  * Generate the full `qemu-system-*` argv (excluding the program name) from a
  * validated Hardware Spec. Pure: same inputs always yield the same array.
  *
@@ -296,6 +379,15 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   ];
   for (const disk of spec.disks) {
     argv.push(...buildDriveArgs(disk, options.imageDir));
+  }
+  if (spec.cdrom !== undefined) {
+    argv.push(...buildCdromArgs(spec.cdrom, options.isoDir));
+  }
+  if (spec.boot !== undefined) {
+    // boot is already allowlisted to [a-dnp]+ by the schema; emit the single
+    // order= form (and comma-escape as defense-in-depth) so it can never inject
+    // a second -boot option or an extra argv token.
+    argv.push('-boot', `order=${escapeQemuOptsValue(spec.boot)}`);
   }
   argv.push('-qmp', `unix:${options.qmpSocketPath},server=on,wait=off`);
   return argv;
