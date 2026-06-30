@@ -1,0 +1,52 @@
+default:
+  image: node:20
+
+# Ordered gate: a failure short-circuits the rest, and the build artifact is only
+# produced from a tree that passed lint, typecheck, and tests.
+stages:
+  - lint
+  - typecheck
+  - test
+  - build
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm/
+
+.node:
+  before_script:
+    - npm ci
+
+lint:
+  stage: lint
+  extends: .node
+  script:
+    - npm run lint
+
+typecheck:
+  stage: typecheck
+  extends: .node
+  script:
+    - npm run typecheck
+
+test:
+  stage: test
+  extends: .node
+  script:
+    - npm run test
+
+build:
+  stage: build
+  extends: .node
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
