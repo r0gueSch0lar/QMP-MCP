@@ -28,6 +28,7 @@ const DEFAULTS: Config = {
   maxVcpus: 2,
   hostfwdPortRange: { low: 1024, high: 65535 },
   allowHostNet: false,
+  eventBufferSize: 256,
 };
 
 describe('loadConfig', () => {
@@ -251,6 +252,17 @@ describe('loadConfig', () => {
         /QMP_MCP_MAX_VCPUS must be a positive integer/,
       );
       expect(() => loadConfig({ QMP_MCP_MAX_VCPUS: '0' })).toThrowError(/QMP_MCP_MAX_VCPUS/);
+    });
+
+    it('reads QMP_MCP_EVENT_BUFFER_SIZE and fails closed on a non-positive-integer value', () => {
+      expect(loadConfig({}).eventBufferSize).toBe(256);
+      expect(loadConfig({ QMP_MCP_EVENT_BUFFER_SIZE: '1024' }).eventBufferSize).toBe(1024);
+      expect(() => loadConfig({ QMP_MCP_EVENT_BUFFER_SIZE: 'big' })).toThrowError(
+        /QMP_MCP_EVENT_BUFFER_SIZE must be a positive integer/,
+      );
+      expect(() => loadConfig({ QMP_MCP_EVENT_BUFFER_SIZE: '0' })).toThrowError(
+        /QMP_MCP_EVENT_BUFFER_SIZE/,
+      );
     });
   });
 

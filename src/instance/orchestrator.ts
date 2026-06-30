@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import {
   type PortRange,
   resolveAllowHostNet,
+  resolveEventBufferSize,
   resolveHostfwdPortRange,
   resolveImageDir,
   resolveIsoDir,
@@ -37,6 +38,12 @@ import {
 } from '../policy/command-policy.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
+import {
+  DEFAULT_EVENT_BUFFER_SIZE,
+  EventBuffer,
+  type ReadResult,
+  type WaitForEventResult,
+} from './event-buffer.js';
 import {
   type Accel,
   buildArgv,
@@ -136,6 +143,13 @@ export interface OrchestratorOptions {
    * the env/file-resolved policy).
    */
   commandPolicy?: ResolvedPolicy;
+  /**
+   * Capacity of the Event Buffer that captures the Instance's QMP async events
+   * (`QMP_MCP_EVENT_BUFFER_SIZE`, issue #12). Optional: defaults to
+   * {@link DEFAULT_EVENT_BUFFER_SIZE} when omitted (the singleton injects the
+   * env-resolved value).
+   */
+  eventBufferSize?: number;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -155,6 +169,13 @@ export class LifecycleError extends Error {
     this.name = 'LifecycleError';
   }
 }
+
+/**
+ * Default `wait_for_event` timeout when a caller supplies none (issue #12). A
+ * long-poll horizon: long enough to catch a boot/shutdown, short enough that the
+ * agent regains control to poll again.
+ */
+const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 
 /** Default QMP socket path: a per-server file under the OS runtime/temp dir. */
 export function defaultQmpSocketPath(): string {
@@ -186,6 +207,14 @@ export class Orchestrator {
   #spec?: HardwareSpec;
   #accel?: Accel;
   /**
+   * The Event Buffer capturing the current Instance's QMP async events. One
+   * buffer lives for the server's lifetime; it is {@link EventBuffer.reset} on
+   * every create/destroy so events never bleed across Instances (issue #12).
+   */
+  #eventBuffer: EventBuffer;
+  /** Unsubscribes the buffer from the current Instance's event stream. */
+  #unsubscribeEvents?: () => void;
+  /**
    * Identifies the create_instance call that currently owns the reserved slot.
    * A call only mutates the singleton's fields while its own token is installed,
    * so a superseded launch cannot clobber a slot another call has since taken.
@@ -197,6 +226,7 @@ export class Orchestrator {
     this.#options = options;
     // Resolve the policy once: an omitted policy means the built-in allowlist.
     this.#commandPolicy = options.commandPolicy ?? buildPolicy();
+    this.#eventBuffer = new EventBuffer(options.eventBufferSize ?? DEFAULT_EVENT_BUFFER_SIZE);
   }
 
   /** Return the current Instance view. Reports `NONE` when nothing is running. */
@@ -284,6 +314,10 @@ export class Orchestrator {
       this.#accel = resolution.accel;
       this.#state = 'RUNNING';
       this.#launchToken = undefined;
+      // Start a fresh Event Buffer for this Instance and capture its QMP async
+      // events from here on — no events carry over from a previous Instance.
+      this.#eventBuffer.reset();
+      this.#unsubscribeEvents = process.onEvent((event) => this.#eventBuffer.append(event));
       // If the process exits on its own, reflect that the Instance is gone.
       void process.exited.then(() => this.#onProcessExit());
 
@@ -319,6 +353,11 @@ export class Orchestrator {
     this.#accel = undefined;
     this.#launchToken = undefined;
     this.#state = 'STOPPED';
+    // Detach from the Instance's event stream and clear the buffer (settling any
+    // pending wait_for_event as a clean timeout); events do not outlive the Instance.
+    this.#unsubscribeEvents?.();
+    this.#unsubscribeEvents = undefined;
+    this.#eventBuffer.reset();
     logger.info('destroying Instance');
     try {
       await process.close();
@@ -335,6 +374,38 @@ export class Orchestrator {
    */
   async getStatus(): Promise<unknown> {
     return this.#requireInstance('query its status').execute('query-status');
+  }
+
+  /**
+   * Return the Instance's recently buffered QMP async events WITHOUT blocking
+   * (the `get_events` tool). Cursor-based: with no `since`, returns every buffered
+   * event plus a `cursor`; passing that `cursor` back as `since` next time pages
+   * forward without missing or repeating events. Rejects when no Instance runs.
+   */
+  getEvents(since?: number): ReadResult {
+    this.#requireInstance('read its events');
+    return this.#eventBuffer.read(since);
+  }
+
+  /**
+   * Long-poll for a matching QMP async event (the `wait_for_event` tool). Resolves
+   * — never rejects — with the first matching event, or with `{ timedOut: true }`
+   * once `timeoutMs` elapses (a timeout is a NORMAL outcome). With no `eventName`
+   * any event matches. Pass `sinceCursor` (a prior `cursor`) to also consider
+   * already-buffered events, so an event that arrived between calls is not lost;
+   * without it the wait is future-only. Rejects only when no Instance runs.
+   */
+  async waitForEvent(opts: {
+    eventName?: string;
+    timeoutMs?: number;
+    sinceCursor?: number;
+  }): Promise<WaitForEventResult> {
+    this.#requireInstance('wait for its events');
+    return this.#eventBuffer.waitFor({
+      eventName: opts.eventName,
+      sinceCursor: opts.sinceCursor,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    });
   }
 
   /**
@@ -470,6 +541,11 @@ export class Orchestrator {
     this.#accel = undefined;
     this.#launchToken = undefined;
     this.#state = 'NONE';
+    // The Instance is gone: stop capturing and clear the buffer (settling any
+    // pending wait_for_event), so no events bleed into the next Instance.
+    this.#unsubscribeEvents?.();
+    this.#unsubscribeEvents = undefined;
+    this.#eventBuffer.reset();
     // Release the handle so the managed QMP socket is removed. A crashed/SIGKILLed
     // qemu leaves its socket file behind; without this, every future create would
     // refuse with 'occupied'. close() is idempotent and best-effort here.
@@ -491,6 +567,8 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Enforce the env-configurable memory/vCPU caps before launch (issue #9).
   maxMemoryMb: resolveMaxMemoryMb(process.env),
   maxVcpus: resolveMaxVcpus(process.env),
+  // Bound the Event Buffer of recent QMP async events (issue #12).
+  eventBufferSize: resolveEventBufferSize(process.env),
   // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
   // allowlist plus QMP_MCP_ALLOW/DENY and the optional QMP_MCP_POLICY_FILE
   // overrides, with the immutable hard denylist always in force (ADR-0003, #11).

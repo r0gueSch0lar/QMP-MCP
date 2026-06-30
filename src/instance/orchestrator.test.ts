@@ -423,6 +423,125 @@ describe('Orchestrator generic execute (Command Policy, fake driver)', () => {
   });
 });
 
+describe('Orchestrator Event Buffer (fake driver)', () => {
+  /** Create an Instance and hand back the orchestrator + its fake process. */
+  async function running(options: Partial<OrchestratorOptions> = {}) {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver, options);
+    await orch.createInstance({});
+    // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
+    const process = driver.lastProcess!;
+    return { orch, driver, process };
+  }
+
+  it('captures events emitted by the Instance; get_events returns them with a cursor', async () => {
+    const { orch, process } = await running();
+    process.emitEvent({ event: 'STOP', data: { reason: 'pause' } });
+    process.emitEvent({ event: 'RESET' });
+
+    const { events, cursor } = orch.getEvents();
+    expect(events.map((e) => e.event)).toEqual(['STOP', 'RESET']);
+    expect(events[0]?.data).toEqual({ reason: 'pause' });
+    expect(cursor).toBe(events[events.length - 1]?.seq);
+
+    // Cursor paging: only newer events come back.
+    process.emitEvent({ event: 'SHUTDOWN' });
+    expect(orch.getEvents(cursor).events.map((e) => e.event)).toEqual(['SHUTDOWN']);
+  });
+
+  it('bounds the buffer: emitting past capacity evicts the oldest', async () => {
+    const { orch, process } = await running({ eventBufferSize: 3 });
+    for (const name of ['e1', 'e2', 'e3', 'e4', 'e5']) process.emitEvent({ event: name });
+
+    const { events } = orch.getEvents();
+    // Only the last 3 survive; e1/e2 were evicted — memory stays bounded.
+    expect(events.map((e) => e.event)).toEqual(['e3', 'e4', 'e5']);
+  });
+
+  it('wait_for_event resolves when a matching (filtered) event is emitted', async () => {
+    const { orch, process } = await running();
+    const pending = orch.waitForEvent({ eventName: 'SHUTDOWN', timeoutMs: 1_000 });
+    process.emitEvent({ event: 'STOP' }); // non-matching
+    process.emitEvent({ event: 'SHUTDOWN', data: { guest: true } });
+
+    const result = await pending;
+    expect(result.timedOut).toBe(false);
+    expect(result.event?.event).toBe('SHUTDOWN');
+    expect(result.event?.data).toEqual({ guest: true });
+  });
+
+  it('wait_for_event with no filter resolves on any event', async () => {
+    const { orch, process } = await running();
+    const pending = orch.waitForEvent({ timeoutMs: 1_000 });
+    process.emitEvent({ event: 'POWERDOWN' });
+    const result = await pending;
+    expect(result.timedOut).toBe(false);
+    expect(result.event?.event).toBe('POWERDOWN');
+  });
+
+  it('wait_for_event times out cleanly (no throw) when no matching event arrives', async () => {
+    const { orch, process } = await running();
+    const pending = orch.waitForEvent({ eventName: 'SHUTDOWN', timeoutMs: 15 });
+    process.emitEvent({ event: 'STOP' }); // never matches
+    const result = await pending;
+    expect(result.timedOut).toBe(true);
+    expect(result.event).toBeUndefined();
+  });
+
+  it('wait_for_event is race-safe: sinceCursor catches an event buffered between calls', async () => {
+    const { orch, process } = await running();
+    // The event lands before the wait is issued; a future-only wait would miss it.
+    process.emitEvent({ event: 'SHUTDOWN' });
+    const cursorBefore = 0; // the agent had not seen any event yet
+    const result = await orch.waitForEvent({
+      eventName: 'SHUTDOWN',
+      timeoutMs: 0,
+      sinceCursor: cursorBefore,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.event?.event).toBe('SHUTDOWN');
+    // Keep `process` referenced to satisfy lint on the destructured binding.
+    expect(process.closed).toBe(false);
+  });
+
+  it('rejects get_events and wait_for_event actionably when no Instance is running', async () => {
+    const orch = makeOrchestrator(new FakeQemuDriver());
+    expect(() => orch.getEvents()).toThrow(LifecycleError);
+    expect(() => orch.getEvents()).toThrow(/create_instance/);
+    await expect(orch.waitForEvent({ timeoutMs: 0 })).rejects.toBeInstanceOf(LifecycleError);
+    await expect(orch.waitForEvent({ timeoutMs: 0 })).rejects.toThrow(/create_instance/);
+  });
+
+  it('does not leak events across Instances: destroy + recreate starts empty', async () => {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver);
+
+    await orch.createInstance({});
+    const firstProcess = driver.lastProcess;
+    firstProcess?.emitEvent({ event: 'STOP' });
+    expect(orch.getEvents().events).toHaveLength(1);
+
+    await orch.destroyInstance();
+    await orch.createInstance({});
+
+    // The new Instance's buffer is empty — no STOP from the previous Instance.
+    expect(orch.getEvents().events).toEqual([]);
+    // The now-stale first handle was unsubscribed on destroy, so it cannot inject
+    // into the new Instance's buffer.
+    firstProcess?.emitEvent({ event: 'RESET' });
+    expect(orch.getEvents().events).toEqual([]);
+  });
+
+  it('settles a pending wait_for_event when the Instance is destroyed', async () => {
+    const { orch } = await running();
+    const pending = orch.waitForEvent({ eventName: 'SHUTDOWN', timeoutMs: 5_000 });
+    await orch.destroyInstance();
+    // The wait resolves as a clean timeout rather than hanging on the dead Instance.
+    const result = await pending;
+    expect(result.timedOut).toBe(true);
+  });
+});
+
 describe('defaultSocketOccupied', () => {
   it('returns true for an existing path and false for a missing one', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'orch-occ-'));
