@@ -21,6 +21,8 @@ import {
   resolveHostfwdPortRange,
   resolveImageDir,
   resolveIsoDir,
+  resolveMaxMemoryMb,
+  resolveMaxVcpus,
 } from '../config.js';
 import { logger } from '../logger.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
@@ -89,6 +91,18 @@ export interface OrchestratorOptions {
    * Optional: defaults to false (host networking refused) when omitted.
    */
   allowHostNet?: boolean;
+  /**
+   * Hard cap, in MiB, on the spec's `memoryMb` (`QMP_MCP_MAX_MEMORY_MB`, issue
+   * #9). An over-cap spec is rejected before qemu is spawned. Optional: omitted
+   * means no memory cap is enforced (the singleton always injects it).
+   */
+  maxMemoryMb?: number;
+  /**
+   * Hard cap on the spec's `vcpus` (`QMP_MCP_MAX_VCPUS`, issue #9). An over-cap
+   * spec is rejected before qemu is spawned. Optional: omitted means no vCPU cap
+   * is enforced (the singleton always injects it).
+   */
+  maxVcpus?: number;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -204,6 +218,8 @@ export class Orchestrator {
         isoDir: this.#options.isoDir,
         hostfwdPortRange: this.#options.hostfwdPortRange,
         allowHostNet: this.#options.allowHostNet,
+        maxMemoryMb: this.#options.maxMemoryMb,
+        maxVcpus: this.#options.maxVcpus,
       });
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
@@ -317,6 +333,9 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),
+  // Enforce the env-configurable memory/vCPU caps before launch (issue #9).
+  maxMemoryMb: resolveMaxMemoryMb(process.env),
+  maxVcpus: resolveMaxVcpus(process.env),
   // `/dev/kvm` probe (single source of truth) from the hardware-spec module.
   kvmAvailable: probeKvm,
   socketOccupied: defaultSocketOccupied,
