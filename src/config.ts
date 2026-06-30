@@ -23,6 +23,26 @@ export const TRANSPORT_MODES: readonly TransportMode[] = ['stdio', 'http', 'both
 export const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warning', 'error'];
 export const AUTH_MODES: readonly AuthMode[] = ['apikey', 'jwt'];
 
+/**
+ * An inclusive `[low, high]` host-port range. A user-mode port-forward's
+ * `hostPort` must fall inside it (ADR-0009), so the agent can never bind an
+ * arbitrary or privileged host port.
+ */
+export interface PortRange {
+  /** Lowest host port a forward may bind (inclusive). */
+  low: number;
+  /** Highest host port a forward may bind (inclusive). */
+  high: number;
+}
+
+/**
+ * Default host-port range for user-mode port-forwards: the IANA non-privileged
+ * range 1024-65535. Privileged ports (<1024) are excluded so a forward never
+ * needs `CAP_NET_BIND_SERVICE`/root (ADR-0008). Shared by {@link loadConfig} and
+ * the argv builder so the default lives in exactly one place.
+ */
+export const DEFAULT_HOSTFWD_PORT_RANGE: PortRange = { low: 1024, high: 65535 };
+
 export interface Config {
   /** Which transport(s) the server should expose. */
   transport: TransportMode;
@@ -65,6 +85,19 @@ export interface Config {
    * may allocate. A larger request is rejected naming this cap.
    */
   maxDiskGb: number;
+  /**
+   * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
+   * within (`QMP_MCP_HOSTFWD_PORT_RANGE`, default 1024-65535). A forward to a
+   * host port outside it is rejected naming the range (ADR-0009).
+   */
+  hostfwdPortRange: PortRange;
+  /**
+   * When true, host-level guest networking (`tap`/`bridge`) is permitted
+   * (`QMP_MCP_ALLOW_HOST_NET`). Default false: only user-mode (SLiRP) networking
+   * is allowed and a `tap`/`bridge` spec is refused, since host networking needs
+   * host privileges incompatible with the non-root posture (ADR-0008/0009).
+   */
+  allowHostNet: boolean;
 }
 
 /**
@@ -152,6 +185,26 @@ function parsePositiveInt(varName: string, raw: string | undefined, fallback: nu
 }
 
 /**
+ * Parse a `LOW-HIGH` host-port range. Treats undefined or empty as unset and
+ * returns the fallback; otherwise requires two base-10 integers with
+ * `1 <= LOW <= HIGH <= 65535` and fails closed on anything else (garbage,
+ * reversed bounds, out-of-range, missing dash) rather than silently coercing.
+ */
+function parsePortRange(varName: string, raw: string | undefined, fallback: PortRange): PortRange {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim();
+  const match = /^(\d+)-(\d+)$/.exec(value);
+  const message =
+    `${varName} must be a host-port range "LOW-HIGH" with ` +
+    `1 <= LOW <= HIGH <= 65535 (got "${raw}").`;
+  if (!match) throw new ConfigError(message);
+  const low = Number(match[1]);
+  const high = Number(match[2]);
+  if (low < 1 || high > 65535 || low > high) throw new ConfigError(message);
+  return { low, high };
+}
+
+/**
  * Resolve the Image Store directory (ADR-0006/0007). An explicit
  * `QMP_MCP_IMAGE_DIR` wins; otherwise a host-agnostic default is derived from the
  * XDG/HOME data dirs (and finally the OS temp dir), so the bare-metal default
@@ -192,6 +245,28 @@ export function resolveIsoDir(env: NodeJS.ProcessEnv): string {
 /** Resolve the maximum disk size cap in GiB (`QMP_MCP_MAX_DISK_GB`, default 64). */
 export function resolveMaxDiskGb(env: NodeJS.ProcessEnv): number {
   return parsePositiveInt('QMP_MCP_MAX_DISK_GB', env.QMP_MCP_MAX_DISK_GB, 64);
+}
+
+/**
+ * Resolve the user-mode port-forward host-port range (`QMP_MCP_HOSTFWD_PORT_RANGE`,
+ * default {@link DEFAULT_HOSTFWD_PORT_RANGE}). Exported so the Orchestrator
+ * singleton and {@link loadConfig} share one source of truth (ADR-0009).
+ */
+export function resolveHostfwdPortRange(env: NodeJS.ProcessEnv): PortRange {
+  return parsePortRange(
+    'QMP_MCP_HOSTFWD_PORT_RANGE',
+    env.QMP_MCP_HOSTFWD_PORT_RANGE,
+    DEFAULT_HOSTFWD_PORT_RANGE,
+  );
+}
+
+/**
+ * Resolve whether host-level (`tap`/`bridge`) networking is permitted
+ * (`QMP_MCP_ALLOW_HOST_NET`, default false). Exported so the Orchestrator
+ * singleton and {@link loadConfig} share one source of truth (ADR-0009).
+ */
+export function resolveAllowHostNet(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_ALLOW_HOST_NET', env.QMP_MCP_ALLOW_HOST_NET, false);
 }
 
 /**
@@ -271,5 +346,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     imageDir: resolveImageDir(env),
     isoDir: resolveIsoDir(env),
     maxDiskGb: resolveMaxDiskGb(env),
+    hostfwdPortRange: resolveHostfwdPortRange(env),
+    allowHostNet: resolveAllowHostNet(env),
   };
 }

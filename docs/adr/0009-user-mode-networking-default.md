@@ -2,8 +2,10 @@
 
 Guest NICs default to QEMU user-mode networking (`-netdev user`, SLiRP): NAT'd outbound
 with the host network not exposed, and inbound only via explicit port-forwards. Those
-forwards are limited to a configurable host-port range so the agent cannot bind
-arbitrary or privileged host ports. tap/bridge networking (`-netdev tap`) is disabled
+forwards bind `127.0.0.1` (loopback) by default, so a forwarded port is reachable only
+from the host itself and never the host LAN — no host-LAN exposure. They are also limited
+to a configurable host-port range so the agent cannot bind arbitrary or privileged host
+ports. tap/bridge networking (`-netdev tap`) is disabled
 unless an env flag (e.g. `QMP_MCP_ALLOW_HOST_NET=true`) enables it, and is documented as
 an advanced, privileged option.
 
