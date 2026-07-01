@@ -41,13 +41,16 @@
   },
   "homepage": "http://gitlab/foo/qmp-mcp#readme",
   "dependencies": {
+    "@novnc/novnc": "^1.7.0",
     "mcp-framework": "^0.2.22",
+    "ws": "^8.21.0",
     "yaml": "^2.9.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.7.0",
     "vitest": "^3.2.0"
   }

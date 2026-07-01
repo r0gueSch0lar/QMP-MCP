@@ -101,14 +101,15 @@ docker-build:
   services:
     - docker:27-dind
   variables:
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_TLS_VERIFY: "1"
-    DOCKER_CERT_PATH: "/certs/client"
+    # Plain (non-TLS) dind: on this runner the TLS cert dir (/certs/client) is
+    # unreliably shared with the job container, so `docker info` fails with
+    # "open /certs/client/ca.pem: no such file or directory" even after waiting.
+    # Talk to dockerd over the unencrypted 2375 socket instead (the traffic
+    # stays inside the runner's job network).
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
   before_script:
-    # Wait for the dind daemon: its TLS certs (/certs/client) are written
-    # asynchronously, so a single early `docker info` races and fails with
-    # "open /certs/client/ca.pem: no such file or directory".
+    # Wait for the dind daemon to accept connections before building.
     - |
       for i in $(seq 1 30); do
         docker info >/dev/null 2>&1 && break
