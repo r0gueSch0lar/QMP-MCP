@@ -20,9 +20,17 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::config::PortRange;
 
+use super::event_buffer::{
+    EventBuffer, ReadResult, WaitForEventOptions, WaitFuture, DEFAULT_EVENT_BUFFER_SIZE,
+};
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, resolve_accel, Accel, AccelResolution, ArgvOptions,
     HardwareSpec,
@@ -139,6 +147,10 @@ pub struct OrchestratorOptions {
     /// built-in default-safe allowlist (the singleton injects the env/file-resolved
     /// policy).
     pub command_policy: Option<ResolvedPolicy>,
+    /// Capacity of the Event Buffer capturing the Instance's QMP async events
+    /// (`QMP_MCP_EVENT_BUFFER_SIZE`, issue #12). `None` uses
+    /// [`DEFAULT_EVENT_BUFFER_SIZE`] (the singleton injects the env-resolved value).
+    pub event_buffer_size: Option<u32>,
     /// Probe for KVM availability (injected for testability; production passes the
     /// `/dev/kvm` probe, tests force a deterministic value).
     pub kvm_available: Box<dyn Fn() -> bool + Send + Sync>,
@@ -168,6 +180,11 @@ pub enum ExecuteCommandError {
     Lifecycle(#[from] LifecycleError),
 }
 
+/// Default `wait_for_event` timeout when a caller supplies none (issue #12). A
+/// long-poll horizon: long enough to catch a boot/shutdown, short enough that the
+/// agent regains control to poll again. Mirrors the TS `DEFAULT_WAIT_TIMEOUT_MS`.
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_millis(30_000);
+
 /// Holds the single managed Instance: exactly one exists at a time. Requesting a
 /// new Instance while one exists is rejected rather than auto-replaced (ADR-0004).
 /// Not `Clone` and not thread-safe on its own — it is shared as an
@@ -182,6 +199,15 @@ pub struct Orchestrator {
     handle: Option<Box<dyn InstanceHandle>>,
     spec: Option<HardwareSpec>,
     accel: Option<Accel>,
+    /// The Event Buffer capturing the current Instance's QMP async events. One buffer
+    /// lives for the server's lifetime; it is [`EventBuffer::reset`] on every
+    /// create/destroy so events never bleed across Instances (issue #12). Shared with
+    /// the feeder task, hence `Arc`.
+    event_buffer: Arc<EventBuffer>,
+    /// The background task draining the current Instance's async QMP events into the
+    /// Event Buffer. Aborted (and cleared) on destroy, so the buffer stops advancing
+    /// when the Instance is gone.
+    event_feeder: Option<JoinHandle<()>>,
 }
 
 impl Orchestrator {
@@ -193,6 +219,12 @@ impl Orchestrator {
             .command_policy
             .take()
             .unwrap_or_else(|| build_policy(&PolicyOverrides::default()));
+        // One Event Buffer for the server's lifetime, sized from the env-resolved
+        // option (or the default). It is reset — never re-created — per Instance.
+        let capacity = options
+            .event_buffer_size
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_EVENT_BUFFER_SIZE);
         Self {
             driver,
             options,
@@ -201,6 +233,8 @@ impl Orchestrator {
             handle: None,
             spec: None,
             accel: None,
+            event_buffer: Arc::new(EventBuffer::new(capacity)),
+            event_feeder: None,
         }
     }
 
@@ -243,6 +277,11 @@ impl Orchestrator {
         self.state = InstanceState::Starting;
         match self.launch_instance(candidate).await {
             Ok((spec, resolution, handle)) => {
+                // Start a fresh Event Buffer for this Instance and capture its QMP
+                // async events for its whole life — no events carry over from a
+                // previous Instance (the buffer's cursor stays monotonic, though).
+                self.event_buffer.reset();
+                self.spawn_event_feeder(handle.subscribe_events());
                 self.handle = Some(handle);
                 self.spec = Some(spec.clone());
                 self.accel = Some(resolution.accel);
@@ -331,6 +370,11 @@ impl Orchestrator {
         self.spec = None;
         self.accel = None;
         self.state = InstanceState::Stopped;
+        // Detach from the Instance's event stream and clear the buffer (settling any
+        // pending wait_for_event as a clean timeout); events do not outlive the
+        // Instance. Mirrors the TS destroy path.
+        self.stop_event_feeder();
+        self.event_buffer.reset();
         tracing::info!("destroying Instance");
         let closed = handle.close().await;
         self.state = InstanceState::None;
@@ -348,6 +392,77 @@ impl Orchestrator {
             .execute("query-status", None)
             .await
             .map_err(|e| LifecycleError(e.0))
+    }
+
+    /// Return the Instance's recently buffered QMP async events WITHOUT blocking (the
+    /// `get_events` tool). Cursor-based: with no `since`, returns every buffered event
+    /// plus a `cursor`; passing that `cursor` back as `since` next time pages forward
+    /// without missing or repeating events. The buffer is bounded, so a slow poller may
+    /// miss evicted events — a gap the monotonic cursor makes visible. Rejects when no
+    /// Instance is running. Mirrors the TS `Orchestrator.getEvents`.
+    pub fn get_events(&self, since: Option<u64>) -> Result<ReadResult, LifecycleError> {
+        self.require_handle("read its events")?;
+        Ok(self.event_buffer.read(since))
+    }
+
+    /// Long-poll for a matching QMP async event (the `wait_for_event` tool). Rejects
+    /// only when no Instance is running; otherwise returns a [`WaitFuture`] that
+    /// resolves — never rejects — with the first matching event, or with
+    /// `{ timed_out: true }` once the timeout elapses (a timeout is a NORMAL outcome).
+    /// With no `event_name` any event matches. Pass `since_cursor` (a prior `cursor`)
+    /// to also consider already-buffered events, so an event that arrived between calls
+    /// is not lost; without it the wait is future-only.
+    ///
+    /// The waiter is registered synchronously here (under the orchestrator lock), then
+    /// the returned future is awaited by the caller AFTER the lock is released, so a
+    /// long-poll never holds the single Orchestrator mutex. Mirrors the TS
+    /// `Orchestrator.waitForEvent` (which defaults an omitted timeout to
+    /// [`DEFAULT_WAIT_TIMEOUT`]).
+    pub fn wait_for_event(
+        &self,
+        event_name: Option<String>,
+        timeout: Option<Duration>,
+        since_cursor: Option<u64>,
+    ) -> Result<WaitFuture, LifecycleError> {
+        self.require_handle("wait for its events")?;
+        Ok(self.event_buffer.wait_for(WaitForEventOptions {
+            event_name,
+            since_cursor,
+            timeout: timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT),
+        }))
+    }
+
+    /// Spawn the background task that drains this Instance's async QMP events into the
+    /// Event Buffer for the Instance's whole life. A lagged broadcast (a burst beyond
+    /// the channel capacity) drops the missed events — a gap the buffer's monotonic
+    /// cursor already makes visible — rather than blocking the reader; a closed channel
+    /// ends the task.
+    fn spawn_event_feeder(
+        &mut self,
+        mut events: broadcast::Receiver<crate::qemu::qmp_client::QmpEvent>,
+    ) {
+        // A previous feeder should already be stopped, but be defensive.
+        self.stop_event_feeder();
+        let buffer = Arc::clone(&self.event_buffer);
+        self.event_feeder = Some(tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        buffer.append(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+
+    /// Abort and drop the current event feeder, if any, so it stops advancing the
+    /// buffer once the Instance is gone.
+    fn stop_event_feeder(&mut self) {
+        if let Some(feeder) = self.event_feeder.take() {
+            feeder.abort();
+        }
     }
 
     /// Pause the running Instance's Guest CPUs via QMP `stop`, moving the lifecycle
@@ -567,6 +682,7 @@ mod tests {
 
     use super::*;
     use crate::qemu::driver::FakeQemuDriver;
+    use crate::qemu::qmp_client::QmpEvent;
 
     /// Deterministic options for the lifecycle tests: force TCG (no `/dev/kvm`
     /// probe), a fixed socket, no stores or caps. A diskless empty spec launches
@@ -583,12 +699,62 @@ mod tests {
             max_vcpus: None,
             allow_raw_args: false,
             command_policy: None,
+            event_buffer_size: None,
             kvm_available: Box::new(|| false),
         }
     }
 
     fn orchestrator_with(driver: FakeQemuDriver) -> Orchestrator {
         Orchestrator::new(Box::new(driver), test_options())
+    }
+
+    /// Emit a synthetic QMP event onto the fake driver's stream and wait until the
+    /// Orchestrator's feeder has drained at least `expected` events into the buffer.
+    /// The feeder runs on a background task, so accumulation is observed with a bounded
+    /// poll rather than assumed synchronous (never flaky: bounded to ~1s).
+    async fn await_event_count(orch: &Orchestrator, expected: usize) {
+        for _ in 0..1_000 {
+            if orch.get_events(None).map(|r| r.events.len()).unwrap_or(0) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("feeder never accumulated {expected} events");
+    }
+
+    fn synth(event: &str) -> QmpEvent {
+        QmpEvent {
+            event: event.to_string(),
+            data: None,
+            timestamp: None,
+        }
+    }
+
+    fn synth_data(event: &str, data: serde_json::Value) -> QmpEvent {
+        QmpEvent {
+            event: event.to_string(),
+            data: Some(data),
+            timestamp: None,
+        }
+    }
+
+    /// A RUNNING Orchestrator plus a sender onto its Instance's synthetic event stream
+    /// (captured before the driver moves into the Orchestrator).
+    async fn running_with_events(
+        buffer_size: Option<u32>,
+    ) -> (Orchestrator, broadcast::Sender<QmpEvent>) {
+        let driver = FakeQemuDriver::new();
+        let slot = driver.events_slot();
+        let mut options = test_options();
+        options.event_buffer_size = buffer_size;
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        orch.create_instance(json!({})).await.unwrap();
+        let sender = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create_instance installs an event sender");
+        (orch, sender)
     }
 
     #[tokio::test]
@@ -850,6 +1016,180 @@ mod tests {
         orch.create_instance(json!({})).await.unwrap();
         let version = orch.execute_command("query-version", None).await.unwrap();
         assert_eq!(version["qemu"]["major"], 9);
+    }
+
+    #[tokio::test]
+    async fn captures_events_and_get_events_pages_by_cursor() {
+        let (orch, events) = running_with_events(None).await;
+        events
+            .send(synth_data("STOP", json!({ "reason": "pause" })))
+            .unwrap();
+        events.send(synth("RESET")).unwrap();
+        await_event_count(&orch, 2).await;
+
+        let ReadResult {
+            events: buffered,
+            cursor,
+        } = orch.get_events(None).unwrap();
+        assert_eq!(
+            buffered
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            ["STOP", "RESET"]
+        );
+        assert_eq!(buffered[0].data, Some(json!({ "reason": "pause" })));
+        assert_eq!(cursor, buffered.last().unwrap().seq);
+
+        // Cursor paging: only newer events come back.
+        events.send(synth("SHUTDOWN")).unwrap();
+        await_event_count(&orch, 3).await;
+        let next = orch.get_events(Some(cursor)).unwrap();
+        assert_eq!(
+            next.events
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            ["SHUTDOWN"]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounds_the_buffer_evicting_the_oldest_past_capacity() {
+        let (orch, events) = running_with_events(Some(3)).await;
+        for name in ["e1", "e2", "e3", "e4", "e5"] {
+            events.send(synth(name)).unwrap();
+        }
+        // Wait for all five to be processed (the buffer retains only the last three).
+        for _ in 0..1_000 {
+            if orch.get_events(None).unwrap().cursor >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let buffered = orch.get_events(None).unwrap().events;
+        assert_eq!(
+            buffered
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            ["e3", "e4", "e5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_resolves_on_a_matching_filtered_event() {
+        let (orch, events) = running_with_events(None).await;
+        let pending = orch
+            .wait_for_event(
+                Some("SHUTDOWN".to_string()),
+                Some(Duration::from_secs(1)),
+                None,
+            )
+            .unwrap();
+        events.send(synth("STOP")).unwrap(); // non-matching
+        events
+            .send(synth_data("SHUTDOWN", json!({ "guest": true })))
+            .unwrap();
+
+        let result = pending.await;
+        assert!(!result.timed_out);
+        let event = result.event.expect("a matching event");
+        assert_eq!(event.event, "SHUTDOWN");
+        assert_eq!(event.data, Some(json!({ "guest": true })));
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_with_no_filter_resolves_on_any_event() {
+        let (orch, events) = running_with_events(None).await;
+        let pending = orch
+            .wait_for_event(None, Some(Duration::from_secs(1)), None)
+            .unwrap();
+        events.send(synth("POWERDOWN")).unwrap();
+        let result = pending.await;
+        assert!(!result.timed_out);
+        assert_eq!(result.event.unwrap().event, "POWERDOWN");
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_times_out_cleanly_when_no_match_arrives() {
+        let (orch, events) = running_with_events(None).await;
+        let pending = orch
+            .wait_for_event(
+                Some("SHUTDOWN".to_string()),
+                Some(Duration::from_millis(20)),
+                None,
+            )
+            .unwrap();
+        events.send(synth("STOP")).unwrap(); // never matches
+        let result = pending.await;
+        assert!(result.timed_out);
+        assert!(result.event.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_is_race_safe_with_since_cursor() {
+        let (orch, events) = running_with_events(None).await;
+        // The event lands before the wait is issued; a future-only wait would miss it.
+        events.send(synth("SHUTDOWN")).unwrap();
+        await_event_count(&orch, 1).await;
+        let result = orch
+            .wait_for_event(Some("SHUTDOWN".to_string()), Some(Duration::ZERO), Some(0))
+            .unwrap()
+            .await;
+        assert!(!result.timed_out);
+        assert_eq!(result.event.unwrap().event, "SHUTDOWN");
+    }
+
+    #[tokio::test]
+    async fn rejects_events_tools_actionably_when_no_instance_is_running() {
+        let orch = orchestrator_with(FakeQemuDriver::new());
+        let err = orch.get_events(None).unwrap_err();
+        assert!(err.0.contains("read its events"), "got: {}", err.0);
+        assert!(err.0.contains("create_instance"), "got: {}", err.0);
+        // The Ok arm is a `WaitFuture` (not `Debug`), so match rather than `unwrap_err`.
+        let Err(err) = orch.wait_for_event(None, Some(Duration::ZERO), None) else {
+            panic!("wait_for_event must reject when no Instance is running");
+        };
+        assert!(err.0.contains("wait for its events"), "got: {}", err.0);
+        assert!(err.0.contains("create_instance"), "got: {}", err.0);
+    }
+
+    #[tokio::test]
+    async fn does_not_leak_events_across_instances() {
+        let (mut orch, events) = running_with_events(None).await;
+        events.send(synth("STOP")).unwrap();
+        await_event_count(&orch, 1).await;
+        assert_eq!(orch.get_events(None).unwrap().events.len(), 1);
+
+        // Destroy + recreate: the buffer starts empty for the new Instance, and the
+        // old sender's events no longer reach it (the feeder was aborted).
+        orch.destroy_instance().await.unwrap();
+        orch.create_instance(json!({})).await.unwrap();
+        assert!(orch.get_events(None).unwrap().events.is_empty());
+        // The old sender feeds the previous Instance's (now-aborted) channel; the
+        // send may find no receiver at all, which is exactly the point — it must not
+        // reach the new Instance's buffer. Tolerate a no-receiver send.
+        let _ = events.send(synth("RESET"));
+        // Give any stray delivery a chance, then confirm nothing leaked in.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(orch.get_events(None).unwrap().events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settles_a_pending_wait_when_the_instance_is_destroyed() {
+        let (mut orch, _events) = running_with_events(None).await;
+        let pending = orch
+            .wait_for_event(
+                Some("SHUTDOWN".to_string()),
+                Some(Duration::from_secs(5)),
+                None,
+            )
+            .unwrap();
+        orch.destroy_instance().await.unwrap();
+        // The wait resolves as a clean timeout rather than hanging on the dead Instance.
+        let result = pending.await;
+        assert!(result.timed_out);
     }
 
     #[test]

@@ -143,6 +143,8 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         allow_raw_args: config.allow_raw_args,
         // The generic qmp_execute tool runs only what this policy admits (ADR-0003).
         command_policy: Some(command_policy),
+        // Bound the Event Buffer of recent QMP async events (issue #12).
+        event_buffer_size: Some(config.event_buffer_size),
         // `/dev/kvm` probe — the single source of truth from the hardware-spec module.
         kvm_available: Box::new(probe_kvm),
     }

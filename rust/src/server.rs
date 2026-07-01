@@ -10,6 +10,7 @@
 //! control, events, images) land in later slices.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -20,6 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::instance::event_buffer::{ReadResult, WaitForEventResult};
 use crate::instance::hardware_spec::{AccelMode, DisplayMode, HardwareSpec, HardwareSpecParams};
 use crate::instance::image_store::{
     CreateImageRequest, CreateImageResult, ImageFormat, ImageListing, ImageStore,
@@ -143,6 +145,50 @@ pub struct QmpExecuteParams {
     /// The QMP command's `arguments` object, if it takes any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
+}
+
+/// Upper bound on a single `wait_for_event` long-poll (ms), so a wait can never hang
+/// indefinitely. Mirrors the TS `MAX_TIMEOUT_MS`.
+const MAX_WAIT_TIMEOUT_MS: u64 = 600_000;
+
+/// Default `wait_for_event` timeout (ms) when the caller supplies none. Mirrors the TS
+/// schema default.
+fn default_wait_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Validated input for `get_events`: an optional cursor to page from. Mirrors the TS
+/// `get_events` zod schema (`since >= 0`, integer; the `u64` type enforces both).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetEventsParams {
+    /// Cursor to page from: return only events whose `seq` is greater than this. Pass
+    /// the `cursor` returned by a previous get_events (or wait_for_event) call to fetch
+    /// only what is new. Omit to get all currently buffered events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+}
+
+/// Validated input for `wait_for_event`: an optional event-name filter, a timeout, and
+/// an optional race-safe cursor. Mirrors the TS `wait_for_event` zod schema; the bounds
+/// (`eventName` non-empty, `timeoutMs` in `0..=600000`) are enforced explicitly in the
+/// tool handler, matching the hand-rolled-validation ethos.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitForEventParams {
+    /// QMP event name to wait for (e.g. "SHUTDOWN", "POWERDOWN", "RESET", "STOP").
+    /// Omit to resolve on the next event of any kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_name: Option<String>,
+    /// How long to wait before returning a timed-out result (default 30000, max
+    /// 600000). A timeout is a normal outcome, not an error. 0 checks without blocking.
+    #[serde(default = "default_wait_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Make the wait race-safe: also resolve on an already-buffered event whose `seq`
+    /// is greater than this cursor (from a prior get_events/wait_for_event), so an
+    /// event that arrived between calls is not missed. Omit for future-only (events
+    /// arriving after this call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_cursor: Option<u64>,
 }
 
 /// Validated input for `create_image`: the bare name, virtual size in GiB, and
@@ -288,6 +334,84 @@ impl QmpMcpServer {
         }
         .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(Json(StatusReport { run_state }))
+    }
+
+    /// Read-only. Return the running Instance's recently buffered QMP async events
+    /// WITHOUT blocking — the pull half of the Event Buffer contract (issue #12).
+    /// Cursor-based: the response carries a `cursor` (the latest event sequence
+    /// number); pass it back as `since` to page forward. The buffer is bounded, so a
+    /// slow poller may miss evicted events. Rejected when no Instance is running.
+    #[tool(
+        description = "Return the running QEMU Instance's recently buffered QMP async events (e.g. \
+                       SHUTDOWN, STOP, RESET, POWERDOWN) without blocking. Each event has \
+                       { seq, event, data?, timestamp? }. The response includes a `cursor`; pass it \
+                       back as `since` to fetch only newer events. The buffer is bounded (oldest \
+                       events are evicted when full). For a blocking wait, use wait_for_event. Fails \
+                       if no Instance is running."
+    )]
+    async fn get_events(
+        &self,
+        Parameters(params): Parameters<GetEventsParams>,
+    ) -> Result<Json<ReadResult>, McpError> {
+        let result = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.get_events(params.since)
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
+    }
+
+    /// Read-only. Long-poll for a matching QMP async event — the blocking half of the
+    /// Event Buffer contract (issue #12). Resolves with the first matching event, or
+    /// with `{ timedOut: true }` once `timeoutMs` elapses (a timeout is a NORMAL
+    /// outcome, never an error). Pass `sinceCursor` to make it race-safe against events
+    /// that landed between calls. Rejected only when no Instance is running.
+    #[tool(
+        description = "Block until the running QEMU Instance emits a matching QMP async event, then \
+                       return it; or return { timedOut: true } if none arrives within timeoutMs (a \
+                       timeout is a normal result, not an error). Provide eventName to filter (e.g. \
+                       \"SHUTDOWN\"), or omit it to wait for any event. Pass sinceCursor (a prior \
+                       cursor) to also catch events already buffered since then, so nothing is missed \
+                       between calls. Useful for \"has the Guest booted/shut down yet?\". Fails if no \
+                       Instance is running."
+    )]
+    async fn wait_for_event(
+        &self,
+        Parameters(params): Parameters<WaitForEventParams>,
+    ) -> Result<Json<WaitForEventResult>, McpError> {
+        // Explicit bounds (mirroring the TS zod schema): a filter, when given, must be
+        // a non-empty event name, and the timeout is capped so a wait cannot hang.
+        if params.event_name.as_deref() == Some("") {
+            return Err(McpError::invalid_params(
+                "eventName, when provided, must be a non-empty QMP event name (e.g. \"SHUTDOWN\"); \
+                 omit it to wait for the next event of any kind."
+                    .to_string(),
+                None,
+            ));
+        }
+        if params.timeout_ms > MAX_WAIT_TIMEOUT_MS {
+            return Err(McpError::invalid_params(
+                format!(
+                    "timeoutMs must be between 0 and {MAX_WAIT_TIMEOUT_MS} (got {}). Use a smaller \
+                     timeout, or poll repeatedly with get_events.",
+                    params.timeout_ms
+                ),
+                None,
+            ));
+        }
+        // Register the waiter under the orchestrator lock, then release the lock and
+        // await the long-poll — so a pending wait never holds the single Orchestrator
+        // mutex (which would serialise out every other tool for the whole timeout).
+        let future = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.wait_for_event(
+                params.event_name,
+                Some(Duration::from_millis(params.timeout_ms)),
+                params.since_cursor,
+            )
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(future.await))
     }
 
     /// Pause the running Instance's Guest CPUs (QMP `stop`), moving the lifecycle to
@@ -528,12 +652,21 @@ mod tests {
     use crate::instance::image_store::ImageStoreOptions;
     use crate::instance::orchestrator::OrchestratorOptions;
     use crate::qemu::driver::FakeQemuDriver;
+    use crate::qemu::qmp_client::QmpEvent;
+    use tokio::sync::broadcast;
+
+    /// A handle onto the current fake Instance's synthetic-event sender, so a wiring
+    /// test can emit QMP events into the running Instance's stream.
+    type EventSlot = Arc<std::sync::Mutex<Option<broadcast::Sender<QmpEvent>>>>;
 
     /// A server wired to a fake-driver Orchestrator, so the wiring tests never touch
     /// a real QEMU. The stores point at non-existent directories: the wiring tests
     /// only check routing, and the store methods fail closed (which is asserted
-    /// exhaustively in the store modules' own tests).
-    fn test_server() -> QmpMcpServer {
+    /// exhaustively in the store modules' own tests). Returns the fake driver's event
+    /// slot too, so an event-surface test can emit synthetic QMP events.
+    fn test_server_with_events() -> (QmpMcpServer, EventSlot) {
+        let driver = FakeQemuDriver::new();
+        let events = driver.events_slot();
         let options = OrchestratorOptions {
             binary: "qemu-system-x86_64".to_string(),
             qmp_socket_path: "/run/qmp-mcp/qmp.sock".to_string(),
@@ -545,12 +678,10 @@ mod tests {
             max_vcpus: None,
             allow_raw_args: false,
             command_policy: None,
+            event_buffer_size: None,
             kvm_available: Box::new(|| false),
         };
-        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
-            Box::new(FakeQemuDriver::new()),
-            options,
-        )));
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(Box::new(driver), options)));
         let image_store = ImageStore::new(ImageStoreOptions {
             dir: "/nonexistent/qmp-mcp-image-store".to_string(),
             max_disk_gb: 64,
@@ -558,7 +689,15 @@ mod tests {
             run: None,
         });
         let iso_store = IsoStore::new("/nonexistent/qmp-mcp-iso-store".to_string());
-        QmpMcpServer::new(orchestrator, image_store, iso_store)
+        (
+            QmpMcpServer::new(orchestrator, image_store, iso_store),
+            events,
+        )
+    }
+
+    /// The common case: just the server, discarding the event slot.
+    fn test_server() -> QmpMcpServer {
+        test_server_with_events().0
     }
 
     #[tokio::test]
@@ -570,6 +709,9 @@ mod tests {
             "destroy_instance",
             "get_instance",
             "get_status",
+            // Event Buffer surface (this slice).
+            "get_events",
+            "wait_for_event",
             // Command Policy + curated QMP tools (this slice).
             "pause_instance",
             "resume_instance",
@@ -764,5 +906,102 @@ mod tests {
                 .contains("not in the Command Policy allowlist"),
             "got: {err}"
         );
+    }
+
+    /// The event tools round-trip through the server surface with the fake driver:
+    /// they reject when no Instance runs, validate their inputs, and — once an Instance
+    /// is up — surface a synthetic QMP event through both `wait_for_event` (blocking
+    /// match) and `get_events` (cursor paging).
+    #[tokio::test]
+    async fn event_tools_round_trip_through_the_tool_surface() {
+        let (server, slot) = test_server_with_events();
+
+        // Before an Instance exists both event tools are refused.
+        let Err(err) = server
+            .get_events(Parameters(GetEventsParams { since: None }))
+            .await
+        else {
+            panic!("get_events must fail before an Instance exists");
+        };
+        assert!(err.to_string().contains("read its events"), "got: {err}");
+        assert!(server
+            .wait_for_event(Parameters(WaitForEventParams {
+                event_name: None,
+                timeout_ms: 0,
+                since_cursor: None,
+            }))
+            .await
+            .is_err());
+
+        // Input validation is enforced before any Instance is consulted.
+        assert!(server
+            .wait_for_event(Parameters(WaitForEventParams {
+                event_name: Some(String::new()),
+                timeout_ms: 0,
+                since_cursor: None,
+            }))
+            .await
+            .is_err());
+        assert!(server
+            .wait_for_event(Parameters(WaitForEventParams {
+                event_name: None,
+                timeout_ms: MAX_WAIT_TIMEOUT_MS + 1,
+                since_cursor: None,
+            }))
+            .await
+            .is_err());
+
+        server
+            .create_instance(Parameters(
+                serde_json::from_value(serde_json::json!({})).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let events = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create_instance installs an event sender");
+        events
+            .send(QmpEvent {
+                event: "SHUTDOWN".to_string(),
+                data: Some(serde_json::json!({ "guest": true })),
+                timestamp: None,
+            })
+            .unwrap();
+
+        // wait_for_event with sinceCursor=0 is race-safe against the feeder: it resolves
+        // whether the event was already buffered or arrives after registration.
+        let waited = server
+            .wait_for_event(Parameters(WaitForEventParams {
+                event_name: Some("SHUTDOWN".to_string()),
+                timeout_ms: 1_000,
+                since_cursor: Some(0),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!waited.timed_out);
+        let event = waited.event.expect("a matching event");
+        assert_eq!(event.event, "SHUTDOWN");
+        assert_eq!(event.data, Some(serde_json::json!({ "guest": true })));
+
+        // get_events now returns the buffered event and a cursor; paging past it is empty.
+        let read = server
+            .get_events(Parameters(GetEventsParams { since: None }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(read.events[0].event, "SHUTDOWN");
+        let after = server
+            .get_events(Parameters(GetEventsParams {
+                since: Some(read.cursor),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(after.events.is_empty());
     }
 }
