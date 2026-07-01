@@ -26,6 +26,8 @@ describe('parseHardwareSpec', () => {
       vcpus: 1,
       memoryMb: 256,
       accel: 'auto',
+      // The Display defaults to none — a fully headless Instance (ADR-0010).
+      display: 'none',
       disks: [],
       // Networking defaults to user-mode (SLiRP) with an allowlisted NIC and no
       // port-forwards (ADR-0009).
@@ -57,6 +59,12 @@ describe('parseHardwareSpec', () => {
 
   it('coerces nothing: a non-integer vcpu count is rejected', () => {
     expect(() => parseHardwareSpec({ vcpus: 1.5 })).toThrowError(/vcpus/);
+  });
+
+  it('defaults display to none, accepts vnc, and rejects an unknown mode (ADR-0010)', () => {
+    expect(parseHardwareSpec({}).display).toBe('none');
+    expect(parseHardwareSpec({ display: 'vnc' }).display).toBe('vnc');
+    expect(() => parseHardwareSpec({ display: 'spice' })).toThrowError(/display/);
   });
 
   it('rejects a machine value with an injected QemuOpts property (comma)', () => {
@@ -106,6 +114,29 @@ describe('buildArgv', () => {
   it('is pure: same inputs yield an equal argv', () => {
     const opts = { accel: 'tcg', qmpSocketPath: SOCK } as const;
     expect(buildArgv(spec(), opts)).toEqual(buildArgv(spec(), opts));
+  });
+});
+
+describe('buildArgv display (ADR-0010)', () => {
+  it('display none (default) stays headless: no -vnc, still -nographic', () => {
+    const argv = buildArgv(spec(), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv).not.toContain('-vnc');
+    expect(argv).toContain('-nographic');
+  });
+
+  it('display vnc emits a loopback -vnc with no plaintext password in the argv', () => {
+    const argv = buildArgv(spec({ display: 'vnc' }), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv).toContain('-vnc');
+    const value = argv[argv.indexOf('-vnc') + 1] ?? '';
+    // Loopback bind, fixed display 0 (single Instance), password REQUIRED but set
+    // later over QMP — the value carries `password=on`, never a plaintext secret.
+    expect(value).toBe('127.0.0.1:0,password=on');
+    expect(value.startsWith('127.0.0.1:')).toBe(true);
+    // No `password=<secret>` form anywhere: password=on is the only password token.
+    expect(argv.join(' ')).not.toMatch(/password=(?!on\b)/);
+    // The generated argv is otherwise intact (still headless-frozen with QMP wired).
+    expect(argv).toContain('-S');
+    expect(argv[argv.indexOf('-qmp') + 1]).toBe(`unix:${SOCK},server=on,wait=off`);
   });
 });
 
