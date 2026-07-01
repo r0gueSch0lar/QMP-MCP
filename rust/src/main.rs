@@ -5,16 +5,13 @@
 //! level, then serve the MCP server. This slice supports the stdio transport only;
 //! selecting `http`/`both` is an actionable error (HTTP is slice #25).
 
-mod config;
-mod logging;
-mod server;
-
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use config::{Config, TransportMode};
+use qmp_mcp::config::{self, Config, TransportMode};
+use qmp_mcp::logging;
+use qmp_mcp::server::QmpMcpServer;
 use rmcp::{transport::stdio, ServiceExt};
-use server::QmpMcpServer;
 
 #[tokio::main]
 async fn main() -> ExitCode {

@@ -1,0 +1,24 @@
+{
+  "description": "Two disks emit two -drive pairs in spec order.",
+  "spec": {
+    "disks": [
+      { "image": "root.qcow2" },
+      { "image": "data.raw", "interface": "ide", "format": "raw", "readonly": true }
+    ]
+  },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{IMAGE_DIR}}/root.qcow2,format=qcow2,if=virtio,media=disk",
+    "-drive", "file={{IMAGE_DIR}}/data.raw,format=raw,if=ide,media=disk,readonly=on",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

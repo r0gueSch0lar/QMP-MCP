@@ -1,0 +1,19 @@
+{
+  "description": "A CD-ROM from the read-only ISO Store (media=cdrom,readonly=on,format=raw) plus a boot order that boots the CD-ROM first.",
+  "spec": { "cdrom": { "iso": "debian.iso" }, "boot": "d" },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{ISO_DIR}}/debian.iso,media=cdrom,readonly=on,format=raw",
+    "-boot", "order=d",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
