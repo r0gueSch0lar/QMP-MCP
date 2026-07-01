@@ -1,0 +1,18 @@
+{
+  "description": "A read-only IDE disk with the raw format pinned. readonly=on is appended.",
+  "spec": { "disks": [{ "image": "disk.raw", "interface": "ide", "format": "raw", "readonly": true }] },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{IMAGE_DIR}}/disk.raw,format=raw,if=ide,media=disk,readonly=on",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "description": "The raw-args escape hatch (ADR-0002): when allowRawArgs is enabled, extraArgs are appended verbatim after the generated argv (which always ends with the -qmp pair).",
+  "spec": { "extraArgs": ["-vga", "std"] },
+  "options": { "accel": "tcg", "allowRawArgs": true },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off",
+    "-vga", "std"
+  ]
+}

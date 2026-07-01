@@ -1,0 +1,18 @@
+{
+  "description": "A default disk: virtio interface, qcow2 format pinned explicitly, read-write. The resolved in-Store path is placeholder-substituted.",
+  "spec": { "disks": [{ "image": "root.qcow2" }] },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{IMAGE_DIR}}/root.qcow2,format=qcow2,if=virtio,media=disk",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
