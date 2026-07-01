@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::instance::hardware_spec::{AccelMode, DisplayMode, HardwareSpec, HardwareSpecParams};
+use crate::instance::image_store::{
+    CreateImageRequest, CreateImageResult, ImageFormat, ImageListing, ImageStore,
+};
+use crate::instance::iso_store::{IsoListing, IsoStore};
 use crate::instance::orchestrator::{InstanceState, Orchestrator};
 
 /// A compact, JSON-serialisable summary of a validated Hardware Spec, returned by
@@ -141,6 +145,24 @@ pub struct QmpExecuteParams {
     pub arguments: Option<serde_json::Value>,
 }
 
+/// Validated input for `create_image`: the bare name, virtual size in GiB, and
+/// image format for a new blank disk provisioned into the Image Store. Mirrors the TS
+/// `create_image` zod schema (the format defaults to `qcow2`; the size cap and name
+/// containment are enforced by the Image Store, not the schema).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateImageParams {
+    /// Bare name for the new image inside the Image Store (no path separators).
+    pub name: String,
+    /// Virtual disk size in GiB. Rejected when it exceeds `QMP_MCP_MAX_DISK_GB`.
+    /// Signed so a zero/negative request yields the actionable "positive integer"
+    /// message rather than a generic deserialisation error.
+    pub size_gb: i64,
+    /// Image format: `qcow2` (default) or `raw`.
+    #[serde(default)]
+    pub format: ImageFormat,
+}
+
 /// The result reported by `get_instance` and `destroy_instance`: the lifecycle
 /// state, plus the spec/accel when an Instance exists.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -156,21 +178,31 @@ pub struct InstanceReport {
     pub accel: Option<String>,
 }
 
-/// The one MCP server struct. Holds the shared Orchestrator and its generated
-/// [`ToolRouter`]. `Clone` is cheap: both fields are shared handles.
+/// The one MCP server struct. Holds the shared Orchestrator, the two allowlisted
+/// stores, and its generated [`ToolRouter`]. `Clone` is cheap: every field is a
+/// shared handle or a small config value.
 #[derive(Clone)]
 pub struct QmpMcpServer {
     orchestrator: Arc<Mutex<Orchestrator>>,
+    image_store: ImageStore,
+    iso_store: IsoStore,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl QmpMcpServer {
     /// Construct the server over the shared `Arc<Mutex<Orchestrator>>` (the same
-    /// Arc the shutdown hook holds), wiring up the generated tool router.
-    pub fn new(orchestrator: Arc<Mutex<Orchestrator>>) -> Self {
+    /// Arc the shutdown hook holds) plus the read-write Image Store and read-only ISO
+    /// Store (ADR-0006), wiring up the generated tool router.
+    pub fn new(
+        orchestrator: Arc<Mutex<Orchestrator>>,
+        image_store: ImageStore,
+        iso_store: IsoStore,
+    ) -> Self {
         Self {
             orchestrator,
+            image_store,
+            iso_store,
             tool_router: Self::tool_router(),
         }
     }
@@ -406,6 +438,65 @@ impl QmpMcpServer {
         .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(Json(QmpExecuteReport { result }))
     }
+
+    /// Create a blank disk image of the given name, size (GiB), and format inside the
+    /// read-write Image Store via `qemu-img create` (ADR-0006). Enforces the
+    /// `QMP_MCP_MAX_DISK_GB` size cap and rejects any name that escapes the Store
+    /// (absolute paths, `..`/separator traversal, injection characters, symlink
+    /// escape) or collides with an existing image.
+    #[tool(
+        description = "Create a blank disk image of the given name, size (GiB), and format (qcow2 \
+                       or raw) inside the Image Store using qemu-img. Enforces the \
+                       QMP_MCP_MAX_DISK_GB size cap and rejects names that escape the Store."
+    )]
+    async fn create_image(
+        &self,
+        Parameters(params): Parameters<CreateImageParams>,
+    ) -> Result<Json<CreateImageResult>, McpError> {
+        let result = self
+            .image_store
+            .create(CreateImageRequest {
+                name: params.name,
+                size_gb: params.size_gb,
+                format: params.format,
+            })
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
+    }
+
+    /// Read-only. List the guest disk images available in the Image Store, by name —
+    /// the names a Hardware Spec disk references (ADR-0006). Fails closed with an
+    /// actionable message naming `QMP_MCP_IMAGE_DIR` when the Store is missing.
+    #[tool(
+        description = "List the guest disk images available in the Image Store, by name. These \
+                       names are what a disk in the Hardware Spec references. Read-only."
+    )]
+    async fn list_images(&self) -> Result<Json<ImageListing>, McpError> {
+        let listing = self
+            .image_store
+            .list()
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(listing))
+    }
+
+    /// Read-only. List the installation/boot ISO media available in the strictly
+    /// read-only ISO Store, by name — the names a Hardware Spec cdrom references
+    /// (ADR-0006). Fails closed with an actionable message naming `QMP_MCP_ISO_DIR`
+    /// when the Store is missing.
+    #[tool(
+        description = "List the installation/boot ISO media available in the read-only ISO Store, \
+                       by name. These names are what a Hardware Spec cdrom references. Read-only."
+    )]
+    async fn list_isos(&self) -> Result<Json<IsoListing>, McpError> {
+        let listing = self
+            .iso_store
+            .list()
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(listing))
+    }
 }
 
 #[tool_handler]
@@ -434,11 +525,14 @@ impl ServerHandler for QmpMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::image_store::ImageStoreOptions;
     use crate::instance::orchestrator::OrchestratorOptions;
     use crate::qemu::driver::FakeQemuDriver;
 
     /// A server wired to a fake-driver Orchestrator, so the wiring tests never touch
-    /// a real QEMU.
+    /// a real QEMU. The stores point at non-existent directories: the wiring tests
+    /// only check routing, and the store methods fail closed (which is asserted
+    /// exhaustively in the store modules' own tests).
     fn test_server() -> QmpMcpServer {
         let options = OrchestratorOptions {
             binary: "qemu-system-x86_64".to_string(),
@@ -457,7 +551,14 @@ mod tests {
             Box::new(FakeQemuDriver::new()),
             options,
         )));
-        QmpMcpServer::new(orchestrator)
+        let image_store = ImageStore::new(ImageStoreOptions {
+            dir: "/nonexistent/qmp-mcp-image-store".to_string(),
+            max_disk_gb: 64,
+            qemu_img_binary: None,
+            run: None,
+        });
+        let iso_store = IsoStore::new("/nonexistent/qmp-mcp-iso-store".to_string());
+        QmpMcpServer::new(orchestrator, image_store, iso_store)
     }
 
     #[tokio::test]
@@ -478,12 +579,47 @@ mod tests {
             "query_cpus",
             "screendump",
             "qmp_execute",
+            // Image/ISO stores (this slice).
+            "create_image",
+            "list_images",
+            "list_isos",
         ] {
             assert!(
                 server.tool_router.has_route(name),
                 "{name} missing from the tool router"
             );
         }
+    }
+
+    /// The store tools round-trip through the server surface: `list_images` and
+    /// `list_isos` fail closed (their configured dirs do not exist), and
+    /// `create_image` rejects a traversing name before it can touch the filesystem.
+    #[tokio::test]
+    async fn store_tools_surface_failures_actionably() {
+        let server = test_server();
+
+        // `Json<T>` success is not `Debug`, so match rather than `unwrap_err`.
+        let Err(err) = server.list_images().await else {
+            panic!("list_images must fail closed on a missing store");
+        };
+        assert!(err.to_string().contains("QMP_MCP_IMAGE_DIR"));
+
+        let Err(err) = server.list_isos().await else {
+            panic!("list_isos must fail closed on a missing store");
+        };
+        assert!(err.to_string().contains("QMP_MCP_ISO_DIR"));
+
+        let Err(err) = server
+            .create_image(Parameters(CreateImageParams {
+                name: "../escape.qcow2".to_string(),
+                size_gb: 1,
+                format: ImageFormat::Qcow2,
+            }))
+            .await
+        else {
+            panic!("create_image must reject a traversing name");
+        };
+        assert!(err.to_string().contains("path separator"));
     }
 
     #[tokio::test]

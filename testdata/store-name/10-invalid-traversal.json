@@ -1,0 +1,6 @@
+{
+  "description": "A parent-directory traversal contains a path separator and is rejected.",
+  "name": "../escape.qcow2",
+  "expectedValid": false,
+  "reasonContains": ["path separator"]
+}

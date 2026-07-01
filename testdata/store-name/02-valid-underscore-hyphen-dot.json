@@ -1,0 +1,5 @@
+{
+  "description": "Letters, digits, dot, underscore and hyphen after a leading alphanumeric are allowed.",
+  "name": "disk-1_v2.raw",
+  "expectedValid": true
+}

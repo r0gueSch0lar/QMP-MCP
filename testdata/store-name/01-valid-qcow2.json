@@ -1,0 +1,5 @@
+{
+  "description": "A plain single-segment qcow2 disk name is valid.",
+  "name": "root.qcow2",
+  "expectedValid": true
+}

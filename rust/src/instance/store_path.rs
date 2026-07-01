@@ -20,6 +20,9 @@
 
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
+use serde::Serialize;
+
 /// Raised for any store-boundary violation (an invalid/traversing name, a symlink
 /// that escapes the store, or a missing store directory). Distinct
 /// store-flavoured wrappers surface it under their own labels, but the containment
@@ -160,6 +163,71 @@ pub fn resolve_in_store(
     Ok(candidate.to_string_lossy().into_owned())
 }
 
+/// A single entry (regular file) present in a store, as reported by a store's
+/// `list`. The Image Store and ISO Store report the identical shape, so — like the
+/// containment boundary above — the type lives HERE once rather than being
+/// duplicated per store (mirrors the TS `ImageInfo`/`IsoInfo`, which share a shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreEntry {
+    /// The bare name to reference this entry by inside its store.
+    pub name: String,
+    /// On-disk (host) size in bytes — sparse images report their allocated size.
+    pub size_bytes: u64,
+}
+
+/// List the regular files present in a store directory, each with its host size in
+/// bytes, sorted by name. This is the shared body behind both stores' `list`
+/// (mirrors the identical `list()` methods of the TS Image/ISO stores):
+///
+///  - Regular files ONLY: symlinks are skipped rather than followed, so a planted
+///    symlink can never surface as a listable entry. Subdirectories are skipped too.
+///  - A missing/inaccessible store fails closed with an actionable message naming
+///    the store's env var, exactly as [`resolve_in_store`] does.
+///  - A leaf that races away between `read_dir` and `stat` is silently skipped.
+pub async fn list_store_files(
+    dir: &str,
+    labels: &StoreLabels,
+) -> Result<Vec<StoreEntry>, StoreError> {
+    let missing = || {
+        StoreError(format!(
+            "{store} directory \"{dir}\" does not exist or is not accessible. Create it or set \
+             {env} to an existing directory.",
+            store = labels.store,
+            env = labels.env_var
+        ))
+    };
+
+    let mut read_dir = tokio::fs::read_dir(dir).await.map_err(|_| missing())?;
+    let mut entries: Vec<StoreEntry> = Vec::new();
+    loop {
+        // Stop enumerating on end-of-dir or a mid-iteration error, returning what we
+        // have — the store was reachable, so this is not a fail-closed condition.
+        let entry = match read_dir.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) | Err(_) => break,
+        };
+        // Skip anything that is not a regular file (symlinks report as symlink, not
+        // file, so they are never followed; directories are skipped as well).
+        match entry.file_type().await {
+            Ok(file_type) if file_type.is_file() => {}
+            _ => continue,
+        }
+        // `DirEntry::metadata` does not traverse symlinks, but the leaf is already a
+        // regular file, so its length is the on-disk size. Skip if it raced away.
+        let size_bytes = match entry.metadata().await {
+            Ok(metadata) => metadata.len(),
+            Err(_) => continue,
+        };
+        entries.push(StoreEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            size_bytes,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +263,11 @@ mod tests {
         // Option-injection characters are outside the allowlist.
         assert!(assert_valid_store_name("root.qcow2,readonly=on", &LBL).is_err());
         assert!(assert_valid_store_name("-leadingdash", &LBL).is_err());
+        // A NUL byte is rejected outright (not cleanly representable in the shared
+        // JSON corpus, so its branch is pinned here).
+        assert!(assert_valid_store_name("a\0b", &LBL)
+            .unwrap_err()
+            .0
+            .contains("NUL byte"));
     }
 }
