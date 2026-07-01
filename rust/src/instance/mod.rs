@@ -7,4 +7,5 @@
 pub mod hardware_spec;
 pub mod image_store;
 pub mod iso_store;
+pub mod orchestrator;
 pub mod store_path;
