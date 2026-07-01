@@ -17,6 +17,9 @@
 //! in-memory fake the lifecycle tests run against.
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
+
+use super::qmp_client::QmpEvent;
 
 /// Everything the driver needs to launch and connect to one Instance. Built by the
 /// Orchestrator from a validated Hardware Spec (`binary` + generated `argv`,
@@ -56,6 +59,12 @@ pub trait InstanceHandle: Send + Sync {
         args: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, DriverError>;
 
+    /// Subscribe to this Instance's async QMP events (the hook the Event Buffer feeds
+    /// from, slice #24). Each returned receiver observes every event broadcast from
+    /// the moment of subscription — the Orchestrator subscribes when the Instance is
+    /// created, so the buffer spans the Instance's whole life.
+    fn subscribe_events(&self) -> broadcast::Receiver<QmpEvent>;
+
     /// Terminate the process and close the QMP Session. Idempotent.
     async fn close(&self) -> Result<(), DriverError>;
 }
@@ -85,13 +94,29 @@ use std::sync::{Arc, Mutex};
 /// to assert what the Orchestrator built and handed over (e.g. exactly one launch
 /// under concurrent create attempts).
 #[cfg(test)]
-#[derive(Default)]
 pub(crate) struct FakeQemuDriver {
     /// When set, [`launch`](QemuDriver::launch) fails with this message.
     launch_error: Option<String>,
     /// Every request that reached [`launch`](QemuDriver::launch), shared so a test
     /// can read it after the driver has moved into the Orchestrator.
     launches: Arc<Mutex<Vec<LaunchRequest>>>,
+    /// The sender for the MOST-RECENTLY launched Instance's synthetic event stream.
+    /// Each launch installs a FRESH channel here — so, exactly like the TS fake's
+    /// per-process listeners, an event emitted on one Instance's sender never reaches a
+    /// later Instance. A test reads this (via [`events_slot`](FakeQemuDriver::events_slot))
+    /// after `create_instance` to emit synthetic events into the current Instance.
+    last_events: Arc<Mutex<Option<broadcast::Sender<QmpEvent>>>>,
+}
+
+#[cfg(test)]
+impl Default for FakeQemuDriver {
+    fn default() -> Self {
+        Self {
+            launch_error: None,
+            launches: Arc::new(Mutex::new(Vec::new())),
+            last_events: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +140,14 @@ impl FakeQemuDriver {
     pub(crate) fn launches(&self) -> Arc<Mutex<Vec<LaunchRequest>>> {
         Arc::clone(&self.launches)
     }
+
+    /// A handle onto the current Instance's event sender, readable after a launch so a
+    /// test can emit synthetic QMP events into the running Instance's stream — the
+    /// equivalent of the TS fake driver's `emitEvent`. Each launch replaces the sender
+    /// with a fresh one, so events cannot bleed across Instances.
+    pub(crate) fn events_slot(&self) -> Arc<Mutex<Option<broadcast::Sender<QmpEvent>>>> {
+        Arc::clone(&self.last_events)
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +161,12 @@ impl QemuDriver for FakeQemuDriver {
             .lock()
             .expect("fake launches mutex")
             .push(request);
-        Ok(Box::new(FakeInstanceHandle::new()))
+        // A fresh per-Instance event channel (capacity matches the QMP client's): the
+        // handle owns the sender, the Orchestrator subscribes a receiver, and the test
+        // emits via the recorded sender clone.
+        let (events_tx, _rx) = broadcast::channel(256);
+        *self.last_events.lock().expect("fake events slot mutex") = Some(events_tx.clone());
+        Ok(Box::new(FakeInstanceHandle::new(events_tx)))
     }
 }
 
@@ -148,16 +186,19 @@ struct FakeHandleState {
 #[cfg(test)]
 struct FakeInstanceHandle {
     state: Mutex<FakeHandleState>,
+    /// The shared synthetic event stream this handle exposes via `subscribe_events`.
+    events_tx: broadcast::Sender<QmpEvent>,
 }
 
 #[cfg(test)]
 impl FakeInstanceHandle {
-    fn new() -> Self {
+    fn new(events_tx: broadcast::Sender<QmpEvent>) -> Self {
         Self {
             state: Mutex::new(FakeHandleState {
                 running: true,
                 closed: false,
             }),
+            events_tx,
         }
     }
 }
@@ -221,6 +262,10 @@ impl InstanceHandle for FakeInstanceHandle {
                 "FakeInstanceHandle has no canned response for QMP command \"{other}\"."
             ))),
         }
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<QmpEvent> {
+        self.events_tx.subscribe()
     }
 
     async fn close(&self) -> Result<(), DriverError> {

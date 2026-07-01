@@ -231,15 +231,6 @@ impl RealInstanceHandle {
             closed: AtomicBool::new(false),
         }
     }
-
-    /// Subscribe to the Instance's async QMP events (the hook the Event Buffer
-    /// consumes in slice #24). Kept on the concrete handle for now; the driver seam
-    /// is extended to surface it through `dyn InstanceHandle` when that slice lands.
-    pub fn subscribe_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<super::qmp_client::QmpEvent> {
-        self.client.subscribe_events()
-    }
 }
 
 #[async_trait]
@@ -250,6 +241,12 @@ impl InstanceHandle for RealInstanceHandle {
             .await
             // Preserve the QMP class+desc (or the connection reason) in the message.
             .map_err(|e| DriverError(e.to_string()))
+    }
+
+    /// Subscribe to the Instance's async QMP events — the hook the Event Buffer feeds
+    /// from (slice #24). Delegates to the hand-rolled QMP client's broadcast.
+    fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<super::qmp_client::QmpEvent> {
+        self.client.subscribe_events()
     }
 
     async fn close(&self) -> Result<(), DriverError> {
