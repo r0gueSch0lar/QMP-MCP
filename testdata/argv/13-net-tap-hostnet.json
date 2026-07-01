@@ -1,0 +1,17 @@
+{
+  "description": "Host-level tap networking, permitted only when allowHostNet is enabled (QMP_MCP_ALLOW_HOST_NET). No hostfwd (user-mode only).",
+  "spec": { "network": { "mode": "tap" } },
+  "options": { "accel": "tcg", "allowHostNet": true },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "tap,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
