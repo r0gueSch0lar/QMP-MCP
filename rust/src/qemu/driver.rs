@@ -229,8 +229,10 @@ impl InstanceHandle for FakeInstanceHandle {
                 Ok(serde_json::json!({}))
             }
             // In-place control commands that leave the run-state unchanged; QEMU
-            // answers with the empty success object.
-            "system_reset" | "system_powerdown" => Ok(serde_json::json!({})),
+            // answers with the empty success object. `set_password` arms the vnc
+            // Display's password over QMP (ADR-0010) — the Orchestrator issues it
+            // before starting the noVNC Viewer.
+            "system_reset" | "system_powerdown" | "set_password" => Ok(serde_json::json!({})),
             // Answered dynamically from the run-state, so `get_status` reflects a
             // pause without the test wiring it up.
             "query-status" => Ok(serde_json::json!({

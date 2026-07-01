@@ -649,6 +649,10 @@ pub fn resolve_accel(
 pub const VNC_LOOPBACK_HOST: &str = "127.0.0.1";
 /// The fixed VNC display number.
 pub const VNC_DISPLAY_NUMBER: u16 = 0;
+/// The loopback TCP port of the VNC Display: QEMU maps `-vnc host:N` to TCP port
+/// `5900 + N`, so the Viewer's proxy always dials this one server-fixed endpoint
+/// (never a client-supplied target). Mirrors the TS `VNC_LOOPBACK_PORT`.
+pub const VNC_LOOPBACK_PORT: u16 = 5900 + VNC_DISPLAY_NUMBER;
 
 /// Fixed id tying a `-netdev` backend to its `-device` NIC. A single NIC per
 /// Instance in this slice, so a constant (non-agent-controlled) id suffices.

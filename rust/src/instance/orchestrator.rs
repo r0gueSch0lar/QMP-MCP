@@ -33,12 +33,13 @@ use super::event_buffer::{
 };
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, resolve_accel, Accel, AccelResolution, ArgvOptions,
-    HardwareSpec,
+    DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
 };
 use crate::qemu::driver::{InstanceHandle, LaunchRequest, QemuDriver};
+use crate::viewer::{RealViewerFactory, ViewerFactory, ViewerHandle, ViewerOptions};
 
 /// The lifecycle states an Instance moves through. `PAUSED` is entered by
 /// [`Orchestrator::pause_instance`] (QMP `stop`) and left by
@@ -151,6 +152,20 @@ pub struct OrchestratorOptions {
     /// (`QMP_MCP_EVENT_BUFFER_SIZE`, issue #12). `None` uses
     /// [`DEFAULT_EVENT_BUFFER_SIZE`] (the singleton injects the env-resolved value).
     pub event_buffer_size: Option<u32>,
+    /// The human-facing noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010).
+    /// A `display: vnc` spec is REJECTED before qemu is spawned when this is `None` —
+    /// the fail-closed coupling between the Display and its browser Viewer.
+    pub viewer_password: Option<String>,
+    /// Address the Viewer's own HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
+    /// `127.0.0.1`). Independent of the MCP transport, so the Viewer works under
+    /// `TRANSPORT=stdio` (ADR-0010).
+    pub viewer_host: String,
+    /// TCP port the Viewer's HTTP server listens on (`QMP_MCP_VIEWER_PORT`, default 6080).
+    pub viewer_port: u16,
+    /// Factory that starts the noVNC Viewer for a `display: vnc` Instance. `None` wires
+    /// in the real in-process Viewer ([`RealViewerFactory`]); tests inject a fake so the
+    /// lifecycle is exercisable without binding a real port.
+    pub start_viewer: Option<Box<dyn ViewerFactory>>,
     /// Probe for KVM availability (injected for testability; production passes the
     /// `/dev/kvm` probe, tests force a deterministic value).
     pub kvm_available: Box<dyn Fn() -> bool + Send + Sync>,
@@ -199,6 +214,12 @@ pub struct Orchestrator {
     handle: Option<Box<dyn InstanceHandle>>,
     spec: Option<HardwareSpec>,
     accel: Option<Accel>,
+    /// The running noVNC Viewer for a `display: vnc` Instance, if any (ADR-0010). Its
+    /// lifetime equals the Instance's: started during create, stopped on destroy.
+    viewer: Option<Box<dyn ViewerHandle>>,
+    /// Factory that starts the Viewer; the real in-process Viewer by default, a fake
+    /// under test.
+    start_viewer: Box<dyn ViewerFactory>,
     /// The Event Buffer capturing the current Instance's QMP async events. One buffer
     /// lives for the server's lifetime; it is [`EventBuffer::reset`] on every
     /// create/destroy so events never bleed across Instances (issue #12). Shared with
@@ -225,6 +246,11 @@ impl Orchestrator {
             .event_buffer_size
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_EVENT_BUFFER_SIZE);
+        // Default to the real in-process Viewer; tests inject a fake factory.
+        let start_viewer = options
+            .start_viewer
+            .take()
+            .unwrap_or_else(|| Box::new(RealViewerFactory));
         Self {
             driver,
             options,
@@ -233,6 +259,8 @@ impl Orchestrator {
             handle: None,
             spec: None,
             accel: None,
+            viewer: None,
+            start_viewer,
             event_buffer: Arc::new(EventBuffer::new(capacity)),
             event_feeder: None,
         }
@@ -277,12 +305,28 @@ impl Orchestrator {
         self.state = InstanceState::Starting;
         match self.launch_instance(candidate).await {
             Ok((spec, resolution, handle)) => {
+                // For a vnc Display, arm the Display password over QMP and start the
+                // Viewer BEFORE publishing the Instance as RUNNING, so any failure tears
+                // the launched qemu down and leaves state NONE (fail-closed, ADR-0010).
+                let viewer = if spec.display == DisplayMode::Vnc {
+                    match self.arm_display(handle.as_ref()).await {
+                        Ok(viewer) => Some(viewer),
+                        Err(err) => {
+                            let _ = handle.close().await;
+                            self.state = InstanceState::None;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Start a fresh Event Buffer for this Instance and capture its QMP
                 // async events for its whole life — no events carry over from a
                 // previous Instance (the buffer's cursor stays monotonic, though).
                 self.event_buffer.reset();
                 self.spawn_event_feeder(handle.subscribe_events());
                 self.handle = Some(handle);
+                self.viewer = viewer;
                 self.spec = Some(spec.clone());
                 self.accel = Some(resolution.accel);
                 self.state = InstanceState::Running;
@@ -312,6 +356,12 @@ impl Orchestrator {
         candidate: serde_json::Value,
     ) -> Result<(HardwareSpec, AccelResolution, Box<dyn InstanceHandle>), LifecycleError> {
         let spec = parse_hardware_spec(candidate).map_err(|e| LifecycleError(e.0))?;
+        // Fail-closed coupling (ADR-0010): a vnc Display starts the browser Viewer,
+        // which cannot serve without QMP_MCP_VIEWER_PASSWORD. Refuse BEFORE spawning
+        // qemu, so nothing is launched when the Viewer could never front it.
+        if spec.display == DisplayMode::Vnc {
+            self.assert_viewer_configured()?;
+        }
         let resolution = resolve_accel(spec.accel, || (self.options.kvm_available)())
             .map_err(|e| LifecycleError(e.0))?;
         let argv = build_argv(&spec, &self.argv_options(resolution.accel))
@@ -367,6 +417,7 @@ impl Orchestrator {
             .handle
             .take()
             .expect("handle present in a non-NONE state");
+        let viewer = self.viewer.take();
         self.spec = None;
         self.accel = None;
         self.state = InstanceState::Stopped;
@@ -376,6 +427,10 @@ impl Orchestrator {
         self.stop_event_feeder();
         self.event_buffer.reset();
         tracing::info!("destroying Instance");
+        // Stop the Viewer alongside qemu — its lifetime equals the Instance's (ADR-0010).
+        if let Some(viewer) = viewer {
+            viewer.stop().await;
+        }
         let closed = handle.close().await;
         self.state = InstanceState::None;
         closed.map_err(|e| LifecycleError(format!("Failed to destroy the Instance: {}", e.0)))?;
@@ -624,6 +679,64 @@ impl Orchestrator {
             ))),
         }
     }
+
+    /// Enforce the fail-closed Display↔Viewer coupling (ADR-0010): a `display: vnc`
+    /// spec requires `QMP_MCP_VIEWER_PASSWORD`. Returns an actionable [`LifecycleError`]
+    /// naming the variable when it is unset, so create_instance is refused before qemu
+    /// is spawned. Mirrors the TS `#assertViewerConfigured`.
+    fn assert_viewer_configured(&self) -> Result<(), LifecycleError> {
+        match self.options.viewer_password.as_deref() {
+            Some(password) if !password.is_empty() => Ok(()),
+            _ => Err(LifecycleError(
+                "The Hardware Spec requested display \"vnc\", which starts the noVNC Viewer, but \
+                 QMP_MCP_VIEWER_PASSWORD is not set. Set QMP_MCP_VIEWER_PASSWORD to a strong \
+                 password to enable the Viewer, or use display \"none\" for a headless Instance."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Arm the vnc Display and start its Viewer. A fresh VNC password is generated and
+    /// set over QMP (`set_password`) — never placed in argv, so it stays out of `ps` —
+    /// then handed to the Viewer to embed in the post-auth page for auto-authentication.
+    /// On any failure a [`LifecycleError`] is returned (and the caller tears the launched
+    /// qemu down), so the Instance never reaches RUNNING half-armed. Mirrors the TS
+    /// `#armDisplay`.
+    async fn arm_display(
+        &self,
+        handle: &dyn InstanceHandle,
+    ) -> Result<Box<dyn ViewerHandle>, LifecycleError> {
+        let vnc_password = generate_vnc_password();
+        handle
+            .execute(
+                "set_password",
+                Some(serde_json::json!({ "protocol": "vnc", "password": vnc_password })),
+            )
+            .await
+            .map_err(|e| {
+                LifecycleError(format!(
+                    "Failed to start the noVNC Viewer for the vnc Display: {}",
+                    e.0
+                ))
+            })?;
+        self.start_viewer
+            .start(ViewerOptions {
+                host: self.options.viewer_host.clone(),
+                port: self.options.viewer_port,
+                // assert_viewer_configured() guaranteed a non-empty password before launch.
+                password: self.options.viewer_password.clone().unwrap_or_default(),
+                vnc_host: VNC_LOOPBACK_HOST.to_string(),
+                vnc_port: VNC_LOOPBACK_PORT,
+                vnc_password,
+            })
+            .await
+            .map_err(|e| {
+                LifecycleError(format!(
+                    "Failed to start the noVNC Viewer for the vnc Display: {}",
+                    e.0
+                ))
+            })
+    }
 }
 
 /// A monotonically increasing counter making each server-chosen screendump filename
@@ -644,6 +757,32 @@ fn screendump_path(dir: &std::path::Path) -> PathBuf {
         "screendump-{}-{nanos}-{seq}.png",
         std::process::id()
     ))
+}
+
+/// Generate the internal VNC Display password (ADR-0010). The VNC auth scheme
+/// truncates the password to 8 characters, so 8 alphanumerics is the effective
+/// maximum; QEMU and noVNC truncate identically, so the armed and embedded passwords
+/// always match. Ambiguous glyphs (0/O, 1/l/I) are omitted so it stays copy-safe if
+/// ever surfaced. Draws from a CSPRNG (`getrandom`) with rejection sampling, so the
+/// selection is UNBIASED — 256 is not a multiple of the 55-char alphabet, so a plain
+/// `byte % 55` would skew toward the first 36 glyphs. Mirrors the TS
+/// `generateVncPassword` (`crypto.randomInt`).
+fn generate_vnc_password() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let n = ALPHABET.len();
+    // Largest multiple of `n` that fits in a byte's range; bytes at or above it are
+    // rejected so every accepted byte maps to a glyph with equal probability.
+    let limit = 256 - (256 % n);
+    let mut out = String::with_capacity(8);
+    while out.len() < 8 {
+        let mut byte = [0u8; 1];
+        getrandom::fill(&mut byte).expect("the OS CSPRNG must be available");
+        let value = byte[0] as usize;
+        if value < limit {
+            out.push(ALPHABET[value % n] as char);
+        }
+    }
+    out
 }
 
 /// Standard (RFC 4648) base64-encode `bytes`, with `=` padding. Hand-rolled to avoid a
@@ -700,12 +839,188 @@ mod tests {
             allow_raw_args: false,
             command_policy: None,
             event_buffer_size: None,
+            viewer_password: None,
+            viewer_host: "127.0.0.1".to_string(),
+            viewer_port: 6080,
+            start_viewer: None,
             kvm_available: Box::new(|| false),
         }
     }
 
     fn orchestrator_with(driver: FakeQemuDriver) -> Orchestrator {
         Orchestrator::new(Box::new(driver), test_options())
+    }
+
+    use crate::viewer::ViewerError;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// A fake noVNC Viewer factory: records the start/stop counts and the options it
+    /// was wired with, so the vnc lifecycle is exercisable without binding a real port.
+    struct FakeViewerFactory {
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+        last_options: Arc<std::sync::Mutex<Option<ViewerOptions>>>,
+        fail: bool,
+    }
+
+    /// The handle the fake factory hands back; `stop` bumps the shared stop counter.
+    struct FakeViewer {
+        stops: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ViewerHandle for FakeViewer {
+        async fn stop(&self) {
+            self.stops.fetch_add(1, SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ViewerFactory for FakeViewerFactory {
+        async fn start(
+            &self,
+            options: ViewerOptions,
+        ) -> Result<Box<dyn ViewerHandle>, ViewerError> {
+            if self.fail {
+                return Err(ViewerError("simulated Viewer bind failure".to_string()));
+            }
+            *self.last_options.lock().unwrap() = Some(options);
+            self.starts.fetch_add(1, SeqCst);
+            Ok(Box::new(FakeViewer {
+                stops: Arc::clone(&self.stops),
+            }))
+        }
+    }
+
+    /// Options wired with a fake Viewer factory plus a configured Viewer password, so a
+    /// `display: vnc` create can complete without a real port.
+    fn options_with_viewer(
+        factory: FakeViewerFactory,
+        viewer_password: Option<&str>,
+    ) -> OrchestratorOptions {
+        let mut options = test_options();
+        options.viewer_password = viewer_password.map(str::to_string);
+        options.start_viewer = Some(Box::new(factory));
+        options
+    }
+
+    #[tokio::test]
+    async fn vnc_display_without_viewer_password_is_rejected_before_any_launch() {
+        // Fail-closed (ADR-0010): a vnc Display with QMP_MCP_VIEWER_PASSWORD unset is
+        // refused BEFORE qemu is spawned, with an actionable message naming the variable.
+        let driver = FakeQemuDriver::new();
+        let launches = driver.launches();
+        let mut orch = orchestrator_with(driver); // test_options → viewer_password None
+        let err = orch
+            .create_instance(json!({ "display": "vnc" }))
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("QMP_MCP_VIEWER_PASSWORD"), "got: {}", err.0);
+        assert!(err.0.contains("display \"vnc\""), "got: {}", err.0);
+        assert_eq!(orch.state(), InstanceState::None);
+        assert_eq!(
+            launches.lock().unwrap().len(),
+            0,
+            "no qemu is launched when the Viewer is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn vnc_display_arms_the_password_starts_the_viewer_and_destroy_stops_it() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let factory = FakeViewerFactory {
+            starts: Arc::clone(&starts),
+            stops: Arc::clone(&stops),
+            last_options: Arc::clone(&last),
+            fail: false,
+        };
+        let mut orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_viewer(factory, Some("view-secret")),
+        );
+
+        orch.create_instance(json!({ "display": "vnc" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            starts.load(SeqCst),
+            1,
+            "the Viewer must start for a vnc Display"
+        );
+
+        // The Viewer is wired to the human-facing gate and the server-fixed loopback
+        // VNC endpoint, with a fresh 8-char armed password (never in argv).
+        let opts = last.lock().unwrap().clone().unwrap();
+        assert_eq!(opts.password, "view-secret");
+        assert_eq!(opts.vnc_host, "127.0.0.1");
+        assert_eq!(opts.vnc_port, 5900);
+        assert_eq!(opts.vnc_password.len(), 8);
+
+        orch.destroy_instance().await.unwrap();
+        assert_eq!(stops.load(SeqCst), 1, "destroy must stop the Viewer");
+        assert_eq!(orch.state(), InstanceState::None);
+    }
+
+    #[tokio::test]
+    async fn a_headless_display_never_starts_the_viewer() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let factory = FakeViewerFactory {
+            starts: Arc::clone(&starts),
+            stops: Arc::new(AtomicUsize::new(0)),
+            last_options: Arc::new(std::sync::Mutex::new(None)),
+            fail: false,
+        };
+        let mut orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_viewer(factory, Some("view-secret")),
+        );
+        // Default display is `none`: the Viewer surface never comes up.
+        orch.create_instance(json!({})).await.unwrap();
+        assert_eq!(
+            starts.load(SeqCst),
+            0,
+            "a headless Instance starts no Viewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_start_failure_tears_down_and_leaves_none() {
+        let factory = FakeViewerFactory {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+            last_options: Arc::new(std::sync::Mutex::new(None)),
+            fail: true,
+        };
+        let mut orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_viewer(factory, Some("view-secret")),
+        );
+        let err = orch
+            .create_instance(json!({ "display": "vnc" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("Failed to start the noVNC Viewer"),
+            "got: {}",
+            err.0
+        );
+        // The launched qemu was torn down and the slot released back to NONE.
+        assert_eq!(orch.state(), InstanceState::None);
+    }
+
+    #[test]
+    fn generate_vnc_password_is_eight_copy_safe_chars() {
+        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+        for _ in 0..64 {
+            let password = generate_vnc_password();
+            assert_eq!(password.len(), 8, "VNC password must be 8 chars");
+            assert!(
+                password.bytes().all(|b| ALPHABET.contains(&b)),
+                "unexpected glyph in {password}"
+            );
+        }
     }
 
     /// Emit a synthetic QMP event onto the fake driver's stream and wait until the
