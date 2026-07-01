@@ -4,14 +4,17 @@
 //! actionable message and exit code 1 on a [`config::ConfigError`]), set the log
 //! level, construct the single-instance Orchestrator behind a shared async mutex,
 //! then serve the MCP server — tearing down any running Instance on shutdown so
-//! qemu is never orphaned (ADR-0004). This slice supports the stdio transport only;
-//! selecting `http`/`both` is an actionable error (HTTP is slice #25).
+//! qemu is never orphaned (ADR-0004). The transport is selected by
+//! `QMP_MCP_TRANSPORT`: `stdio` (auth-free), the streamable `http` transport behind
+//! the fail-closed auth + origin guards (`crate::http`, ADR-0005), or `both`
+//! concurrently — mirroring `index.ts`.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use qmp_mcp::config::{self, Config, TransportMode};
+use qmp_mcp::config::{self, AuthMode, Config, TransportMode};
+use qmp_mcp::http;
 use qmp_mcp::instance::hardware_spec::probe_kvm;
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
@@ -65,24 +68,32 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Serve the configured transport. Returns an error (which `main` logs and turns
-/// into exit 1) for the not-yet-implemented HTTP transports and for any serve-time
-/// failure.
+/// Serve the configured transport(s). Returns an error (which `main` logs and turns
+/// into exit 1) for an unsupported auth mode and for any serve-time failure.
+///
+/// Mirrors `../../src/index.ts`: `stdio` serves one auth-free stdio transport;
+/// `http` serves the streamable HTTP transport behind the fail-closed auth +
+/// origin guards; `both` runs stdio and HTTP concurrently. In every case any
+/// running Instance is torn down before returning, so qemu is never orphaned
+/// (ADR-0004).
 async fn run(
     config: Config,
     command_policy: ResolvedPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if config.transport.exposes_http() {
-        return Err(format!(
-            "QMP_MCP_TRANSPORT={} selected, but the HTTP transport arrives in a later slice \
-             (#25). Set QMP_MCP_TRANSPORT=stdio to run this build.",
-            config.transport
-        )
-        .into());
+    // JWT auth is defined by the shared config surface but not yet implemented in
+    // this variant; refuse to serve HTTP under it rather than silently ignoring the
+    // configured mode. Fail-closed and actionable (API-key or explicit insecure).
+    if config.transport.exposes_http()
+        && !config.allow_insecure
+        && config.auth_mode == AuthMode::Jwt
+    {
+        return Err(
+            "QMP_MCP_AUTH=jwt is not yet implemented in the Rust variant. \
+             Use QMP_MCP_AUTH=apikey with QMP_MCP_API_KEYS, \
+             or set QMP_MCP_ALLOW_INSECURE=true to run unauthenticated (local dev only)."
+                .into(),
+        );
     }
-
-    debug_assert_eq!(config.transport, TransportMode::Stdio);
-    tracing::info!("starting qmp-mcp (transport=stdio)");
 
     // The single-instance Orchestrator, shared behind an async mutex so concurrent
     // tool calls serialise on the one Instance (ADR-0011). It is wired to the real
@@ -104,16 +115,37 @@ async fn run(
         run: None,
     });
     let iso_store = IsoStore::new(config.iso_dir.clone());
+    let server = QmpMcpServer::new(Arc::clone(&orchestrator), image_store, iso_store);
 
-    let service = QmpMcpServer::new(Arc::clone(&orchestrator), image_store, iso_store)
+    // ADR-0005: the only way to serve HTTP without auth is the explicit insecure
+    // override, which logs the same cleartext warning as the TS server so an operator
+    // is never surprised by an open port. stdio-only never reaches this.
+    if config.allow_insecure && config.transport.exposes_http() {
+        tracing::warn!(
+            "QMP_MCP_ALLOW_INSECURE=true: serving the HTTP transport WITHOUT authentication. \
+             This is for local development only — never expose this port on an untrusted network."
+        );
+    }
+
+    match config.transport {
+        TransportMode::Stdio => serve_stdio(server, &orchestrator).await?,
+        TransportMode::Http => serve_http(&config, server, &orchestrator).await?,
+        TransportMode::Both => serve_both(&config, server, &orchestrator).await?,
+    }
+    Ok(())
+}
+
+/// Serve the auth-free stdio transport, racing it against a termination signal, then
+/// tear down any running Instance (ADR-0004).
+async fn serve_stdio(
+    server: QmpMcpServer,
+    orchestrator: &Arc<Mutex<Orchestrator>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("starting qmp-mcp (transport=stdio)");
+    let service = server
         .serve(stdio())
         .await
         .inspect_err(|err| tracing::error!("failed to start stdio transport: {err:?}"))?;
-
-    // ADR-0004: the Instance's lifetime is the server's lifetime. Race the service
-    // (which resolves when the peer disconnects / stdin closes) against SIGINT/
-    // SIGTERM, then tear down any running Instance before exiting so qemu is never
-    // orphaned. Mirrors the shutdown hook in ../../src/index.ts.
     tokio::select! {
         result = service.waiting() => {
             result?;
@@ -123,7 +155,69 @@ async fn run(
             tracing::info!("received {signal}; shutting down");
         }
     }
-    teardown(&orchestrator).await;
+    teardown(orchestrator).await;
+    Ok(())
+}
+
+/// Serve only the streamable HTTP transport (behind the fail-closed guards), racing
+/// it against a termination signal, then tear down any running Instance (ADR-0004).
+async fn serve_http(
+    config: &Config,
+    server: QmpMcpServer,
+    orchestrator: &Arc<Mutex<Orchestrator>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!(
+        "starting qmp-mcp (transport=http on http://{}:{}{})",
+        config.http_host,
+        config.http_port,
+        config.http_endpoint
+    );
+    tokio::select! {
+        result = http::serve(config, server, std::future::pending()) => {
+            result?;
+            tracing::info!("HTTP transport closed; shutting down");
+        }
+        signal = shutdown_signal() => {
+            tracing::info!("received {signal}; shutting down");
+        }
+    }
+    teardown(orchestrator).await;
+    Ok(())
+}
+
+/// Serve stdio and the streamable HTTP transport concurrently (mirroring the TS
+/// `both` mode). Whichever of {stdio closes, HTTP ends, a signal arrives} happens
+/// first stops the server; any running Instance is then torn down (ADR-0004).
+async fn serve_both(
+    config: &Config,
+    server: QmpMcpServer,
+    orchestrator: &Arc<Mutex<Orchestrator>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!(
+        "starting qmp-mcp (transport=both on http://{}:{}{})",
+        config.http_host,
+        config.http_port,
+        config.http_endpoint
+    );
+    let stdio_service = server
+        .clone()
+        .serve(stdio())
+        .await
+        .inspect_err(|err| tracing::error!("failed to start stdio transport: {err:?}"))?;
+    tokio::select! {
+        result = stdio_service.waiting() => {
+            result?;
+            tracing::info!("stdio transport closed; shutting down");
+        }
+        result = http::serve(config, server, std::future::pending()) => {
+            result?;
+            tracing::info!("HTTP transport closed; shutting down");
+        }
+        signal = shutdown_signal() => {
+            tracing::info!("received {signal}; shutting down");
+        }
+    }
+    teardown(orchestrator).await;
     Ok(())
 }
 
