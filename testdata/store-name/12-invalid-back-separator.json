@@ -1,0 +1,6 @@
+{
+  "description": "A nested name containing a backslash is rejected: subdirectories are not allowed in a store.",
+  "name": "sub\\child.qcow2",
+  "expectedValid": false,
+  "reasonContains": ["path separator"]
+}
