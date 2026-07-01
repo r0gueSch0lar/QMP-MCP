@@ -64,6 +64,12 @@ ENV QMP_MCP_TRANSPORT=http \
     QMP_MCP_HTTP_HOST=0.0.0.0 \
     QMP_MCP_HTTP_PORT=8080
 
+# The optional noVNC Viewer (ADR-0010) runs on its own HTTP server. Bind it to all
+# interfaces so a published port is reachable; it stays FAIL-CLOSED behind
+# QMP_MCP_VIEWER_PASSWORD (unset here — a vnc Display is refused until you set it).
+ENV QMP_MCP_VIEWER_HOST=0.0.0.0 \
+    QMP_MCP_VIEWER_PORT=6080
+
 # Run as a dedicated non-root user (ADR-0008). TCG works rootless with zero device
 # access, so the zero-privilege path always works; KVM is opt-in only.
 RUN groupadd --system qmp \
@@ -73,7 +79,9 @@ RUN groupadd --system qmp \
 
 USER qmp
 
-EXPOSE 8080
+# 8080: the MCP HTTP transport. 6080: the optional noVNC Viewer (ADR-0010), served
+# only while a `display: vnc` Instance runs and only behind QMP_MCP_VIEWER_PASSWORD.
+EXPOSE 8080 6080
 
 # `node dist/index.js` is the `qmp-mcp` bin. Our orchestrator owns the Instance
 # lifecycle, so the entrypoint is the server itself — never a VM-booting wrapper

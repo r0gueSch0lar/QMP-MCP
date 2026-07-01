@@ -126,6 +126,22 @@ export interface Config {
    * hosts (ADR-0002).
    */
   allowRawArgs: boolean;
+  /**
+   * The human-facing password gating the noVNC Viewer (`QMP_MCP_VIEWER_PASSWORD`,
+   * ADR-0010), or undefined when unset. The Viewer is FAIL-CLOSED behind it: the
+   * page and the websocket are refused unless the request authenticates, and
+   * requesting a `display: vnc` Instance while this is unset is rejected. Distinct
+   * from the MCP `apiKeys` because its audience is a human in a browser.
+   */
+  viewerPassword: string | undefined;
+  /**
+   * Address the noVNC Viewer's HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
+   * `127.0.0.1`; the container image overrides it to `0.0.0.0`). Independent of the
+   * MCP transport, so the Viewer works even with `QMP_MCP_TRANSPORT=stdio` (ADR-0010).
+   */
+  viewerHost: string;
+  /** TCP port the noVNC Viewer listens on (`QMP_MCP_VIEWER_PORT`, default 6080). */
+  viewerPort: number;
 }
 
 /**
@@ -341,6 +357,36 @@ export function resolveAllowRawArgs(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve the noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010), or
+ * undefined when unset. A whitespace-only value is treated as unset (mirroring
+ * `QMP_MCP_JWT_SECRET`) so the Viewer stays fail-closed rather than serving behind
+ * a blank gate. Exported so the Orchestrator singleton and {@link loadConfig} share
+ * one source of truth.
+ */
+export function resolveViewerPassword(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_VIEWER_PASSWORD;
+  return raw !== undefined && raw.trim() !== '' ? raw : undefined;
+}
+
+/**
+ * Resolve the noVNC Viewer bind address (`QMP_MCP_VIEWER_HOST`, default
+ * `127.0.0.1`; the container image overrides it to `0.0.0.0`). Exported so the
+ * Orchestrator singleton and {@link loadConfig} share one source of truth (ADR-0010).
+ */
+export function resolveViewerHost(env: NodeJS.ProcessEnv): string {
+  return parseString(env.QMP_MCP_VIEWER_HOST, '127.0.0.1');
+}
+
+/**
+ * Resolve the noVNC Viewer TCP port (`QMP_MCP_VIEWER_PORT`, default 6080).
+ * Fail-closed on garbage. Exported so the Orchestrator singleton and
+ * {@link loadConfig} share one source of truth (ADR-0010).
+ */
+export function resolveViewerPort(env: NodeJS.ProcessEnv): number {
+  return parsePort('QMP_MCP_VIEWER_PORT', env.QMP_MCP_VIEWER_PORT, 6080);
+}
+
+/**
  * Split a comma-separated list env var into trimmed, non-empty entries.
  * Undefined yields an empty list.
  */
@@ -423,5 +469,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     allowHostNet: resolveAllowHostNet(env),
     eventBufferSize: resolveEventBufferSize(env),
     allowRawArgs: resolveAllowRawArgs(env),
+    viewerPassword: resolveViewerPassword(env),
+    viewerHost: resolveViewerHost(env),
+    viewerPort: resolveViewerPort(env),
   };
 }

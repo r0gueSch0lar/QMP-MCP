@@ -14,7 +14,7 @@
  * process-global {@link orchestrator} singleton wires in the real driver.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +28,9 @@ import {
   resolveIsoDir,
   resolveMaxMemoryMb,
   resolveMaxVcpus,
+  resolveViewerHost,
+  resolveViewerPassword,
+  resolveViewerPort,
 } from '../config.js';
 import { logger } from '../logger.js';
 import {
@@ -39,6 +42,11 @@ import {
 } from '../policy/command-policy.js';
 import type { InstanceProcess, QemuDriver } from '../qemu/driver.js';
 import { RealQemuDriver } from '../qemu/real-driver.js';
+import {
+  startViewer as startRealViewer,
+  type Viewer,
+  type ViewerOptions,
+} from '../viewer/viewer.js';
 import {
   DEFAULT_EVENT_BUFFER_SIZE,
   EventBuffer,
@@ -52,6 +60,8 @@ import {
   parseHardwareSpec,
   probeKvm,
   resolveAccel,
+  VNC_LOOPBACK_HOST,
+  VNC_LOOPBACK_PORT,
 } from './hardware-spec.js';
 
 /**
@@ -159,6 +169,27 @@ export interface OrchestratorOptions {
    * env-resolved value).
    */
   eventBufferSize?: number;
+  /**
+   * The human-facing noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010).
+   * A `display: vnc` spec is REJECTED before qemu is spawned when this is unset —
+   * the fail-closed coupling between the Display and its browser Viewer. Optional:
+   * omitted means the Viewer cannot be requested (the singleton injects it).
+   */
+  viewerPassword?: string;
+  /**
+   * Address the Viewer's own HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
+   * `127.0.0.1`). Independent of the MCP transport, so the Viewer works under
+   * `TRANSPORT=stdio` (ADR-0010).
+   */
+  viewerHost?: string;
+  /** TCP port the Viewer's HTTP server listens on (`QMP_MCP_VIEWER_PORT`, default 6080). */
+  viewerPort?: number;
+  /**
+   * Factory that starts the noVNC Viewer for a `display: vnc` Instance. Injected so
+   * the lifecycle is testable without binding a real port; the singleton wires in
+   * the real in-process Viewer.
+   */
+  startViewer?: (options: ViewerOptions) => Promise<Viewer>;
   /** Probe for KVM availability (injected for testability). */
   kvmAvailable: () => boolean;
   /**
@@ -215,6 +246,10 @@ export class Orchestrator {
   #process?: InstanceProcess;
   #spec?: HardwareSpec;
   #accel?: Accel;
+  /** The running noVNC Viewer for a `display: vnc` Instance, if any (ADR-0010). */
+  #viewer?: Viewer;
+  /** Factory that starts the Viewer; the real in-process Viewer by default. */
+  #startViewer: (options: ViewerOptions) => Promise<Viewer>;
   /**
    * The Event Buffer capturing the current Instance's QMP async events. One
    * buffer lives for the server's lifetime; it is {@link EventBuffer.reset} on
@@ -236,6 +271,8 @@ export class Orchestrator {
     // Resolve the policy once: an omitted policy means the built-in allowlist.
     this.#commandPolicy = options.commandPolicy ?? buildPolicy();
     this.#eventBuffer = new EventBuffer(options.eventBufferSize ?? DEFAULT_EVENT_BUFFER_SIZE);
+    // Default to the real in-process Viewer; tests inject a fake factory.
+    this.#startViewer = options.startViewer ?? startRealViewer;
   }
 
   /** Return the current Instance view. Reports `NONE` when nothing is running. */
@@ -276,6 +313,10 @@ export class Orchestrator {
     try {
       // Parse/accel are synchronous but may throw; a throw must free the slot.
       const spec = parseHardwareSpec(candidate);
+      // Fail-closed coupling (ADR-0010): a vnc Display starts the browser Viewer,
+      // which cannot serve without QMP_MCP_VIEWER_PASSWORD. Refuse BEFORE spawning
+      // qemu, so nothing is launched when the Viewer could never front it.
+      if (spec.display === 'vnc') this.#assertViewerConfigured();
       const resolution = resolveAccel(spec.accel, this.#options.kvmAvailable);
 
       const { qmpSocketPath, binary } = this.#options;
@@ -319,7 +360,25 @@ export class Orchestrator {
         );
       }
 
+      // For a vnc Display, arm the Display password over QMP and start the Viewer
+      // BEFORE publishing the Instance as RUNNING, so any failure tears everything
+      // down and leaves state NONE (fail-closed).
+      let viewer: Viewer | undefined;
+      if (spec.display === 'vnc') {
+        viewer = await this.#armDisplay(process);
+        // A concurrent teardown could have superseded us during those awaits; if so,
+        // do not clobber the new owner — tear down what we just started.
+        if (!ownsSlot()) {
+          await viewer.stop().catch(() => undefined);
+          void process.close().catch(() => undefined);
+          throw new LifecycleError(
+            'Instance creation was superseded before it completed; the launched process was torn down.',
+          );
+        }
+      }
+
       this.#process = process;
+      this.#viewer = viewer;
       this.#spec = spec;
       this.#accel = resolution.accel;
       this.#state = 'RUNNING';
@@ -358,7 +417,9 @@ export class Orchestrator {
     // slot/spec/accel) before the first await, so a concurrent destroyInstance
     // hits the no-Instance guard above instead of double-closing.
     const process = this.#process;
+    const viewer = this.#viewer;
     this.#process = undefined;
+    this.#viewer = undefined;
     this.#spec = undefined;
     this.#accel = undefined;
     this.#launchToken = undefined;
@@ -370,6 +431,8 @@ export class Orchestrator {
     this.#eventBuffer.reset();
     logger.info('destroying Instance');
     try {
+      // Stop the Viewer alongside qemu — its lifetime equals the Instance's (ADR-0010).
+      await viewer?.stop().catch(() => undefined);
       await process.close();
     } finally {
       this.#state = 'NONE';
@@ -541,12 +604,64 @@ export class Orchestrator {
     return this.#process;
   }
 
+  /**
+   * Enforce the fail-closed Display↔Viewer coupling (ADR-0010): a `display: vnc`
+   * spec requires `QMP_MCP_VIEWER_PASSWORD`. Throws an actionable
+   * {@link LifecycleError} naming the variable when it is unset, so create_instance
+   * is refused before qemu is spawned.
+   */
+  #assertViewerConfigured(): void {
+    const password = this.#options.viewerPassword;
+    if (password === undefined || password === '') {
+      throw new LifecycleError(
+        'The Hardware Spec requested display "vnc", which starts the noVNC Viewer, but ' +
+          'QMP_MCP_VIEWER_PASSWORD is not set. Set QMP_MCP_VIEWER_PASSWORD to a strong password to ' +
+          'enable the Viewer, or use display "none" for a headless Instance.',
+      );
+    }
+  }
+
+  /**
+   * Arm the vnc Display and start its Viewer. A fresh VNC password is generated and
+   * set over QMP (`set_password`) — never placed in argv, so it stays out of `ps` —
+   * then handed to the Viewer to embed in the post-auth page for auto-authentication.
+   * On any failure the launched qemu (and a half-started Viewer) are torn down and a
+   * {@link LifecycleError} is thrown, so the Instance never reaches RUNNING half-armed.
+   */
+  async #armDisplay(process: InstanceProcess): Promise<Viewer> {
+    const vncPassword = generateVncPassword();
+    let viewer: Viewer | undefined;
+    try {
+      await process.execute('set_password', { protocol: 'vnc', password: vncPassword });
+      viewer = await this.#startViewer({
+        host: this.#options.viewerHost ?? '127.0.0.1',
+        port: this.#options.viewerPort ?? 6080,
+        // #assertViewerConfigured() guaranteed a non-empty password before launch.
+        password: this.#options.viewerPassword ?? '',
+        vncHost: VNC_LOOPBACK_HOST,
+        vncPort: VNC_LOOPBACK_PORT,
+        vncPassword,
+      });
+      return viewer;
+    } catch (err) {
+      await viewer?.stop().catch(() => undefined);
+      void process.close().catch(() => undefined);
+      throw new LifecycleError(
+        `Failed to start the noVNC Viewer for the vnc Display: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /** Reconcile state when the process exits without an explicit destroy. */
   #onProcessExit(): void {
     if (this.#state === 'STOPPED' || this.#state === 'NONE') return;
     logger.warning('Instance process exited unexpectedly; resetting state to NONE');
     const process = this.#process;
+    const viewer = this.#viewer;
     this.#process = undefined;
+    this.#viewer = undefined;
     this.#spec = undefined;
     this.#accel = undefined;
     this.#launchToken = undefined;
@@ -560,7 +675,23 @@ export class Orchestrator {
     // qemu leaves its socket file behind; without this, every future create would
     // refuse with 'occupied'. close() is idempotent and best-effort here.
     void process?.close().catch(() => undefined);
+    // The Instance is gone: stop its Viewer too (ADR-0010).
+    void viewer?.stop().catch(() => undefined);
   }
+}
+
+/**
+ * Generate the internal VNC Display password. The VNC auth scheme truncates the
+ * password to 8 characters, so 8 alphanumerics is the effective maximum; QEMU and
+ * noVNC truncate identically, so the armed and embedded passwords always match.
+ * Ambiguous glyphs (0/O, 1/l/I) are omitted so it stays copy-safe if ever surfaced.
+ */
+function generateVncPassword(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  // crypto.randomInt(max) draws a uniform integer in [0, max) with rejection
+  // sampling, so it has none of the modulo bias `randomBytes[i] % length` would
+  // introduce when 256 is not a multiple of the alphabet length (it is not: 55).
+  return Array.from({ length: 8 }, () => alphabet.charAt(randomInt(alphabet.length))).join('');
 }
 
 /** The process-global Orchestrator singleton, wired to the real QEMU driver. */
@@ -580,6 +711,11 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Gate the raw-args escape hatch: a spec's extraArgs are refused unless
   // QMP_MCP_ALLOW_RAW_ARGS=true (ADR-0002).
   allowRawArgs: resolveAllowRawArgs(process.env),
+  // noVNC Viewer for a vnc Display (ADR-0010): the human-facing gate plus the
+  // Viewer's own bind address/port. A vnc spec is refused when the password is unset.
+  viewerPassword: resolveViewerPassword(process.env),
+  viewerHost: resolveViewerHost(process.env),
+  viewerPort: resolveViewerPort(process.env),
   // Bound the Event Buffer of recent QMP async events (issue #12).
   eventBufferSize: resolveEventBufferSize(process.env),
   // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
