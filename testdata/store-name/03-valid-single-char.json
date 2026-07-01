@@ -1,0 +1,5 @@
+{
+  "description": "A single leading alphanumeric with no remainder is valid.",
+  "name": "a",
+  "expectedValid": true
+}

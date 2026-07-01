@@ -1,0 +1,6 @@
+{
+  "description": "A comma would let a name inject extra comma-separated QemuOpts properties, so it is rejected.",
+  "name": "root.qcow2,readonly=on",
+  "expectedValid": false,
+  "reasonContains": ["inject QEMU -drive properties"]
+}

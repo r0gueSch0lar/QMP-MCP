@@ -1,0 +1,5 @@
+{
+  "description": "A leading digit is allowed: the first character must be alphanumeric, not necessarily a letter.",
+  "name": "0disk.img",
+  "expectedValid": true
+}

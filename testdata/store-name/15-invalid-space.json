@@ -1,0 +1,6 @@
+{
+  "description": "An interior space is outside the option-injection-safe allowlist and is rejected.",
+  "name": "my disk.qcow2",
+  "expectedValid": false,
+  "reasonContains": ["inject QEMU -drive properties"]
+}

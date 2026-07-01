@@ -1,0 +1,6 @@
+{
+  "description": "A leading hyphen is rejected: it could otherwise inject a QEMU -drive option.",
+  "name": "-drive.qcow2",
+  "expectedValid": false,
+  "reasonContains": ["inject QEMU -drive properties"]
+}

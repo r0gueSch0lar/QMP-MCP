@@ -1,0 +1,6 @@
+{
+  "description": "A colon is outside the allowlist and is rejected: it could be read as a QEMU protocol/host separator (e.g. nbd:host).",
+  "name": "nbd:host.qcow2",
+  "expectedValid": false,
+  "reasonContains": ["inject QEMU -drive properties"]
+}
