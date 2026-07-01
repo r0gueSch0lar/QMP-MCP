@@ -55,3 +55,15 @@ The bounded, server-side ring buffer of recent QMP async events for the current
 Instance. The agent reads it pull-style via `get_events`/`wait_for_event`; an optional
 push notification is a secondary surface.
 _Avoid_: event log, event stream, queue
+
+**Display**:
+The Guest's graphical output, exposed by QEMU itself over VNC and selected through the
+Hardware Spec. Portable: it is a plain QEMU feature, so it works identically on bare
+metal and in any image.
+_Avoid_: screen, console, framebuffer
+
+**Viewer**:
+The optional noVNC browser bridge over a Guest's VNC Display, started and stopped by
+the server for the lifetime of a `display: vnc` Instance. Reads the Display only —
+never the QMP Session — and is fail-closed behind its own password.
+_Avoid_: console, GUI, web UI, VNC server
