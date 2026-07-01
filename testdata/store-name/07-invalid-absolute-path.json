@@ -1,0 +1,6 @@
+{
+  "description": "An absolute path is rejected: names are bare and resolved inside the store, never host paths.",
+  "name": "/etc/passwd",
+  "expectedValid": false,
+  "reasonContains": ["absolute path"]
+}
