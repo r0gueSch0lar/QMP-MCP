@@ -14,8 +14,10 @@ path = "src/main.rs"
 # Official MCP Rust SDK. The default features already enable `server` + `macros`
 # (which is where the re-exported `schemars` and the `#[tool_router]`/`#[tool]`/
 # `#[tool_handler]` macros come from); `transport-io` adds tokio's io-std so we can
-# serve over stdio. Listed explicitly for intent even though some are on by default.
-rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
+# serve over stdio; `transport-streamable-http-server` adds the tower-based
+# `StreamableHttpService` the HTTP transport is built on (slice #25, ADR-0005/0011).
+# Listed explicitly for intent even though some are on by default.
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 # `sync` gives the `tokio::sync::Mutex` behind the single-instance Orchestrator
 # (ADR-0011); `signal` gives the SIGINT/SIGTERM teardown hook (ADR-0004). The QMP
 # client + real driver (slice #21) add `net` (the QMP `UnixStream`), `process` (the
@@ -44,3 +46,9 @@ async-trait = "0.1"
 # with the TS TERM-then-KILL grace), mirroring `../../src/qemu/real-driver.ts`.
 # Already in the tree as a transitive tokio dependency.
 libc = "0.2"
+# The HTTP transport's web stack (slice #25, ADR-0005/0011). rmcp's
+# `StreamableHttpService` is a `tower_service::Service` over the `http` 1.x stack;
+# axum 0.8 (the same major rmcp's own examples use) nests it under the configured
+# endpoint and lets the fail-closed auth + DNS-rebinding guards sit in front as
+# `middleware::from_fn` layers. stdio needs none of this and does not pull it in.
+axum = "0.8"
