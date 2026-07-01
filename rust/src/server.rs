@@ -679,6 +679,10 @@ mod tests {
             allow_raw_args: false,
             command_policy: None,
             event_buffer_size: None,
+            viewer_password: None,
+            viewer_host: "127.0.0.1".to_string(),
+            viewer_port: 6080,
+            start_viewer: None,
             kvm_available: Box::new(|| false),
         };
         let orchestrator = Arc::new(Mutex::new(Orchestrator::new(Box::new(driver), options)));
