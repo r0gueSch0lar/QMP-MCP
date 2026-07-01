@@ -239,6 +239,13 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         command_policy: Some(command_policy),
         // Bound the Event Buffer of recent QMP async events (issue #12).
         event_buffer_size: Some(config.event_buffer_size),
+        // noVNC Viewer for a vnc Display (ADR-0010): the human-facing gate plus the
+        // Viewer's own bind address/port. A vnc spec is refused when the password is
+        // unset. `start_viewer: None` wires in the real in-process Viewer.
+        viewer_password: config.viewer_password.clone(),
+        viewer_host: config.viewer_host.clone(),
+        viewer_port: config.viewer_port,
+        start_viewer: None,
         // `/dev/kvm` probe — the single source of truth from the hardware-spec module.
         kvm_available: Box::new(probe_kvm),
     }
