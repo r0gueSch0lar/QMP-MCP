@@ -1,0 +1,6 @@
+{
+  "description": "The current-directory name '.' is not a valid file name.",
+  "name": ".",
+  "expectedValid": false,
+  "reasonContains": ["not a valid file name"]
+}

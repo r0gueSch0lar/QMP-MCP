@@ -1,0 +1,6 @@
+{
+  "description": "An empty name is rejected as not a non-empty string.",
+  "name": "",
+  "expectedValid": false,
+  "reasonContains": ["non-empty string"]
+}
