@@ -12,8 +12,9 @@
 //! hands back a live [`InstanceHandle`], and everything else flows through that
 //! handle (`execute` for QMP commands — including `query-status` and the
 //! `stop`/`cont` pause controls — and `close` to terminate). The real driver
-//! (tokio child process + hand-rolled QMP client) drops in behind the same shape in
-//! slice #21; this slice ships only the fake plus a fail-closed placeholder.
+//! ([`crate::qemu::real_driver::RealQemuDriver`] — tokio child process + hand-rolled
+//! QMP client) sits behind the same shape; this module defines the port and the
+//! in-memory fake the lifecycle tests run against.
 
 use async_trait::async_trait;
 
@@ -68,30 +69,6 @@ pub trait QemuDriver: Send + Sync {
     /// Spawn `binary` with `argv` and negotiate the QMP Session on
     /// `qmp_socket_path`, returning a handle that owns the running Instance.
     async fn launch(&self, request: LaunchRequest) -> Result<Box<dyn InstanceHandle>, DriverError>;
-}
-
-/// The production placeholder driver for this slice. The seam, the Orchestrator,
-/// its lifecycle, and the whole tool surface are in place, but actually spawning a
-/// `qemu-system-*` process and negotiating its QMP Session — the *real* driver —
-/// arrives in slice #21. Until then this fails closed with an actionable message so
-/// a `create_instance` call never silently pretends to have started a VM.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UnavailableDriver;
-
-#[async_trait]
-impl QemuDriver for UnavailableDriver {
-    async fn launch(
-        &self,
-        _request: LaunchRequest,
-    ) -> Result<Box<dyn InstanceHandle>, DriverError> {
-        Err(DriverError(
-            "The real QEMU driver is not wired in this build. Launching a qemu-system-* \
-             process and negotiating its QMP Session arrives in a later slice (#21); until \
-             then create_instance cannot start a real Instance. The Orchestrator, its \
-             lifecycle, and the tool surface are already in place."
-                .to_string(),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
