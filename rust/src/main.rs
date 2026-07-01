@@ -15,7 +15,7 @@ use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::instance::hardware_spec::probe_kvm;
 use qmp_mcp::instance::orchestrator::{InstanceState, Orchestrator, OrchestratorOptions};
 use qmp_mcp::logging;
-use qmp_mcp::qemu::driver::UnavailableDriver;
+use qmp_mcp::qemu::real_driver::RealQemuDriver;
 use qmp_mcp::server::QmpMcpServer;
 use rmcp::{transport::stdio, ServiceExt};
 use tokio::sync::Mutex;
@@ -65,12 +65,11 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("starting qmp-mcp (transport=stdio)");
 
     // The single-instance Orchestrator, shared behind an async mutex so concurrent
-    // tool calls serialise on the one Instance (ADR-0011). The real QEMU driver
-    // arrives in slice #21; until then the fail-closed placeholder is wired in, so a
-    // create_instance attempt reports an actionable "not yet implemented" instead of
-    // pretending to have started a VM.
+    // tool calls serialise on the one Instance (ADR-0011). It is wired to the real
+    // QEMU driver, which spawns `qemu-system-*` on the server-managed QMP UNIX socket
+    // and negotiates the live QMP Session (slice #21).
     let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
-        Box::new(UnavailableDriver),
+        Box::new(RealQemuDriver),
         orchestrator_options(&config),
     )));
 
