@@ -90,6 +90,49 @@ docker run --rm -p 8080:8080 \
 accessible, otherwise falls back to TCG, reporting which it chose. `accel: 'kvm'`
 hard-fails with an actionable message when `/dev/kvm` is unavailable.
 
+## Browser Viewer (noVNC)
+
+The **Display** is the Guest's graphical output; the **Viewer** is an optional
+in-process [noVNC](https://novnc.com) bridge that lets you watch and control it in a
+browser (ADR-0010). It is off by default and interactive (keyboard + mouse), not
+view-only.
+
+To use it, set a Viewer password and request a `vnc` Display when you create the
+Instance:
+
+- Set `QMP_MCP_VIEWER_PASSWORD` to a strong password. Without it, requesting a `vnc`
+  Display **rejects** `create_instance` with an actionable error — the Viewer is
+  fail-closed and refuses to serve without its own password.
+- Call `create_instance` with `display: "vnc"` in the Hardware Spec. The server
+  attaches a **loopback-only** VNC server to the Guest, arms it with an internal
+  password over QMP (never in the process list), and starts the Viewer for the
+  lifetime of that Instance. `destroy_instance` stops it.
+- Open `http://<host>:6080/` in a browser (the Viewer runs on its own HTTP server,
+  independent of the MCP transport — it works even under `stdio`). Authenticate with
+  `QMP_MCP_VIEWER_PASSWORD` (HTTP Basic; any username). The VNC handshake is then
+  automatic — `QMP_MCP_VIEWER_PASSWORD` is the only secret you type.
+
+With Docker, publish the Viewer port alongside the MCP port and pass the password:
+
+```bash
+docker run --rm -p 8080:8080 -p 6080:6080 \
+  -e QMP_MCP_API_KEYS=replace-with-a-strong-key \
+  -e QMP_MCP_VIEWER_PASSWORD=replace-with-a-strong-viewer-password \
+  qmp-mcp
+```
+
+The raw VNC port (5900) is **loopback-only and never published** — the Viewer is its
+sole client, and its bytes are proxied only to that server-controlled loopback port,
+never to any client-supplied target.
+
+**Cleartext exposure.** The Viewer serves plain HTTP: the Basic password and the
+interactive VNC session travel **unencrypted**. On loopback (`QMP_MCP_VIEWER_HOST` left
+at `127.0.0.1`) that is fine. When it binds a non-loopback address (the container image
+sets `0.0.0.0` so a published port is reachable) it logs a startup **WARNING** and you
+should put it **behind a TLS-terminating reverse proxy** on any untrusted network. The
+Viewer also refuses to be framed (`X-Frame-Options: DENY` + a `frame-ancestors 'none'`
+CSP), rejects cross-origin websocket upgrades, and caps concurrent connections.
+
 ## Tools
 
 | Tool | What it does |
@@ -142,6 +185,9 @@ the most-used variables:
 | `QMP_MCP_POLICY_FILE` | _(unset)_ | YAML policy file layered onto the allowlist. |
 | `QMP_MCP_EVENT_BUFFER_SIZE` | `256` | Capacity of the Event Buffer of recent QMP async events. |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | Allow a spec's `extraArgs` (raw QEMU args) — gated escape hatch (ADR-0002). |
+| `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | Password gating the noVNC Viewer; required to request `display: vnc` (ADR-0010). |
+| `QMP_MCP_VIEWER_HOST` | `127.0.0.1` | Viewer HTTP bind address. (The image overrides to `0.0.0.0`.) |
+| `QMP_MCP_VIEWER_PORT` | `6080` | Viewer HTTP listen port. |
 
 ## Security
 
@@ -165,6 +211,12 @@ the most-used variables:
 - **Non-root, KVM optional, never `--privileged` (ADR-0008).** The server runs as a
   non-root user; the only device it may be granted is `/dev/kvm`, and only as an opt-in
   performance upgrade — TCG works with zero privileges.
+- **Fail-closed Viewer (ADR-0010).** The optional noVNC Viewer exists only while a
+  `display: vnc` Instance runs and refuses both the page and the websocket unless the
+  request authenticates with `QMP_MCP_VIEWER_PASSWORD`. The Guest's VNC server binds
+  loopback only (never published) behind a second, server-set VNC password; the
+  websocket proxy always dials that server-controlled loopback port, never a
+  client-supplied target, and static serving is confined to the noVNC assets.
 
 ## Development
 
