@@ -4,3 +4,6 @@ coverage/
 .npm/
 *.log
 *.tsbuildinfo
+
+# Rust variant build output (target/ is written in-container as uid 1000; Cargo.lock IS committed)
+rust/target/
