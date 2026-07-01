@@ -1,0 +1,8 @@
+{
+  "description": "A default-safe allowlist hit for a non-exfiltrating control command already exposed as a curated tool.",
+  "command": "system_powerdown",
+  "expectedVerdict": {
+    "allowed": true,
+    "command": "system_powerdown"
+  }
+}

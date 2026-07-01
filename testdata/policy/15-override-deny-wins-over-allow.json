@@ -1,0 +1,11 @@
+{
+  "description": "Fail-closed precedence: when a command is in both the override allow and deny lists, deny wins.",
+  "command": "query-rocker",
+  "config": { "allow": ["query-rocker"], "deny": ["query-rocker"] },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "query-rocker",
+    "hardDenied": false,
+    "reasonContains": ["denied by the Command Policy"]
+  }
+}

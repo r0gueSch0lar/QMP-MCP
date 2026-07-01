@@ -18,11 +18,17 @@
 //! launch-token bookkeeping the single-threaded-async TypeScript port needs is not
 //! required here.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::config::PortRange;
 
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, resolve_accel, Accel, AccelResolution, ArgvOptions,
     HardwareSpec,
+};
+use crate::policy::{
+    build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
 };
 use crate::qemu::driver::{InstanceHandle, LaunchRequest, QemuDriver};
 
@@ -88,6 +94,20 @@ pub struct CreateInstanceResult {
     pub accel_reason: String,
 }
 
+/// A captured Instance screenshot. The image bytes are returned inline (base64)
+/// rather than as a host path: the agent never learns or controls where the file
+/// lived, and the server deletes it after reading (see [`Orchestrator::screendump`]).
+/// Mirrors the TS `ScreendumpResult`.
+#[derive(Debug, Clone)]
+pub struct ScreendumpResult {
+    /// MIME type of the captured image (always `image/png`).
+    pub mime_type: String,
+    /// Base64-encoded image bytes, ready to hand back as MCP image content.
+    pub data: String,
+    /// Size of the decoded image in bytes.
+    pub bytes: usize,
+}
+
 /// Knobs the Orchestrator needs that are not part of the Hardware Spec. The
 /// singleton injects the env-resolved values (mirrors the TS `OrchestratorOptions`,
 /// trimmed to what this slice's `build_argv` + accel resolution consume).
@@ -114,6 +134,11 @@ pub struct OrchestratorOptions {
     /// Whether the raw-args escape hatch is enabled (`QMP_MCP_ALLOW_RAW_ARGS`,
     /// ADR-0002).
     pub allow_raw_args: bool,
+    /// The resolved Command Policy governing which QMP commands the generic
+    /// [`Orchestrator::execute_command`] path may run (ADR-0003). `None` uses the
+    /// built-in default-safe allowlist (the singleton injects the env/file-resolved
+    /// policy).
+    pub command_policy: Option<ResolvedPolicy>,
     /// Probe for KVM availability (injected for testability; production passes the
     /// `/dev/kvm` probe, tests force a deterministic value).
     pub kvm_available: Box<dyn Fn() -> bool + Send + Sync>,
@@ -127,6 +152,22 @@ pub struct OrchestratorOptions {
 #[error("{0}")]
 pub struct LifecycleError(pub String);
 
+/// The failure modes of the generic [`Orchestrator::execute_command`] path: either the
+/// Command Policy refused the command (fail-closed, before it ever reached QEMU) or a
+/// lifecycle/driver failure occurred while forwarding an allowed command. Both carry an
+/// actionable message; the [`CommandPolicyError`] variant additionally preserves the
+/// `hard_denied` flag. Mirrors the TS split between `CommandPolicyError` and
+/// `LifecycleError` on the `executeCommand` path.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExecuteCommandError {
+    /// The command was refused by the Command Policy (never reached QEMU).
+    #[error(transparent)]
+    Policy(#[from] CommandPolicyError),
+    /// No Instance is running, or the QMP round-trip for an allowed command failed.
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
+}
+
 /// Holds the single managed Instance: exactly one exists at a time. Requesting a
 /// new Instance while one exists is rejected rather than auto-replaced (ADR-0004).
 /// Not `Clone` and not thread-safe on its own — it is shared as an
@@ -134,6 +175,9 @@ pub struct LifecycleError(pub String);
 pub struct Orchestrator {
     driver: Box<dyn QemuDriver>,
     options: OrchestratorOptions,
+    /// The Command Policy gating [`execute_command`](Self::execute_command); defaults
+    /// to the built-in allowlist when the options omit one.
+    command_policy: ResolvedPolicy,
     state: InstanceState,
     handle: Option<Box<dyn InstanceHandle>>,
     spec: Option<HardwareSpec>,
@@ -142,11 +186,17 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Construct an Orchestrator over an injected [`QemuDriver`]. Starts in
-    /// [`InstanceState::None`] with no Instance.
-    pub fn new(driver: Box<dyn QemuDriver>, options: OrchestratorOptions) -> Self {
+    /// [`InstanceState::None`] with no Instance. Resolves the Command Policy once: an
+    /// omitted policy means the built-in default-safe allowlist.
+    pub fn new(driver: Box<dyn QemuDriver>, mut options: OrchestratorOptions) -> Self {
+        let command_policy = options
+            .command_policy
+            .take()
+            .unwrap_or_else(|| build_policy(&PolicyOverrides::default()));
         Self {
             driver,
             options,
+            command_policy,
             state: InstanceState::None,
             handle: None,
             spec: None,
@@ -325,6 +375,127 @@ impl Orchestrator {
         Ok(self.state)
     }
 
+    /// Hard-reset the Instance via QMP `system_reset` (equivalent to the reset button).
+    /// This reboots the Guest in place; it does not change the lifecycle state. Rejects
+    /// when no Instance is running.
+    pub async fn reset_instance(&self) -> Result<InstanceState, LifecycleError> {
+        self.require_handle("reset it")?
+            .execute("system_reset", None)
+            .await
+            .map_err(|e| LifecycleError(e.0))?;
+        tracing::info!("Instance reset (QMP system_reset)");
+        Ok(self.state)
+    }
+
+    /// Request a graceful Guest shutdown via QMP `system_powerdown` (an ACPI
+    /// power-button event). This only *asks* the Guest to power off; the Instance keeps
+    /// running until the Guest acts, so the lifecycle state is unchanged. Rejects when
+    /// no Instance is running.
+    pub async fn powerdown_instance(&self) -> Result<InstanceState, LifecycleError> {
+        self.require_handle("power it down")?
+            .execute("system_powerdown", None)
+            .await
+            .map_err(|e| LifecycleError(e.0))?;
+        tracing::info!("Instance ACPI powerdown requested (QMP system_powerdown)");
+        Ok(self.state)
+    }
+
+    /// Return the live QMP `query-block` result (the Guest's block devices and their
+    /// backing media). Rejects when no Instance is running.
+    pub async fn query_block(&self) -> Result<serde_json::Value, LifecycleError> {
+        self.require_handle("list its block devices")?
+            .execute("query-block", None)
+            .await
+            .map_err(|e| LifecycleError(e.0))
+    }
+
+    /// Return the live QMP `query-cpus-fast` result (per-vCPU information). Rejects when
+    /// no Instance is running.
+    pub async fn query_cpus(&self) -> Result<serde_json::Value, LifecycleError> {
+        self.require_handle("query its CPUs")?
+            .execute("query-cpus-fast", None)
+            .await
+            .map_err(|e| LifecycleError(e.0))
+    }
+
+    /// Capture a screenshot of the Instance's display via QMP `screendump` and return
+    /// the image inline.
+    ///
+    /// SECURITY (ADR-0003, the name-vs-argument gate): QMP `screendump` writes an
+    /// arbitrary host file at the path it is given, so the `filename` is ALWAYS
+    /// server-chosen — a fresh, unique file under a server-controlled directory — and
+    /// never agent-supplied (this method takes no path input). The generic Command
+    /// Policy name-gate is NOT sufficient for `screendump` (it would gate the name but
+    /// not the dangerous path argument), which is exactly why `screendump` is absent
+    /// from the default allowlist and served only here. The bytes are read back,
+    /// returned as base64, and the temp file is deleted, so the agent never learns or
+    /// controls a host path. Rejects when no Instance is running. Mirrors the TS
+    /// `Orchestrator.screendump`.
+    pub async fn screendump(&self) -> Result<ScreendumpResult, LifecycleError> {
+        let handle = self.require_handle("capture a screendump")?;
+        let dir = std::env::temp_dir().join("qmp-mcp").join("screendumps");
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            LifecycleError(format!(
+                "Failed to create the screendump directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+        // Server-chosen, single-use path — NOT influenced by the agent.
+        let filename = screendump_path(&dir);
+        let filename_str = filename.to_string_lossy().into_owned();
+
+        // Best-effort cleanup on every exit path, so the captured frame never lingers.
+        let result = async {
+            handle
+                .execute(
+                    "screendump",
+                    Some(serde_json::json!({ "filename": filename_str, "format": "png" })),
+                )
+                .await
+                .map_err(|e| LifecycleError(e.0))?;
+            let bytes = tokio::fs::read(&filename).await.map_err(|e| {
+                LifecycleError(format!("Failed to read the captured screendump: {e}"))
+            })?;
+            Ok(ScreendumpResult {
+                mime_type: "image/png".to_string(),
+                data: base64_encode(&bytes),
+                bytes: bytes.len(),
+            })
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&filename).await;
+        result
+    }
+
+    /// Run a generic QMP command against the running Instance, gated by the Command
+    /// Policy (ADR-0003). The command name is checked FIRST: a denied command returns a
+    /// [`CommandPolicyError`] and never reaches the QMP Session — fail-closed, so a
+    /// hard-denied command is refused even with no Instance running. Only an allowed
+    /// command requires (and is forwarded to) the live Session, returning its QMP
+    /// `return` value. The forwarded name is the normalised one, so trailing whitespace
+    /// never reaches QEMU. Mirrors the TS `Orchestrator.executeCommand`.
+    pub async fn execute_command(
+        &self,
+        command: &str,
+        args: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, ExecuteCommandError> {
+        let verdict = decide_command(&self.command_policy, command);
+        let name = match &verdict {
+            crate::policy::CommandVerdict::Allowed { command } => command.clone(),
+            crate::policy::CommandVerdict::Denied { .. } => {
+                return Err(ExecuteCommandError::Policy(
+                    CommandPolicyError::from_verdict(&verdict)
+                        .expect("a denied verdict yields a CommandPolicyError"),
+                ));
+            }
+        };
+        let handle = self.require_handle(&format!("execute the QMP command \"{name}\""))?;
+        handle
+            .execute(&name, args)
+            .await
+            .map_err(|e| ExecuteCommandError::Lifecycle(LifecycleError(e.0)))
+    }
+
     /// Borrow the live [`InstanceHandle`] for an action that requires a running
     /// Instance, or return an actionable [`LifecycleError`] naming the action. The
     /// handle is only present in RUNNING/PAUSED, so this also fail-closes the
@@ -338,6 +509,53 @@ impl Orchestrator {
             ))),
         }
     }
+}
+
+/// A monotonically increasing counter making each server-chosen screendump filename
+/// unique within this process, combined with the PID and a high-resolution timestamp.
+static SCREENDUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, single-use, server-controlled screendump path under `dir`. It is derived
+/// entirely from server-side state (PID + high-resolution clock + a process-unique
+/// counter) and NEVER from agent input — the containment guarantee for the arbitrary
+/// host-file write QMP `screendump` performs.
+fn screendump_path(dir: &std::path::Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SCREENDUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        "screendump-{}-{nanos}-{seq}.png",
+        std::process::id()
+    ))
+}
+
+/// Standard (RFC 4648) base64-encode `bytes`, with `=` padding. Hand-rolled to avoid a
+/// dependency, matching the repo's hand-rolled ethos; the output feeds MCP image
+/// content verbatim.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -364,6 +582,7 @@ mod tests {
             max_memory_mb: None,
             max_vcpus: None,
             allow_raw_args: false,
+            command_policy: None,
             kvm_available: Box::new(|| false),
         }
     }
@@ -488,6 +707,160 @@ mod tests {
         assert!(msg.contains("qemu binary not found"), "got: {msg}");
         // The reserved slot is freed, so the Orchestrator is back to NONE.
         assert_eq!(orch.state(), InstanceState::None);
+    }
+
+    #[tokio::test]
+    async fn reset_and_powerdown_leave_the_lifecycle_state_unchanged() {
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        // No Instance → both are refused with an actionable message.
+        assert!(orch
+            .reset_instance()
+            .await
+            .unwrap_err()
+            .0
+            .contains("reset it"));
+        assert!(orch
+            .powerdown_instance()
+            .await
+            .unwrap_err()
+            .0
+            .contains("power it down"));
+
+        orch.create_instance(json!({})).await.unwrap();
+        assert_eq!(orch.reset_instance().await.unwrap(), InstanceState::Running);
+        assert_eq!(orch.state(), InstanceState::Running);
+        assert_eq!(
+            orch.powerdown_instance().await.unwrap(),
+            InstanceState::Running
+        );
+        assert_eq!(orch.state(), InstanceState::Running);
+    }
+
+    #[tokio::test]
+    async fn query_block_and_query_cpus_forward_their_qmp_commands() {
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        assert!(orch.query_block().await.is_err());
+        assert!(orch.query_cpus().await.is_err());
+
+        orch.create_instance(json!({})).await.unwrap();
+        let block = orch.query_block().await.unwrap();
+        assert_eq!(block[0]["device"], "virtio0");
+        let cpus = orch.query_cpus().await.unwrap();
+        assert_eq!(cpus[0]["cpu-index"], 0);
+    }
+
+    #[tokio::test]
+    async fn screendump_writes_a_server_chosen_path_reads_it_back_and_deletes_it() {
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        // No Instance → refused (never touches the filesystem).
+        assert!(orch
+            .screendump()
+            .await
+            .unwrap_err()
+            .0
+            .contains("capture a screendump"));
+
+        orch.create_instance(json!({})).await.unwrap();
+        let shot = orch.screendump().await.unwrap();
+        assert_eq!(shot.mime_type, "image/png");
+        assert!(shot.bytes > 0);
+        // The fake wrote a PNG signature; base64 of it starts with the same prefix as
+        // the real bytes would, proving the captured file was read back inline.
+        assert_eq!(shot.data, base64_encode(b"\x89PNG\r\n\x1a\nFAKE"));
+
+        // The temp file is deleted after reading — the host is left clean.
+        let dir = std::env::temp_dir().join("qmp-mcp").join("screendumps");
+        if let Ok(mut entries) = std::fs::read_dir(&dir) {
+            assert!(
+                entries.all(|e| {
+                    e.map(|e| !e.file_name().to_string_lossy().ends_with(".png"))
+                        .unwrap_or(true)
+                }),
+                "screendump left a .png behind in {}",
+                dir.display()
+            );
+        }
+    }
+
+    /// The screendump path is derived only from server-side state (PID + clock +
+    /// counter), never from agent input, and is unique per call — the containment
+    /// guarantee for the arbitrary host-file write `screendump` performs.
+    #[test]
+    fn screendump_path_is_server_chosen_contained_and_unique() {
+        let dir = std::env::temp_dir().join("qmp-mcp").join("screendumps");
+        let a = screendump_path(&dir);
+        let b = screendump_path(&dir);
+        assert_ne!(a, b, "each screendump path must be unique");
+        for p in [&a, &b] {
+            assert!(p.starts_with(&dir), "path must be contained under {dir:?}");
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("screendump-") && name.ends_with(".png"));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_an_allowlisted_command_and_forwards_the_normalised_name() {
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        orch.create_instance(json!({})).await.unwrap();
+        // Stray case/space normalises to `query-status` and reaches the fake handle.
+        let result = orch
+            .execute_command("  Query-Status  ", None)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn execute_command_denies_a_default_denied_command_with_an_actionable_reason() {
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        orch.create_instance(json!({})).await.unwrap();
+        match orch.execute_command("totally-made-up-command", None).await {
+            Err(ExecuteCommandError::Policy(err)) => {
+                assert!(!err.hard_denied);
+                assert!(err.message.contains("not in the Command Policy allowlist"));
+            }
+            other => panic!("expected a policy denial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_hard_denies_even_with_no_instance_running_fail_closed() {
+        // No Instance: a hard-denied command is still refused by the policy FIRST,
+        // before the running-Instance check, so it never reaches (a non-existent) QEMU.
+        let orch = orchestrator_with(FakeQemuDriver::new());
+        match orch.execute_command("human-monitor-command", None).await {
+            Err(ExecuteCommandError::Policy(err)) => {
+                assert!(err.hard_denied);
+                assert!(err.message.contains("hard denylist"));
+            }
+            other => panic!("expected a hard policy denial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_honours_an_injected_policy_override() {
+        // A policy that additionally allows `query-version` lets it through, while a
+        // default Orchestrator would default-deny it.
+        let mut options = test_options();
+        options.command_policy = Some(build_policy(&PolicyOverrides {
+            allow: vec!["query-version".to_string()],
+            deny: vec![],
+        }));
+        let mut orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), options);
+        orch.create_instance(json!({})).await.unwrap();
+        let version = orch.execute_command("query-version", None).await.unwrap();
+        assert_eq!(version["qemu"]["major"], 9);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     /// ADR-0011: concurrent `create_instance` calls serialise on the mutex and
