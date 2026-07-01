@@ -1,0 +1,11 @@
+{
+  "description": "Hard denylist, name-gated: dump-guest-memory copies guest memory to a host file. Denied for its NAME regardless of the (dangerous) protocol argument.",
+  "command": "dump-guest-memory",
+  "arguments": { "paging": false, "protocol": "file:/tmp/guest.dump" },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "dump-guest-memory",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "\"dump-guest-memory\""]
+  }
+}

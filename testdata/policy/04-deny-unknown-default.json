@@ -1,0 +1,10 @@
+{
+  "description": "Default-deny: an unknown command is refused (not as a hard denial) because the generic tool only runs allowlisted commands.",
+  "command": "totally-made-up-command",
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "totally-made-up-command",
+    "hardDenied": false,
+    "reasonContains": ["not in the Command Policy allowlist"]
+  }
+}

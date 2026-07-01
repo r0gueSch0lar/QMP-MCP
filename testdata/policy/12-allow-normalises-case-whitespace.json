@@ -1,0 +1,8 @@
+{
+  "description": "An allowlisted command with stray case and whitespace normalises to its canonical form and is allowed; the canonical name is what gets forwarded to QEMU.",
+  "command": "  Query-Status  ",
+  "expectedVerdict": {
+    "allowed": true,
+    "command": "query-status"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "description": "The hard denylist is checked first, before any override: a hard-denied command listed under BOTH allow and deny overrides is still reported as a hard denial, not an ordinary override deny.",
+  "command": "qom-set",
+  "config": { "allow": ["qom-set"], "deny": ["qom-set"] },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "qom-set",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "\"qom-set\""]
+  }
+}
