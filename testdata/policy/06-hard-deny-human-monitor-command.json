@@ -1,0 +1,11 @@
+{
+  "description": "Hard denylist: human-monitor-command runs arbitrary HMP and bypasses every other QMP control. Permanently denied.",
+  "command": "human-monitor-command",
+  "arguments": { "command-line": "info registers" },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "human-monitor-command",
+    "hardDenied": true,
+    "reasonContains": ["permanently denied", "hard denylist", "\"human-monitor-command\""]
+  }
+}

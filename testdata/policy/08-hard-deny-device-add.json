@@ -1,0 +1,10 @@
+{
+  "description": "Hard denylist: device_add can wire up host-backed devices. Permanently denied.",
+  "command": "device_add",
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "device_add",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "\"device_add\""]
+  }
+}

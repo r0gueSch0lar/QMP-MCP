@@ -1,0 +1,11 @@
+{
+  "description": "The immutable hard denylist wins over an allow override: even when an operator lists blockdev-add under allow (env or policy file), it stays hard-denied.",
+  "command": "blockdev-add",
+  "config": { "allow": ["blockdev-add"] },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "blockdev-add",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "can NEVER be enabled"]
+  }
+}
