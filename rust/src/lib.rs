@@ -9,5 +9,6 @@
 pub mod config;
 pub mod instance;
 pub mod logging;
+pub mod policy;
 pub mod qemu;
 pub mod server;

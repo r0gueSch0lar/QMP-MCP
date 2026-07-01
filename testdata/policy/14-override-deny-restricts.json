@@ -1,0 +1,11 @@
+{
+  "description": "An operator override (QMP_MCP_DENY or the policy file deny list) tightens the policy by removing a default-allowlisted command; it stays reachable through its dedicated curated tool.",
+  "command": "system_reset",
+  "config": { "deny": ["system_reset"] },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "system_reset",
+    "hardDenied": false,
+    "reasonContains": ["denied by the Command Policy", "QMP_MCP_DENY"]
+  }
+}
