@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "QEMU MCP server (Rust variant) — build, launch, drive, and tear down a single QEMU Instance over MCP. Second implementation of the shared qmp-mcp bounded context (see ../CONTEXT.md, ADR-0011)."
+repository = "http://gitlab/foo/qmp-mcp"
+readme = "README.md"
+keywords = ["mcp", "qemu", "qmp", "virtualization", "ai-agent"]
+categories = ["command-line-utilities", "virtualization", "emulators"]
+# Not published to a registry: the distributable artifact is the Docker image
+# (rust/Dockerfile) and a `cargo install --git … --bin qmp-mcp` / `--path .` build.
+# `cargo install` ignores this flag, so the binary stays installable from source.
 publish = false
 
 [[bin]]

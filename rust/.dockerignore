@@ -1,0 +1,18 @@
+# Keep the crate build context small and reproducible. Dependencies and build
+# output are (re)generated inside the image by cargo-chef + `cargo build`, never
+# copied from the host.
+
+# Build output — huge, host-owned (written as uid 1000 by the dev container), and
+# always rebuilt in-image. NEVER send it in the build context.
+target
+
+# Version control metadata.
+.git
+.gitignore
+
+# The Dockerfile itself and this file are not build inputs.
+Dockerfile
+.dockerignore
+
+# NOTE: README.md is intentionally NOT ignored — Cargo.toml's `readme` field
+# references it, so it stays in the context for a clean manifest.

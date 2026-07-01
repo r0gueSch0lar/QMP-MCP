@@ -144,6 +144,105 @@ docker-build:
         echo "Registry credentials not set — built the image but skipping push (push is optional)."
       fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Rust variant lane (rust/, ADR-0011). Mirrors the TS gate — fmt → clippy → test →
+# image build — but SCOPED so it runs only when the Rust crate (or this CI file)
+# changes: a TS-only MR never triggers it, and vice-versa. On the default branch and
+# on tags it always runs, so main and releases are validated regardless of the
+# change surface (same philosophy as `docker-build`). The `auto-merge` workflow and
+# the TS lane above are untouched.
+
+# Shared change-scope rules for every Rust job. On an MR, run only when files under
+# rust/ (or this CI file) changed; always run on the default branch and on tags.
+.rust-changes:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - rust/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+# Shared base for the cargo (fmt/clippy/test) jobs: the toolchain image matching the
+# dev container + CI (rust 1.96 line), a cargo cache keyed on the crate lockfile, and
+# a `cd rust` so cargo runs in the crate. clippy/rustfmt are added idempotently in
+# case the base image ships a minimal profile.
+.cargo:
+  extends: .rust-changes
+  image: rust:1-bookworm
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key:
+      files:
+        - rust/Cargo.lock
+    paths:
+      - .cargo/registry
+      - .cargo/git
+      - rust/target/
+  before_script:
+    - rustup component add rustfmt clippy
+    - cd rust
+
+rust-fmt:
+  stage: lint
+  extends: .cargo
+  script:
+    - cargo fmt --all -- --check
+
+rust-clippy:
+  stage: lint
+  extends: .cargo
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+# The qemu/qemu-img integration tests runtime-skip when those binaries are absent,
+# so the whole suite passes on this qemu-less toolchain image.
+rust-test:
+  stage: test
+  extends: .cargo
+  script:
+    - cargo test
+
+# Build the Rust production image (rust/Dockerfile) on the docker-in-docker runner to
+# validate it (ADR-0007/0011), reusing the same non-TLS dind pattern as `docker-build`.
+# Tagged DISTINCTLY from the TS image (`qmp-mcp-rs`) so the two never collide. Build
+# only by default; the push step is OPTIONAL and runs only when registry credentials
+# are present, so the job never fails for lack of them.
+rust-image:
+  stage: package
+  extends: .rust-changes
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    # Plain (non-TLS) dind: on this runner the TLS cert dir (/certs/client) is
+    # unreliably shared with the job container, so talk to dockerd over the
+    # unencrypted 2375 socket instead (traffic stays inside the runner's job network).
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    # Wait for the dind daemon to accept connections before building.
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        echo "waiting for dockerd (dind) to be ready ($i/30)..."
+        sleep 2
+      done
+      docker info
+  script:
+    # Build context is the crate dir (rust/), which is self-contained (embedded assets).
+    - docker build -f rust/Dockerfile -t "qmp-mcp-rs:${CI_COMMIT_SHORT_SHA}" rust/
+    - |
+      if [ -n "$CI_REGISTRY" ] && [ -n "$CI_REGISTRY_IMAGE" ] && [ -n "$CI_REGISTRY_USER" ] && [ -n "$CI_REGISTRY_PASSWORD" ]; then
+        echo "Registry credentials present — pushing the image."
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        docker tag "qmp-mcp-rs:${CI_COMMIT_SHORT_SHA}" "${CI_REGISTRY_IMAGE}:rust-${CI_COMMIT_SHORT_SHA}"
+        docker push "${CI_REGISTRY_IMAGE}:rust-${CI_COMMIT_SHORT_SHA}"
+      else
+        echo "Registry credentials not set — built the image but skipping push (push is optional)."
+      fi
+
 # Publish to npm, but ONLY on a version tag and ONLY when an NPM_TOKEN variable is
 # set. `npm publish` runs prepublishOnly (npm run build) to produce dist/ first.
 npm-publish:
