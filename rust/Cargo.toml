@@ -50,5 +50,25 @@ libc = "0.2"
 # `StreamableHttpService` is a `tower_service::Service` over the `http` 1.x stack;
 # axum 0.8 (the same major rmcp's own examples use) nests it under the configured
 # endpoint and lets the fail-closed auth + DNS-rebinding guards sit in front as
-# `middleware::from_fn` layers. stdio needs none of this and does not pull it in.
-axum = "0.8"
+# `middleware::from_fn` layers. The `ws` feature adds the browser-facing WebSocket
+# upgrade the noVNC Viewer relays over (slice #26, ADR-0010). stdio needs none of
+# this and does not pull it in.
+axum = { version = "0.8", features = ["ws"] }
+# The noVNC Viewer (slice #26, ADR-0010/0011): the vendored `@novnc/novnc` assets
+# under `assets/novnc/` are EMBEDDED in the binary via `include_dir!` — traversal-safe
+# by construction (a request can only resolve to an embedded file) and shipped in the
+# binary for bare-metal parity, so there is no runtime asset directory to confine.
+include_dir = "0.7"
+# The Viewer's `ws <-> VNC-TCP` relay splits the axum `WebSocket` (a `Stream + Sink`)
+# into its read/write halves so both directions relay concurrently with backpressure;
+# `futures-util` provides `StreamExt::split`/`SinkExt`. Already in the tree as a
+# transitive rmcp/axum dependency.
+futures-util = "0.3"
+# The axum WebSocket `Message::Binary` payload type; the relay wraps VNC bytes in it.
+# Already in the tree as a transitive axum dependency.
+bytes = "1"
+# Cryptographically-secure randomness for the server-generated VNC Display password
+# (ADR-0010): unbiased rejection sampling over the copy-safe alphabet, mirroring the
+# TS orchestrator's `crypto.randomInt`. Already in the tree transitively; used
+# directly here for the one password draw. No modulo bias.
+getrandom = "0.4"

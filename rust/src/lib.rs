@@ -13,3 +13,4 @@ pub mod logging;
 pub mod policy;
 pub mod qemu;
 pub mod server;
+pub mod viewer;
