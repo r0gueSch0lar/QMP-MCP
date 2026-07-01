@@ -1,0 +1,17 @@
+{
+  "description": "machine, cpu, vcpus and memoryMb map straight through to -machine/-cpu/-smp/-m.",
+  "spec": { "machine": "pc", "cpu": "host", "vcpus": 4, "memoryMb": 2048 },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "pc,accel=tcg",
+    "-cpu", "host",
+    "-smp", "4",
+    "-m", "2048",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

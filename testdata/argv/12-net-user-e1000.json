@@ -1,0 +1,17 @@
+{
+  "description": "An allowlisted non-default NIC model (e1000) is emitted verbatim into -device.",
+  "spec": { "network": { "model": "e1000" } },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "user,id=net0",
+    "-device", "e1000,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
