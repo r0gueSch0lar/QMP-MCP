@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler,
 };
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::instance::hardware_spec::{AccelMode, DisplayMode, HardwareSpec, HardwareSpecParams};
@@ -87,6 +87,58 @@ pub struct CreateInstanceReport {
 pub struct StatusReport {
     /// The raw QMP `query-status` result for the running Instance.
     pub run_state: serde_json::Value,
+}
+
+/// A bare lifecycle-state report, returned by the curated power/pause tools
+/// (`pause_instance`, `resume_instance`, `reset_instance`, `powerdown_instance`).
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StateReport {
+    /// The lifecycle state after the command: `NONE`, `STARTING`, `RUNNING`,
+    /// `PAUSED`, or `STOPPED`.
+    pub state: String,
+}
+
+/// The result reported by `list_block_devices`: the raw QMP `query-block` result
+/// (an array of the Guest's block devices and their backing media), wrapped to give
+/// the tool the object-typed output schema the MCP spec requires.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockDevicesReport {
+    /// The raw QMP `query-block` result for the running Instance.
+    pub block_devices: serde_json::Value,
+}
+
+/// The result reported by `query_cpus`: the raw QMP `query-cpus-fast` result
+/// (per-vCPU information), wrapped for the object-typed output schema.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CpusReport {
+    /// The raw QMP `query-cpus-fast` result for the running Instance.
+    pub cpus: serde_json::Value,
+}
+
+/// The result reported by `qmp_execute`: the raw QMP `return` value of the executed
+/// (allowlisted) command, wrapped for the object-typed output schema.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QmpExecuteReport {
+    /// The raw QMP `return` value the allowlisted command produced.
+    pub result: serde_json::Value,
+}
+
+/// Validated input for `qmp_execute`: a QMP command name and its optional
+/// `arguments` object. Mirrors the TS `qmp_execute` zod schema.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct QmpExecuteParams {
+    /// The QMP command name to run (e.g. `query-pci`, `query-fdsets`). Subject to the
+    /// Command Policy: a default-safe allowlist with an immutable hard denylist.
+    /// Dangerous commands (human-monitor-command, migrate, dump-guest-memory,
+    /// device_add, …) are permanently denied.
+    pub command: String,
+    /// The QMP command's `arguments` object, if it takes any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
 }
 
 /// The result reported by `get_instance` and `destroy_instance`: the lifecycle
@@ -205,6 +257,155 @@ impl QmpMcpServer {
         .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(Json(StatusReport { run_state }))
     }
+
+    /// Pause the running Instance's Guest CPUs (QMP `stop`), moving the lifecycle to
+    /// PAUSED. Reversible with `resume_instance`. Rejected when no Instance is running.
+    #[tool(
+        description = "Pause the running QEMU Instance's Guest CPUs (QMP stop), moving its lifecycle \
+                       state to PAUSED. Reversible with resume_instance. Fails if no Instance is running."
+    )]
+    async fn pause_instance(&self) -> Result<Json<StateReport>, McpError> {
+        let state = {
+            let mut orchestrator = self.orchestrator.lock().await;
+            orchestrator.pause_instance().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(StateReport {
+            state: state.as_str().to_string(),
+        }))
+    }
+
+    /// Resume the paused Instance's Guest CPUs (QMP `cont`), moving the lifecycle back
+    /// to RUNNING. Rejected when no Instance is running.
+    #[tool(
+        description = "Resume the paused QEMU Instance's Guest CPUs (QMP cont), moving its lifecycle \
+                       state back to RUNNING. Fails if no Instance is running."
+    )]
+    async fn resume_instance(&self) -> Result<Json<StateReport>, McpError> {
+        let state = {
+            let mut orchestrator = self.orchestrator.lock().await;
+            orchestrator.resume_instance().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(StateReport {
+            state: state.as_str().to_string(),
+        }))
+    }
+
+    /// Hard-reset the running Instance (QMP `system_reset`), rebooting the Guest in
+    /// place. Unsaved Guest state is lost; the lifecycle state is unchanged. Rejected
+    /// when no Instance is running.
+    #[tool(
+        description = "Hard-reset the running QEMU Instance (QMP system_reset), rebooting the Guest in \
+                       place. Unsaved Guest state is lost. Fails if no Instance is running."
+    )]
+    async fn reset_instance(&self) -> Result<Json<StateReport>, McpError> {
+        let state = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.reset_instance().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(StateReport {
+            state: state.as_str().to_string(),
+        }))
+    }
+
+    /// Request a graceful Guest shutdown (QMP `system_powerdown`, an ACPI power-button
+    /// event). The Guest decides when to power off, so the lifecycle state is
+    /// unchanged. Rejected when no Instance is running.
+    #[tool(
+        description = "Request a graceful Guest shutdown of the running QEMU Instance via an ACPI \
+                       power-button event (QMP system_powerdown). The Guest decides when to power \
+                       off. Fails if no Instance is running."
+    )]
+    async fn powerdown_instance(&self) -> Result<Json<StateReport>, McpError> {
+        let state = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.powerdown_instance().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(StateReport {
+            state: state.as_str().to_string(),
+        }))
+    }
+
+    /// Read-only. Return the running Instance's block (storage) devices and their
+    /// backing media (QMP `query-block`). Rejected when no Instance is running.
+    #[tool(
+        description = "Return the running QEMU Instance's block (storage) devices and their backing \
+                       media (QMP query-block). Read-only. Fails if no Instance is running."
+    )]
+    async fn list_block_devices(&self) -> Result<Json<BlockDevicesReport>, McpError> {
+        let block_devices = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.query_block().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(BlockDevicesReport { block_devices }))
+    }
+
+    /// Read-only. Return per-vCPU information for the running Instance's Guest (QMP
+    /// `query-cpus-fast`). Rejected when no Instance is running.
+    #[tool(
+        description = "Return per-vCPU information for the running QEMU Instance's Guest (QMP \
+                       query-cpus-fast). Read-only. Fails if no Instance is running."
+    )]
+    async fn query_cpus(&self) -> Result<Json<CpusReport>, McpError> {
+        let cpus = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.query_cpus().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(CpusReport { cpus }))
+    }
+
+    /// Capture a screenshot of the running Instance's display and return it as a PNG
+    /// image. The destination file is ALWAYS server-chosen (a single-use temp file),
+    /// read back, and deleted — QMP `screendump` writes an arbitrary host file, so the
+    /// path is never agent-supplied (ADR-0003). Rejected when no Instance is running.
+    #[tool(
+        description = "Capture a screenshot of the running QEMU Instance's display and return it as a \
+                       PNG image (QMP screendump to a server-chosen path). Fails if no Instance is \
+                       running."
+    )]
+    async fn screendump(&self) -> Result<CallToolResult, McpError> {
+        let shot = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator.screendump().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::image(
+            shot.data,
+            shot.mime_type,
+        )]))
+    }
+
+    /// Run an arbitrary QMP command against the running Instance, gated by the Command
+    /// Policy (ADR-0003). The command name is checked BEFORE it can reach the QMP
+    /// Session: a denied command returns an actionable error and never touches QEMU;
+    /// hard-denied commands can never be enabled. Rejected when no Instance is running
+    /// or the command is not permitted.
+    #[tool(
+        description = "Run an arbitrary QMP command against the running QEMU Instance, subject to the \
+                       Command Policy (a default-safe allowlist plus an immutable hard denylist). \
+                       Provide the QMP command name and optional arguments object. Dangerous commands \
+                       (e.g. human-monitor-command, migrate, dump-guest-memory, device_add) are \
+                       permanently denied and cannot be enabled. Fails if no Instance is running or \
+                       the command is not permitted."
+    )]
+    async fn qmp_execute(
+        &self,
+        Parameters(params): Parameters<QmpExecuteParams>,
+    ) -> Result<Json<QmpExecuteReport>, McpError> {
+        let result = {
+            let orchestrator = self.orchestrator.lock().await;
+            orchestrator
+                .execute_command(&params.command, params.arguments)
+                .await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(QmpExecuteReport { result }))
+    }
 }
 
 #[tool_handler]
@@ -249,6 +450,7 @@ mod tests {
             max_memory_mb: None,
             max_vcpus: None,
             allow_raw_args: false,
+            command_policy: None,
             kvm_available: Box::new(|| false),
         };
         let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
@@ -259,13 +461,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advertises_the_four_lifecycle_tools() {
+    async fn advertises_the_lifecycle_and_qmp_tools() {
         let server = test_server();
         for name in [
+            // Lifecycle (earlier slices).
             "create_instance",
             "destroy_instance",
             "get_instance",
             "get_status",
+            // Command Policy + curated QMP tools (this slice).
+            "pause_instance",
+            "resume_instance",
+            "reset_instance",
+            "powerdown_instance",
+            "list_block_devices",
+            "query_cpus",
+            "screendump",
+            "qmp_execute",
         ] {
             assert!(
                 server.tool_router.has_route(name),
@@ -325,5 +537,96 @@ mod tests {
         let destroyed = server.destroy_instance().await.unwrap().0;
         assert_eq!(destroyed.state, "NONE");
         assert_eq!(server.get_instance().await.unwrap().0.state, "NONE");
+    }
+
+    /// The curated QMP tools round-trip through the server surface with the fake
+    /// driver: pause/resume flip the state, reset/powerdown leave it, and the
+    /// read-only queries and screendump return their payloads.
+    #[tokio::test]
+    async fn curated_qmp_tools_round_trip_through_the_tool_surface() {
+        let server = test_server();
+        // Before an Instance exists every curated tool is refused.
+        assert!(server.pause_instance().await.is_err());
+        assert!(server.list_block_devices().await.is_err());
+        assert!(server.screendump().await.is_err());
+
+        server
+            .create_instance(Parameters(
+                serde_json::from_value(serde_json::json!({})).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(server.pause_instance().await.unwrap().0.state, "PAUSED");
+        assert_eq!(server.resume_instance().await.unwrap().0.state, "RUNNING");
+        assert_eq!(server.reset_instance().await.unwrap().0.state, "RUNNING");
+        assert_eq!(
+            server.powerdown_instance().await.unwrap().0.state,
+            "RUNNING"
+        );
+
+        let block = server.list_block_devices().await.unwrap().0;
+        assert_eq!(block.block_devices[0]["device"], "virtio0");
+        let cpus = server.query_cpus().await.unwrap().0;
+        assert_eq!(cpus.cpus[0]["cpu-index"], 0);
+
+        // screendump returns MCP image content, not a host path.
+        let shot = server.screendump().await.unwrap();
+        assert_eq!(shot.is_error, Some(false));
+        assert_eq!(shot.content.len(), 1);
+    }
+
+    /// `qmp_execute` forwards an allowlisted command and refuses a hard-denied one with
+    /// an actionable reason — the generic escape hatch, gated by the Command Policy.
+    #[tokio::test]
+    async fn qmp_execute_allows_allowlisted_and_denies_hard_denied_through_the_surface() {
+        let server = test_server();
+        server
+            .create_instance(Parameters(
+                serde_json::from_value(serde_json::json!({})).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        // An allowlisted read-only command executes and returns its QMP result.
+        let ok = server
+            .qmp_execute(Parameters(QmpExecuteParams {
+                command: "query-status".to_string(),
+                arguments: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(ok.result["status"], "running");
+
+        // A hard-denied command is refused with a reason naming the denylist. (A
+        // `let else` avoids requiring `Debug` on the `Json` success type.)
+        let Err(err) = server
+            .qmp_execute(Parameters(QmpExecuteParams {
+                command: "migrate".to_string(),
+                arguments: None,
+            }))
+            .await
+        else {
+            panic!("migrate must be refused");
+        };
+        assert!(err.to_string().contains("hard denylist"), "got: {err}");
+
+        // A default-denied command is refused as not-allowlisted (not a hard denial).
+        // The dangerous filename argument is ignored — the policy gates the NAME.
+        let Err(err) = server
+            .qmp_execute(Parameters(QmpExecuteParams {
+                command: "screendump".to_string(),
+                arguments: Some(serde_json::json!({ "filename": "/etc/shadow" })),
+            }))
+            .await
+        else {
+            panic!("screendump must be refused generically");
+        };
+        assert!(
+            err.to_string()
+                .contains("not in the Command Policy allowlist"),
+            "got: {err}"
+        );
     }
 }

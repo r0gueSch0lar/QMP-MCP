@@ -168,7 +168,7 @@ impl InstanceHandle for FakeInstanceHandle {
     async fn execute(
         &self,
         command: &str,
-        _args: Option<serde_json::Value>,
+        args: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, DriverError> {
         // No `.await` is held across this guard, so it never blocks the runtime.
         let mut state = self.state.lock().expect("fake handle mutex");
@@ -187,12 +187,36 @@ impl InstanceHandle for FakeInstanceHandle {
                 state.running = true;
                 Ok(serde_json::json!({}))
             }
+            // In-place control commands that leave the run-state unchanged; QEMU
+            // answers with the empty success object.
+            "system_reset" | "system_powerdown" => Ok(serde_json::json!({})),
             // Answered dynamically from the run-state, so `get_status` reflects a
             // pause without the test wiring it up.
             "query-status" => Ok(serde_json::json!({
                 "status": if state.running { "running" } else { "paused" },
                 "running": state.running,
             })),
+            // A minimal, well-shaped stand-in for the read-only queries the curated
+            // list_block_devices / query_cpus tools and `qmp_execute` forward.
+            "query-block" => Ok(serde_json::json!([{ "device": "virtio0", "removable": false }])),
+            "query-cpus-fast" => Ok(serde_json::json!([{ "cpu-index": 0, "target": "x86_64" }])),
+            "query-version" => Ok(serde_json::json!({ "qemu": { "major": 9, "minor": 0 } })),
+            // `screendump` writes an arbitrary host file at the server-chosen path in
+            // its `filename` argument; the fake writes a tiny PNG-ish blob there so the
+            // Orchestrator can read it back, base64-encode it, and delete it.
+            "screendump" => {
+                let filename = args
+                    .as_ref()
+                    .and_then(|a| a.get("filename"))
+                    .and_then(|f| f.as_str())
+                    .ok_or_else(|| {
+                        DriverError("screendump requires a filename argument.".to_string())
+                    })?;
+                std::fs::write(filename, b"\x89PNG\r\n\x1a\nFAKE").map_err(|e| {
+                    DriverError(format!("fake screendump failed to write {filename}: {e}"))
+                })?;
+                Ok(serde_json::json!({}))
+            }
             other => Err(DriverError(format!(
                 "FakeInstanceHandle has no canned response for QMP command \"{other}\"."
             ))),

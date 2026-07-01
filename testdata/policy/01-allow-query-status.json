@@ -1,0 +1,8 @@
+{
+  "description": "A default-safe allowlist hit: the read-only run-state query is allowed with no overrides.",
+  "command": "query-status",
+  "expectedVerdict": {
+    "allowed": true,
+    "command": "query-status"
+  }
+}
