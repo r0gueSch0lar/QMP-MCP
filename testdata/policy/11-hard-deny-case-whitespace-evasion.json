@@ -1,0 +1,10 @@
+{
+  "description": "Denylist evasion is blocked: a stray case flip and surrounding whitespace normalise onto the canonical hard-denied command, which the verdict echoes back.",
+  "command": "  MIGRATE  ",
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "migrate",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "\"migrate\""]
+  }
+}

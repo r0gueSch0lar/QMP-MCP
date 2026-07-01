@@ -15,6 +15,7 @@ use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::instance::hardware_spec::probe_kvm;
 use qmp_mcp::instance::orchestrator::{InstanceState, Orchestrator, OrchestratorOptions};
 use qmp_mcp::logging;
+use qmp_mcp::policy::{self, ResolvedPolicy};
 use qmp_mcp::qemu::real_driver::RealQemuDriver;
 use qmp_mcp::server::QmpMcpServer;
 use rmcp::{transport::stdio, ServiceExt};
@@ -39,7 +40,21 @@ async fn main() -> ExitCode {
 
     logging::init(config.log_level);
 
-    match run(config).await {
+    // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
+    // allowlist plus QMP_MCP_ALLOW/DENY and the optional QMP_MCP_POLICY_FILE overrides,
+    // with the immutable hard denylist always in force (ADR-0003). Fail closed — with
+    // an actionable message naming QMP_MCP_POLICY_FILE — on a missing/malformed file,
+    // rather than starting with a half-understood policy. Resolved after the logger is
+    // up so the "ignoring hard-denied allow override" warnings are visible.
+    let command_policy = match policy::resolve_command_policy(&env) {
+        Ok(policy) => policy,
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match run(config, command_policy).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("fatal: {err}");
@@ -51,7 +66,10 @@ async fn main() -> ExitCode {
 /// Serve the configured transport. Returns an error (which `main` logs and turns
 /// into exit 1) for the not-yet-implemented HTTP transports and for any serve-time
 /// failure.
-async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    config: Config,
+    command_policy: ResolvedPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     if config.transport.exposes_http() {
         return Err(format!(
             "QMP_MCP_TRANSPORT={} selected, but the HTTP transport arrives in a later slice \
@@ -70,7 +88,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // and negotiates the live QMP Session (slice #21).
     let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
         Box::new(RealQemuDriver),
-        orchestrator_options(&config),
+        orchestrator_options(&config, command_policy),
     )));
 
     let service = QmpMcpServer::new(Arc::clone(&orchestrator))
@@ -95,9 +113,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Assemble the Orchestrator's options from the validated config. The QMP socket is
-/// a per-server file under the OS temp dir (the server owns it; ADR-0004).
-fn orchestrator_options(config: &Config) -> OrchestratorOptions {
+/// Assemble the Orchestrator's options from the validated config and the resolved
+/// Command Policy. The QMP socket is a per-server file under the OS temp dir (the
+/// server owns it; ADR-0004).
+fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> OrchestratorOptions {
     OrchestratorOptions {
         binary: "qemu-system-x86_64".to_string(),
         qmp_socket_path: default_qmp_socket_path(),
@@ -108,6 +127,8 @@ fn orchestrator_options(config: &Config) -> OrchestratorOptions {
         max_memory_mb: Some(config.max_memory_mb),
         max_vcpus: Some(config.max_vcpus),
         allow_raw_args: config.allow_raw_args,
+        // The generic qmp_execute tool runs only what this policy admits (ADR-0003).
+        command_policy: Some(command_policy),
         // `/dev/kvm` probe — the single source of truth from the hardware-spec module.
         kvm_available: Box::new(probe_kvm),
     }

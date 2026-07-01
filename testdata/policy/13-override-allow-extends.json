@@ -1,0 +1,9 @@
+{
+  "description": "An operator override (QMP_MCP_ALLOW or the policy file allow list) extends the allowlist with a safe read-only command that is not in the built-in defaults.",
+  "command": "query-rocker",
+  "config": { "allow": ["query-rocker"] },
+  "expectedVerdict": {
+    "allowed": true,
+    "command": "query-rocker"
+  }
+}

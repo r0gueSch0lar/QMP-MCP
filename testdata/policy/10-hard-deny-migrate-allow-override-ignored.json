@@ -1,0 +1,11 @@
+{
+  "description": "The immutable hard denylist wins over an allow override: migrate cannot be re-enabled by listing it under allow. It streams full VM state to an arbitrary target.",
+  "command": "migrate",
+  "config": { "allow": ["migrate"] },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "migrate",
+    "hardDenied": true,
+    "reasonContains": ["hard denylist", "\"migrate\""]
+  }
+}

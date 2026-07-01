@@ -1,0 +1,11 @@
+{
+  "description": "The policy gates NAMES, not arguments: screendump is default-denied for its NAME even though its dangerous host-file-write argument is what makes it dangerous. It is served only by the dedicated, path-controlling screendump tool, never generically.",
+  "command": "screendump",
+  "arguments": { "filename": "/home/user/.ssh/authorized_keys", "format": "png" },
+  "expectedVerdict": {
+    "allowed": false,
+    "command": "screendump",
+    "hardDenied": false,
+    "reasonContains": ["not in the Command Policy allowlist"]
+  }
+}

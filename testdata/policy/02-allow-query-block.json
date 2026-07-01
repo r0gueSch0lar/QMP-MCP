@@ -1,0 +1,8 @@
+{
+  "description": "A default-safe allowlist hit: the read-only block-device query is allowed with no overrides.",
+  "command": "query-block",
+  "expectedVerdict": {
+    "allowed": true,
+    "command": "query-block"
+  }
+}
