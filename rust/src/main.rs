@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::instance::hardware_spec::probe_kvm;
+use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
+use qmp_mcp::instance::iso_store::IsoStore;
 use qmp_mcp::instance::orchestrator::{InstanceState, Orchestrator, OrchestratorOptions};
 use qmp_mcp::logging;
 use qmp_mcp::policy::{self, ResolvedPolicy};
@@ -91,7 +93,19 @@ async fn run(
         orchestrator_options(&config, command_policy),
     )));
 
-    let service = QmpMcpServer::new(Arc::clone(&orchestrator))
+    // The two allowlisted stores (ADR-0006): a read-write Image Store that provisions
+    // disks via `qemu-img create` under the configured size cap, and a strictly
+    // read-only ISO Store. Built once from the validated config (env is snapshotted at
+    // startup), so the tools resolve names against the configured directories.
+    let image_store = ImageStore::new(ImageStoreOptions {
+        dir: config.image_dir.clone(),
+        max_disk_gb: config.max_disk_gb,
+        qemu_img_binary: None,
+        run: None,
+    });
+    let iso_store = IsoStore::new(config.iso_dir.clone());
+
+    let service = QmpMcpServer::new(Arc::clone(&orchestrator), image_store, iso_store)
         .serve(stdio())
         .await
         .inspect_err(|err| tracing::error!("failed to start stdio transport: {err:?}"))?;
