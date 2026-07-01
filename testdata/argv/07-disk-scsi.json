@@ -1,0 +1,18 @@
+{
+  "description": "A SCSI disk with the default qcow2 format.",
+  "spec": { "disks": [{ "image": "data.qcow2", "interface": "scsi" }] },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{IMAGE_DIR}}/data.qcow2,format=qcow2,if=scsi,media=disk",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

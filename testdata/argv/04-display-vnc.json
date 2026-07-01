@@ -1,0 +1,18 @@
+{
+  "description": "display vnc adds a loopback -vnc with password=on (the secret is set later over QMP, never in argv).",
+  "spec": { "display": "vnc" },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

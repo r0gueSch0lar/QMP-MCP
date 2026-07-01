@@ -1,0 +1,17 @@
+{
+  "description": "Host-level bridge networking with an e1000 NIC, permitted only when allowHostNet is enabled.",
+  "spec": { "network": { "mode": "bridge", "model": "e1000" } },
+  "options": { "accel": "tcg", "allowHostNet": true },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "bridge,id=net0",
+    "-device", "e1000,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

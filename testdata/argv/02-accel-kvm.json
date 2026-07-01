@@ -1,0 +1,17 @@
+{
+  "description": "The resolved accelerator is encoded into -machine accel=. Here KVM.",
+  "spec": {},
+  "options": { "accel": "kvm" },
+  "expectedArgv": [
+    "-machine", "q35,accel=kvm",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

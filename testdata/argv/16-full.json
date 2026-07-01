@@ -1,0 +1,43 @@
+{
+  "description": "A comprehensive spec exercising the full flag ordering: custom machine/cpu/smp/mem, KVM, VNC display, two disks, a CD-ROM, a boot order, and user-mode networking with a port-forward — all under injected resource caps.",
+  "spec": {
+    "machine": "pc",
+    "cpu": "host",
+    "vcpus": 2,
+    "memoryMb": 1024,
+    "display": "vnc",
+    "disks": [
+      { "image": "root.qcow2" },
+      { "image": "data.raw", "interface": "scsi", "format": "raw", "readonly": true }
+    ],
+    "cdrom": { "iso": "install.iso" },
+    "boot": "dc",
+    "network": {
+      "model": "e1000",
+      "hostForwards": [{ "hostPort": 2222, "guestPort": 22 }]
+    }
+  },
+  "options": {
+    "accel": "kvm",
+    "hostfwdPortRange": { "low": 1024, "high": 65535 },
+    "maxMemoryMb": 4096,
+    "maxVcpus": 2
+  },
+  "expectedArgv": [
+    "-machine", "pc,accel=kvm",
+    "-cpu", "host",
+    "-smp", "2",
+    "-m", "1024",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-drive", "file={{IMAGE_DIR}}/root.qcow2,format=qcow2,if=virtio,media=disk",
+    "-drive", "file={{IMAGE_DIR}}/data.raw,format=raw,if=scsi,media=disk,readonly=on",
+    "-drive", "file={{ISO_DIR}}/install.iso,media=cdrom,readonly=on,format=raw",
+    "-boot", "order=dc",
+    "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22",
+    "-device", "e1000,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
