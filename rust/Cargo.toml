@@ -16,7 +16,9 @@ path = "src/main.rs"
 # `#[tool_handler]` macros come from); `transport-io` adds tokio's io-std so we can
 # serve over stdio. Listed explicitly for intent even though some are on by default.
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `sync` gives the `tokio::sync::Mutex` behind the single-instance Orchestrator
+# (ADR-0011); `signal` gives the SIGINT/SIGTERM teardown hook (ADR-0004).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pinned to the same major rmcp 0.16 depends on (1.x), so the tree resolves a
@@ -25,3 +27,7 @@ schemars = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2"
+# The single injectable seam is an `async_trait` QemuDriver (ADR-0011). Object-safe
+# async trait methods so the Orchestrator can hold a `Box<dyn QemuDriver>` (real or
+# fake). Already in the tree as a transitive rmcp dependency.
+async-trait = "0.1"
