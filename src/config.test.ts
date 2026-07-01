@@ -30,6 +30,9 @@ const DEFAULTS: Config = {
   allowHostNet: false,
   eventBufferSize: 256,
   allowRawArgs: false,
+  viewerPassword: undefined,
+  viewerHost: '127.0.0.1',
+  viewerPort: 6080,
 };
 
 describe('loadConfig', () => {
@@ -339,6 +342,36 @@ describe('loadConfig', () => {
       expect(loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'False' }).allowHostNet).toBe(false);
       expect(() => loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'yes' })).toThrowError(
         /QMP_MCP_ALLOW_HOST_NET must be "true" or "false"/,
+      );
+    });
+  });
+
+  describe('noVNC Viewer (ADR-0010)', () => {
+    it('defaults the Viewer host/port and leaves the password unset', () => {
+      const config = loadConfig({});
+      expect(config.viewerHost).toBe('127.0.0.1');
+      expect(config.viewerPort).toBe(6080);
+      expect(config.viewerPassword).toBeUndefined();
+    });
+
+    it('reads the Viewer password, host and port from env', () => {
+      const config = loadConfig({
+        QMP_MCP_VIEWER_PASSWORD: 'view-secret',
+        QMP_MCP_VIEWER_HOST: '0.0.0.0',
+        QMP_MCP_VIEWER_PORT: '7000',
+      });
+      expect(config.viewerPassword).toBe('view-secret');
+      expect(config.viewerHost).toBe('0.0.0.0');
+      expect(config.viewerPort).toBe(7000);
+    });
+
+    it('treats a whitespace-only Viewer password as unset (fail-closed)', () => {
+      expect(loadConfig({ QMP_MCP_VIEWER_PASSWORD: '   ' }).viewerPassword).toBeUndefined();
+    });
+
+    it('fails closed on a non-integer Viewer port, naming the variable', () => {
+      expect(() => loadConfig({ QMP_MCP_VIEWER_PORT: 'abc' })).toThrowError(
+        /QMP_MCP_VIEWER_PORT must be an integer port in 1\.\.65535/,
       );
     });
   });

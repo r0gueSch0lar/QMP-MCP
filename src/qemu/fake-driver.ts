@@ -35,6 +35,9 @@ const DEFAULT_RESPONSES: Record<string, unknown> = {
   cont: {},
   system_reset: {},
   system_powerdown: {},
+  // Arming a vnc Display's password after launch (ADR-0010) returns QMP's empty
+  // success; a test need only assert it was issued with the vnc protocol.
+  set_password: {},
 };
 
 /**

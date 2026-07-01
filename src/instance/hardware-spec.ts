@@ -31,6 +31,28 @@ export const ACCEL_MODES = ['auto', 'kvm', 'tcg'] as const;
 export type AccelMode = (typeof ACCEL_MODES)[number];
 
 /**
+ * Guest Display modes (ADR-0010). `none` (the default) is today's fully headless
+ * Instance — no display backend at all. `vnc` attaches a LOOPBACK-only VNC server
+ * to the Guest's framebuffer (`-vnc 127.0.0.1:N`), the portable QEMU Display the
+ * optional noVNC Viewer bridges over. The VNC password is NOT emitted into argv:
+ * `password=on` only *requires* a password, which the Orchestrator sets after
+ * launch over QMP (`set_password`), so no VNC secret ever reaches `ps`.
+ */
+export const DISPLAY_MODES = ['none', 'vnc'] as const;
+export type DisplayMode = (typeof DISPLAY_MODES)[number];
+
+/**
+ * The single Instance's loopback VNC Display endpoint (ADR-0010). It is fixed
+ * because exactly one Instance runs at a time: VNC display number N maps to TCP
+ * port 5900+N, so the server both emits `-vnc 127.0.0.1:N` and points the Viewer's
+ * proxy at 127.0.0.1:(5900+N) from this one source of truth. Bound to loopback so
+ * the raw VNC port is never reachable off-host — the Viewer is its only client.
+ */
+export const VNC_LOOPBACK_HOST = '127.0.0.1';
+export const VNC_DISPLAY_NUMBER = 0;
+export const VNC_LOOPBACK_PORT = 5900 + VNC_DISPLAY_NUMBER;
+
+/**
  * The minimal validated Hardware Spec for this slice. Unknown fields are
  * rejected (`.strict()`) so a typo fails closed rather than being silently
  * ignored. Every field has a default, so an empty spec is valid.
@@ -223,6 +245,13 @@ export const hardwareSpecSchema = z
       .default('auto')
       .describe(
         "Accelerator: 'auto' probes /dev/kvm and falls back to TCG, 'kvm' requires /dev/kvm, 'tcg' is software emulation.",
+      ),
+    display: z
+      .enum(DISPLAY_MODES)
+      .default('none')
+      .describe(
+        "Guest Display: 'none' (default, fully headless) or 'vnc' (a loopback-only VNC " +
+          'Display the optional noVNC Viewer bridges over — requires QMP_MCP_VIEWER_PASSWORD).',
       ),
     disks: z
       .array(diskSchema)
@@ -628,6 +657,14 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
     '-nographic',
     '-S',
   ];
+  if (spec.display === 'vnc') {
+    // Loopback-only VNC Display (ADR-0010). `password=on` REQUIRES a password but
+    // does NOT carry one: the Orchestrator sets it after launch over QMP
+    // (set_password), so no VNC secret ever appears in argv or `ps`. The bind is
+    // pinned to 127.0.0.1 so the raw VNC port is unreachable off-host — the Viewer
+    // is its sole client. The display number is fixed (single Instance).
+    argv.push('-vnc', `${VNC_LOOPBACK_HOST}:${VNC_DISPLAY_NUMBER},password=on`);
+  }
   for (const disk of spec.disks) {
     argv.push(...buildDriveArgs(disk, options.imageDir));
   }

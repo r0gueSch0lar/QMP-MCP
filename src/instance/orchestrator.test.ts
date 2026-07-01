@@ -181,6 +181,128 @@ describe('Orchestrator lifecycle (fake driver)', () => {
   });
 });
 
+describe('Orchestrator vnc Display + Viewer (fake driver, ADR-0010)', () => {
+  /** A recording fake Viewer + its factory, standing in for the real in-process one. */
+  interface FakeViewer {
+    host: string;
+    port: number;
+    stopped: boolean;
+    options: {
+      host: string;
+      port: number;
+      password: string;
+      vncHost: string;
+      vncPort: number;
+      vncPassword: string;
+    };
+    stop(): Promise<void>;
+  }
+
+  function fakeViewerFactory(): {
+    factory: (options: FakeViewer['options']) => Promise<FakeViewer>;
+    viewers: FakeViewer[];
+  } {
+    const viewers: FakeViewer[] = [];
+    const factory = async (options: FakeViewer['options']): Promise<FakeViewer> => {
+      const viewer: FakeViewer = {
+        host: options.host,
+        port: options.port,
+        stopped: false,
+        options,
+        stop: async () => {
+          viewer.stopped = true;
+        },
+      };
+      viewers.push(viewer);
+      return viewer;
+    };
+    return { factory, viewers };
+  }
+
+  it('create(display:vnc) arms the VNC password over QMP and starts the Viewer; destroy stops it', async () => {
+    const driver = new FakeQemuDriver();
+    const { factory, viewers } = fakeViewerFactory();
+    const orch = makeOrchestrator(driver, {
+      viewerPassword: 'human-secret',
+      viewerHost: '127.0.0.1',
+      viewerPort: 6080,
+      startViewer: factory,
+    });
+
+    await orch.createInstance({ display: 'vnc' });
+
+    // The Display password was set over QMP (protocol vnc), NOT placed in argv.
+    const setPassword = driver.lastProcess?.executed.find((e) => e.command === 'set_password');
+    expect(setPassword?.args?.protocol).toBe('vnc');
+    const vncPassword = setPassword?.args?.password;
+    expect(typeof vncPassword).toBe('string');
+    expect((vncPassword as string).length).toBeGreaterThan(0);
+
+    // The generated argv carries a loopback -vnc with no plaintext password.
+    const argv = driver.launches[0]?.argv ?? [];
+    expect(argv[argv.indexOf('-vnc') + 1]).toBe('127.0.0.1:0,password=on');
+    expect(argv.join(' ')).not.toContain(vncPassword as string);
+
+    // Exactly one Viewer was started, dialing the server-controlled loopback VNC
+    // port, gated by the human password, and embedding the SAME vnc password.
+    expect(viewers).toHaveLength(1);
+    expect(viewers[0]?.options.vncHost).toBe('127.0.0.1');
+    expect(viewers[0]?.options.vncPort).toBe(5900);
+    expect(viewers[0]?.options.password).toBe('human-secret');
+    expect(viewers[0]?.options.vncPassword).toBe(vncPassword);
+    expect(orch.getInstance().state).toBe('RUNNING');
+
+    await orch.destroyInstance();
+    // The Viewer's lifetime equals the Instance's: destroy stops it.
+    expect(viewers[0]?.stopped).toBe(true);
+    expect(orch.getInstance().state).toBe('NONE');
+  });
+
+  it('rejects create(display:vnc) when QMP_MCP_VIEWER_PASSWORD is unset, before launching', async () => {
+    const driver = new FakeQemuDriver();
+    const { factory, viewers } = fakeViewerFactory();
+    // No viewerPassword injected — the fail-closed coupling must refuse.
+    const orch = makeOrchestrator(driver, { startViewer: factory });
+
+    await expect(orch.createInstance({ display: 'vnc' })).rejects.toBeInstanceOf(LifecycleError);
+    await expect(orch.createInstance({ display: 'vnc' })).rejects.toThrow(
+      /QMP_MCP_VIEWER_PASSWORD/,
+    );
+
+    // Fail-closed: no qemu was launched and no Viewer was started.
+    expect(driver.launches).toHaveLength(0);
+    expect(viewers).toHaveLength(0);
+    expect(orch.getInstance().state).toBe('NONE');
+  });
+
+  it('does not start a Viewer for a headless (display:none) Instance', async () => {
+    const driver = new FakeQemuDriver();
+    const { factory, viewers } = fakeViewerFactory();
+    const orch = makeOrchestrator(driver, { viewerPassword: 'human-secret', startViewer: factory });
+
+    await orch.createInstance({});
+
+    expect(viewers).toHaveLength(0);
+    // No set_password is issued when there is no vnc Display.
+    expect(driver.lastProcess?.executed.some((e) => e.command === 'set_password')).toBe(false);
+  });
+
+  it('stops the Viewer when qemu exits unexpectedly', async () => {
+    const driver = new FakeQemuDriver();
+    const { factory, viewers } = fakeViewerFactory();
+    const orch = makeOrchestrator(driver, { viewerPassword: 'human-secret', startViewer: factory });
+
+    await orch.createInstance({ display: 'vnc' });
+    expect(viewers).toHaveLength(1);
+
+    driver.lastProcess?.simulateExit();
+    await tick();
+
+    expect(orch.getInstance().state).toBe('NONE');
+    expect(viewers[0]?.stopped).toBe(true);
+  });
+});
+
 describe('Orchestrator control commands (fake driver)', () => {
   /** Create an Instance and hand back the orchestrator + its fake process. */
   async function running(options: Partial<OrchestratorOptions> = {}, driverOptions = {}) {
