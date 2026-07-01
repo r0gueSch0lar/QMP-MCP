@@ -272,7 +272,7 @@ impl BootOrder {
 /// A single guest disk as supplied by the agent. `image` is a bare name in the
 /// Image Store (resolved + containment-checked at argv time); `interface`/`format`
 /// are closed enums. Unknown fields are rejected (fail closed).
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiskParams {
     /// Name of a disk image in the Image Store (a bare name, never a host path).
@@ -289,7 +289,7 @@ pub struct DiskParams {
 }
 
 /// A CD-ROM drive backed by an ISO from the read-only ISO Store.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CdromParams {
     /// Name of an ISO in the read-only ISO Store (a bare name, never a host path).
@@ -299,7 +299,7 @@ pub struct CdromParams {
 /// A single user-mode port-forward as supplied by the agent: expose guest
 /// `guestPort` on host `hostPort`. Ports are validated to `1..=65535`; `proto` is a
 /// closed enum.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostForwardParams {
     /// Host TCP/UDP port to bind (1-65535, and within `QMP_MCP_HOSTFWD_PORT_RANGE`).
@@ -313,7 +313,7 @@ pub struct HostForwardParams {
 
 /// The guest NIC as supplied by the agent. Defaults to a single user-mode
 /// `virtio-net-pci` with no port-forwards. `model`/`mode` are closed enums.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkParams {
     /// Networking backend: `user` (default) or `tap`/`bridge` (host networking).
@@ -332,7 +332,7 @@ pub struct NetworkParams {
 /// Unknown fields are rejected (`deny_unknown_fields`, mirroring zod `.strict()`),
 /// every field has a default, and the closed sets are enums. The free-string and
 /// numeric fields are validated by [`parse_hardware_spec`] into a [`HardwareSpec`].
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareSpecParams {
     /// QEMU machine type, e.g. `q35` (default) or `pc`.
