@@ -20,10 +20,10 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::config::PortRange;
@@ -38,7 +38,7 @@ use super::hardware_spec::{
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
 };
-use crate::qemu::driver::{InstanceHandle, LaunchRequest, QemuDriver};
+use crate::qemu::driver::{DriverError, ExitedFuture, InstanceHandle, LaunchRequest, QemuDriver};
 use crate::viewer::{RealViewerFactory, ViewerFactory, ViewerHandle, ViewerOptions};
 
 /// The lifecycle states an Instance moves through. `PAUSED` is entered by
@@ -229,6 +229,22 @@ pub struct Orchestrator {
     /// Event Buffer. Aborted (and cleared) on destroy, so the buffer stops advancing
     /// when the Instance is gone.
     event_feeder: Option<JoinHandle<()>>,
+    /// A `Weak` back-reference to the shared `Arc<Mutex<Self>>`, installed once by
+    /// [`new_shared`](Self::new_shared) right after construction (the `Arc` cannot exist
+    /// yet inside [`new`](Self::new)). [`create_instance`](Self::create_instance)
+    /// upgrades it to spawn the exit-watch task. Storing a `Weak` — not an `Arc` — keeps
+    /// the Orchestrator from owning itself, so there is no reference cycle. Empty for a
+    /// bare (non-shared) Orchestrator, whose exit watcher is then inert (issue #28).
+    self_ref: Weak<Mutex<Orchestrator>>,
+    /// Monotonic Instance generation, bumped each time an Instance is published RUNNING.
+    /// The exit-watch task captures the generation of the Instance it watches and only
+    /// reconciles while it still matches — so a stale watcher for a since-destroyed (and
+    /// perhaps recreated) Instance is a no-op and can never tear down a NEWER one.
+    generation: u64,
+    /// The background task awaiting the current Instance's exit signal to reconcile it to
+    /// NONE on an unexpected qemu exit. Aborted on an explicit destroy; the generation
+    /// guard also makes any stale wakeup inert.
+    exit_watcher: Option<JoinHandle<()>>,
 }
 
 impl Orchestrator {
@@ -263,13 +279,42 @@ impl Orchestrator {
             start_viewer,
             event_buffer: Arc::new(EventBuffer::new(capacity)),
             event_feeder: None,
+            self_ref: Weak::new(),
+            generation: 0,
+            exit_watcher: None,
         }
+    }
+
+    /// Construct the Orchestrator already behind its shared `Arc<Mutex<Self>>`, with the
+    /// `Weak` self back-reference installed so [`create_instance`](Self::create_instance)
+    /// can spawn the exit-watch task that reconciles an unexpected qemu exit to NONE
+    /// (issue #28). The production wiring and the shared-lifecycle tests use this; the
+    /// bare [`new`](Self::new) is fine for the pure-lifecycle unit tests (their exit
+    /// watcher never fires because the self-reference is empty).
+    pub fn new_shared(
+        driver: Box<dyn QemuDriver>,
+        options: OrchestratorOptions,
+    ) -> Arc<Mutex<Self>> {
+        let orch = Arc::new(Mutex::new(Self::new(driver, options)));
+        // We hold the only reference right after construction, so `try_lock` cannot fail.
+        orch.try_lock()
+            .expect("a freshly constructed Orchestrator is unlocked")
+            .self_ref = Arc::downgrade(&orch);
+        orch
     }
 
     /// The current lifecycle state (a cheap accessor for the shutdown hook and
     /// tests, avoiding an [`InstanceView`] clone).
     pub fn state(&self) -> InstanceState {
         self.state
+    }
+
+    /// The current Instance generation — the value a fresh exit watcher captures and
+    /// [`reconcile_unexpected_exit`](Self::reconcile_unexpected_exit) guards on. Test-only,
+    /// so the generation guard can be asserted deterministically.
+    #[cfg(test)]
+    fn current_generation(&self) -> u64 {
+        self.generation
     }
 
     /// Return the current Instance view. Reports `NONE` when nothing is running.
@@ -325,11 +370,19 @@ impl Orchestrator {
                 // previous Instance (the buffer's cursor stays monotonic, though).
                 self.event_buffer.reset();
                 self.spawn_event_feeder(handle.subscribe_events());
+                // Capture the exit signal BEFORE the handle moves into the field; the
+                // exit-watch task awaits it to reconcile an unexpected qemu exit to NONE.
+                let exited = handle.exited();
                 self.handle = Some(handle);
                 self.viewer = viewer;
                 self.spec = Some(spec.clone());
                 self.accel = Some(resolution.accel);
+                // A new live Instance: bump the generation the exit-watch task guards on,
+                // so a stale watcher for a prior Instance can never clobber this one.
+                self.generation = self.generation.wrapping_add(1);
+                let generation = self.generation;
                 self.state = InstanceState::Running;
+                self.spawn_exit_watcher(generation, exited);
                 tracing::info!("Instance RUNNING ({})", resolution.reason);
                 Ok(CreateInstanceResult {
                     state: InstanceState::Running,
@@ -410,9 +463,60 @@ impl Orchestrator {
                     .to_string(),
             ));
         }
-        // Claim the teardown: take the handle and clear the Instance fields before
-        // awaiting close. (The outer mutex already serialises callers, so this
-        // cannot interleave with another destroy.)
+        // A normal destroy: silence the exit-watch task first, so it cannot double-
+        // reconcile when `close` fires the exit signal. The generation/NONE guard also
+        // makes it inert, but aborting avoids leaving the task parked. Safe to abort
+        // here — destroy runs on a tool task, never the watcher's own task. (The outer
+        // mutex already serialises callers, so this cannot interleave with another
+        // destroy.)
+        self.stop_exit_watcher();
+        tracing::info!("destroying Instance");
+        self.teardown_current_instance()
+            .await
+            .map_err(|e| LifecycleError(format!("Failed to destroy the Instance: {}", e.0)))?;
+        tracing::info!("Instance destroyed (state NONE)");
+        Ok(())
+    }
+
+    /// Reconcile the Orchestrator to NONE after the current Instance's qemu exited
+    /// WITHOUT an explicit [`destroy_instance`](Self::destroy_instance) — a crash, a
+    /// guest-initiated poweroff, or an external kill — running the SAME teardown as
+    /// destroy (stop the Viewer, abort the event feeder, close the handle so the managed
+    /// QMP socket is removed). Called by the exit-watch task under the shared lock once
+    /// the [`InstanceHandle`]'s exit signal fires.
+    ///
+    /// Guarded twice so it is race-safe: a no-op when `generation` no longer matches (a
+    /// stale watcher for a since-destroyed / recreated Instance — it must NEVER clobber a
+    /// NEWER Instance), and a no-op when the slot is already empty (a normal destroy beat
+    /// it here). Mirrors the TS `Orchestrator.#onProcessExit`.
+    async fn reconcile_unexpected_exit(&mut self, generation: u64) {
+        if self.generation != generation
+            || self.state == InstanceState::None
+            || self.handle.is_none()
+        {
+            return;
+        }
+        tracing::warn!("Instance process exited unexpectedly; resetting state to NONE");
+        // This runs ON the watcher's own task: drop (never abort) its JoinHandle, so we
+        // do not cancel this very teardown at its first await point.
+        let _ = self.exit_watcher.take();
+        if let Err(err) = self.teardown_current_instance().await {
+            tracing::warn!("cleanup after the unexpected qemu exit reported: {}", err.0);
+        }
+        tracing::info!("Instance reconciled to NONE after an unexpected qemu exit");
+    }
+
+    /// The teardown BOTH [`destroy_instance`](Self::destroy_instance) and
+    /// [`reconcile_unexpected_exit`](Self::reconcile_unexpected_exit) run: take the
+    /// handle and Viewer, clear the Instance fields, detach the event feeder and reset
+    /// the buffer (settling any pending wait_for_event as a clean timeout), stop the
+    /// Viewer, then close the handle — which terminates qemu and removes the managed QMP
+    /// socket, so a crashed/SIGKILLed Instance's leftover socket cannot block the next
+    /// create. The caller has already guarded that an Instance exists and dealt with the
+    /// exit-watch task. Returns the driver `close` result so the explicit-destroy path
+    /// can surface it. State ends at `NONE` even if `close` errors (mirrors the TS
+    /// `finally`).
+    async fn teardown_current_instance(&mut self) -> Result<(), DriverError> {
         let handle = self
             .handle
             .take()
@@ -421,21 +525,46 @@ impl Orchestrator {
         self.spec = None;
         self.accel = None;
         self.state = InstanceState::Stopped;
-        // Detach from the Instance's event stream and clear the buffer (settling any
-        // pending wait_for_event as a clean timeout); events do not outlive the
-        // Instance. Mirrors the TS destroy path.
+        // Detach from the Instance's event stream and clear the buffer; events do not
+        // outlive the Instance. Mirrors the TS destroy/exit path.
         self.stop_event_feeder();
         self.event_buffer.reset();
-        tracing::info!("destroying Instance");
         // Stop the Viewer alongside qemu — its lifetime equals the Instance's (ADR-0010).
         if let Some(viewer) = viewer {
             viewer.stop().await;
         }
         let closed = handle.close().await;
         self.state = InstanceState::None;
-        closed.map_err(|e| LifecycleError(format!("Failed to destroy the Instance: {}", e.0)))?;
-        tracing::info!("Instance destroyed (state NONE)");
-        Ok(())
+        closed
+    }
+
+    /// Spawn the background task that awaits the current Instance's exit signal and, when
+    /// qemu vanishes WITHOUT an explicit destroy (crash, guest poweroff, external kill),
+    /// reconciles the Orchestrator to NONE. It upgrades the `Weak` self back-reference
+    /// and re-checks the captured `generation` under the lock, so a stale watcher for a
+    /// since-destroyed/recreated Instance is a no-op. A bare (non-shared) Orchestrator
+    /// has an empty self-reference, so its watcher upgrades to nothing and is inert.
+    fn spawn_exit_watcher(&mut self, generation: u64, exited: ExitedFuture) {
+        // A previous watcher should already be stopped, but be defensive.
+        self.stop_exit_watcher();
+        let self_ref = self.self_ref.clone();
+        self.exit_watcher = Some(tokio::spawn(async move {
+            exited.await;
+            if let Some(orch) = self_ref.upgrade() {
+                orch.lock()
+                    .await
+                    .reconcile_unexpected_exit(generation)
+                    .await;
+            }
+        }));
+    }
+
+    /// Abort and drop the current exit-watch task, if any, so it cannot reconcile after
+    /// an explicit destroy (or before a fresh watcher is spawned).
+    fn stop_exit_watcher(&mut self) {
+        if let Some(watcher) = self.exit_watcher.take() {
+            watcher.abort();
+        }
     }
 
     /// Return the live QMP `query-status` result for the running Instance (the run
@@ -1007,6 +1136,123 @@ mod tests {
             err.0
         );
         // The launched qemu was torn down and the slot released back to NONE.
+        assert_eq!(orch.state(), InstanceState::None);
+    }
+
+    /// Poll until the shared Orchestrator reaches `state`, or panic. The exit-watch task
+    /// reconciles on a background task, so the transition is observed with a bounded poll
+    /// rather than assumed synchronous (never flaky: bounded to ~1s).
+    async fn await_state(orch: &Arc<AsyncMutex<Orchestrator>>, state: InstanceState) {
+        for _ in 0..1_000 {
+            if orch.lock().await.state() == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("Orchestrator never reached state {state}");
+    }
+
+    #[tokio::test]
+    async fn reconciles_to_none_on_unexpected_exit_and_allows_a_fresh_create() {
+        // The issue #28 acceptance path: qemu exits WITHOUT destroy_instance; the
+        // Orchestrator must reconcile to NONE, get_instance must reflect it, and a
+        // subsequent create must be accepted (no phantom "already running").
+        let driver = FakeQemuDriver::new();
+        let exit_slot = driver.exit_slot();
+        let launches = driver.launches();
+        let orch = Orchestrator::new_shared(Box::new(driver), test_options());
+
+        orch.lock().await.create_instance(json!({})).await.unwrap();
+        assert_eq!(orch.lock().await.state(), InstanceState::Running);
+
+        // qemu vanishes on its own (crash/SIGKILL) — the exit signal fires without an
+        // explicit destroy. Release the lock first so the watcher can reconcile.
+        let _ = exit_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create installs an exit signal")
+            .send(true);
+
+        await_state(&orch, InstanceState::None).await;
+        {
+            let guard = orch.lock().await;
+            assert_eq!(guard.get_instance().state, InstanceState::None);
+            assert!(guard.get_instance().spec.is_none());
+            assert!(guard.get_instance().accel.is_none());
+        }
+
+        // The crashed Instance's handle was released, so a fresh create is accepted.
+        orch.lock()
+            .await
+            .create_instance(json!({}))
+            .await
+            .expect("a fresh create is accepted after an unexpected exit");
+        assert_eq!(orch.lock().await.state(), InstanceState::Running);
+        assert_eq!(
+            launches.lock().unwrap().len(),
+            2,
+            "a second qemu was launched after the crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_stops_the_viewer() {
+        // Parity with the TS "stops the Viewer when qemu exits unexpectedly": the Viewer
+        // lifetime equals the Instance's, so an unexpected exit stops it too (ADR-0010).
+        let stops = Arc::new(AtomicUsize::new(0));
+        let factory = FakeViewerFactory {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::clone(&stops),
+            last_options: Arc::new(std::sync::Mutex::new(None)),
+            fail: false,
+        };
+        let driver = FakeQemuDriver::new();
+        let exit_slot = driver.exit_slot();
+        let orch = Orchestrator::new_shared(
+            Box::new(driver),
+            options_with_viewer(factory, Some("view-secret")),
+        );
+        orch.lock()
+            .await
+            .create_instance(json!({ "display": "vnc" }))
+            .await
+            .unwrap();
+
+        let _ = exit_slot.lock().unwrap().clone().unwrap().send(true);
+        await_state(&orch, InstanceState::None).await;
+        assert_eq!(
+            stops.load(SeqCst),
+            1,
+            "an unexpected exit must stop the Viewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_generation_watcher_never_clobbers_a_newer_instance() {
+        // The generation guard: reconcile_unexpected_exit only fires for the Instance it
+        // was armed for. A reconcile for any OTHER generation is inert.
+        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        orch.create_instance(json!({})).await.unwrap();
+        let gen1 = orch.current_generation();
+
+        // A reconcile for an OLDER generation leaves the current Instance untouched.
+        orch.reconcile_unexpected_exit(gen1 - 1).await;
+        assert_eq!(orch.state(), InstanceState::Running);
+
+        // Destroy + recreate: the new Instance carries a NEWER generation.
+        orch.destroy_instance().await.unwrap();
+        orch.create_instance(json!({})).await.unwrap();
+        assert_eq!(orch.current_generation(), gen1 + 1);
+
+        // The stale watcher for the destroyed Instance (generation gen1) must NOT tear
+        // down the newer one.
+        orch.reconcile_unexpected_exit(gen1).await;
+        assert_eq!(orch.state(), InstanceState::Running);
+
+        // The CURRENT generation does reconcile to NONE.
+        let current = orch.current_generation();
+        orch.reconcile_unexpected_exit(current).await;
         assert_eq!(orch.state(), InstanceState::None);
     }
 
