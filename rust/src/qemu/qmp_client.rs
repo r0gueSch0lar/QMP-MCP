@@ -34,7 +34,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -124,6 +124,12 @@ struct Shared {
     closed: AtomicBool,
     /// The reason recorded at close, surfaced to any outstanding/subsequent command.
     close_reason: Mutex<Option<String>>,
+    /// Latches `true` the first time the connection closes/fails, so an owner can
+    /// `await` the Session's end via [`QmpClient::exited`]. QEMU drops the QMP socket
+    /// when it exits, so this is a faithful proxy for the qemu process exiting (crash,
+    /// guest poweroff, external kill, or an explicit close) — the exit signal the
+    /// Orchestrator's exit-watch task reconciles on (issue #28).
+    exit_tx: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -135,8 +141,13 @@ impl Shared {
             return;
         }
         *self.close_reason.lock().expect("close_reason mutex") = Some(reason.to_string());
-        let mut pending = self.pending.lock().expect("pending mutex");
-        pending.clear(); // dropping the senders wakes each waiter with a recv error
+        {
+            let mut pending = self.pending.lock().expect("pending mutex");
+            pending.clear(); // dropping the senders wakes each waiter with a recv error
+        }
+        // Fire the exit signal (latched). `send` errors only when nobody is awaiting the
+        // Session's end, which is harmless here.
+        let _ = self.exit_tx.send(true);
     }
 
     /// The recorded close reason, or a generic fallback.
@@ -172,6 +183,9 @@ impl QmpClient {
     pub fn new(stream: UnixStream) -> Self {
         let (read, write) = stream.into_split();
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        // The exit signal starts `false`; subscribers created later still observe a
+        // subsequent (or already-latched) `true` (see [`QmpClient::exited`]).
+        let (exit_tx, _exit_rx) = watch::channel(false);
         let shared = std::sync::Arc::new(Shared {
             write: AsyncMutex::new(write),
             next_id: AtomicU64::new(1),
@@ -179,6 +193,7 @@ impl QmpClient {
             events_tx,
             closed: AtomicBool::new(false),
             close_reason: Mutex::new(None),
+            exit_tx,
         });
         let (greeting_tx, greeting_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -212,6 +227,22 @@ impl QmpClient {
     /// broadcast from now on (the hook the Event Buffer consumes in slice #24).
     pub fn subscribe_events(&self) -> broadcast::Receiver<QmpEvent> {
         self.shared.events_tx.subscribe()
+    }
+
+    /// A future that resolves once the QMP Session has closed — on socket EOF, a
+    /// read/write failure, or an explicit [`close`](Self::close). Since QEMU drops the
+    /// QMP socket when it exits, this is a faithful proxy for the qemu process exiting
+    /// (crash, guest poweroff, external kill) — the hook the Orchestrator's exit-watch
+    /// task awaits to reconcile the Instance to NONE (issue #28). Latched: it resolves
+    /// immediately when the Session has already closed.
+    pub fn exited(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.shared.exit_tx.subscribe();
+        async move {
+            // `wait_for` checks the current value first, so a subscriber created after
+            // the close still observes the latched `true` and returns at once. An error
+            // (sender dropped) also means the Session is gone, so either way we resolve.
+            let _ = rx.wait_for(|&closed| closed).await;
+        }
     }
 
     /// The greeting QEMU sent, available after [`negotiate`](Self::negotiate) resolves.

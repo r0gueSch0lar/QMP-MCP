@@ -99,10 +99,13 @@ async fn run(
     // tool calls serialise on the one Instance (ADR-0011). It is wired to the real
     // QEMU driver, which spawns `qemu-system-*` on the server-managed QMP UNIX socket
     // and negotiates the live QMP Session (slice #21).
-    let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+    // `new_shared` installs the Orchestrator's `Weak` self back-reference so
+    // create_instance can spawn the exit-watch task that reconciles an unexpected qemu
+    // exit (crash, guest poweroff, external kill) back to NONE (issue #28).
+    let orchestrator = Orchestrator::new_shared(
         Box::new(RealQemuDriver),
         orchestrator_options(&config, command_policy),
-    )));
+    );
 
     // The two allowlisted stores (ADR-0006): a read-write Image Store that provisions
     // disks via `qemu-img create` under the configured size cap, and a strictly
