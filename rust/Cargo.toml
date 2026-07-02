@@ -79,3 +79,11 @@ bytes = "1"
 # TS orchestrator's `crypto.randomInt`. Already in the tree transitively; used
 # directly here for the one password draw. No modulo bias.
 getrandom = "0.4"
+
+# Release artifacts (per-architecture binaries from `cargo build --release`,
+# `cargo install`, and the Docker image) are stripped of symbols so the shipped
+# binary is lean on every target. See rust/.cargo/config.toml + the README's
+# "Building for other platforms" section for the cross-compilation matrix.
+[profile.release]
+strip = true
+
