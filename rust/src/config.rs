@@ -27,6 +27,13 @@ pub type EnvMap = HashMap<String, String>;
 /// server (issue #12).
 pub const DEFAULT_EVENT_BUFFER_SIZE: u32 = 256;
 
+/// Default `qemu-system-*` binary the Orchestrator launches
+/// (`QMP_MCP_QEMU_BINARY`). x86_64 is the historical default; selecting a
+/// different emulator (e.g. `qemu-system-aarch64`) switches the guest
+/// architecture, with the Hardware Spec's `machine`/`cpu` shaping the rest of the
+/// argv (issue #15).
+pub const DEFAULT_QEMU_BINARY: &str = "qemu-system-x86_64";
+
 /// Which transport(s) the server exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
@@ -160,6 +167,11 @@ pub struct Config {
     pub image_dir: String,
     /// Absolute path of the read-only ISO Store directory (ADR-0006).
     pub iso_dir: String,
+    /// The `qemu-system-*` binary the Orchestrator launches as argv[0]. Selecting
+    /// a non-x86 emulator (e.g. `qemu-system-aarch64`) switches the guest
+    /// architecture; the Hardware Spec's `machine`/`cpu` still shape the rest of
+    /// the argv (issue #15).
+    pub qemu_binary: String,
     /// Hard cap, in GiB, on the virtual size of a created disk image.
     pub max_disk_gb: u32,
     /// Hard cap, in MiB, on a Hardware Spec's `memoryMb` (issue #9).
@@ -411,6 +423,41 @@ pub fn resolve_iso_dir(env: &EnvMap) -> String {
     join(&tmp_dir(env), &["qmp-mcp", "isos"])
 }
 
+/// Resolve and validate the `qemu-system-*` binary the Orchestrator launches as
+/// argv[0] (`QMP_MCP_QEMU_BINARY`). Undefined or blank/whitespace-only reads as
+/// the default [`DEFAULT_QEMU_BINARY`]; an explicit value is trimmed and must be a
+/// **bare command name** (resolved via `PATH`) or an **absolute path**, over the
+/// safe charset `[A-Za-z0-9._/+-]`.
+///
+/// The value is exec'd as argv[0] with **no shell**, but we still fail closed on
+/// whitespace, shell metacharacters, and control characters — and on a relative
+/// path (`./qemu`, `build/qemu`) — so a foot-gun never reaches `exec`. The
+/// Hardware Spec's `machine`/`cpu` shape the rest of the argv, so an aarch64
+/// binary plus `machine: virt` / `cpu: cortex-a72` builds an ARM guest (issue #15).
+pub fn resolve_qemu_binary(env: &EnvMap) -> Result<String, ConfigError> {
+    let value = match trimmed_non_empty(env, "QMP_MCP_QEMU_BINARY") {
+        None => return Ok(DEFAULT_QEMU_BINARY.to_string()),
+        Some(v) => v,
+    };
+    // Safe charset: ASCII letters/digits plus the path and version punctuation that
+    // legitimate binary names and absolute paths use (`^[A-Za-z0-9._/+-]+$`).
+    let charset_ok = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'));
+    // A '/' is only allowed when the value is an absolute path; a bare command name
+    // carries no slash. This rejects relative paths, which resolve against an
+    // ambient CWD rather than a stable location.
+    let shape_ok = !value.contains('/') || value.starts_with('/');
+    if !charset_ok || !shape_ok {
+        return Err(ConfigError(format!(
+            "QMP_MCP_QEMU_BINARY must be a bare command name or an absolute path over \
+             [A-Za-z0-9._/+-] (no whitespace, shell metacharacters, or control \
+             characters) (got \"{value}\")."
+        )));
+    }
+    Ok(value.to_string())
+}
+
 /// An original (untrimmed) env value that is present and not whitespace-only, or
 /// `None`. Mirrors the JWT-secret / Viewer-password resolvers, which keep the
 /// original string but treat a blank value as unset (fail-closed).
@@ -506,6 +553,7 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         allow_insecure,
         image_dir: resolve_image_dir(env),
         iso_dir: resolve_iso_dir(env),
+        qemu_binary: resolve_qemu_binary(env)?,
         max_disk_gb: parse_positive_int(
             "QMP_MCP_MAX_DISK_GB",
             get(env, "QMP_MCP_MAX_DISK_GB"),
@@ -578,6 +626,7 @@ mod tests {
             allow_insecure: false,
             image_dir: DEFAULT_IMAGE_DIR.into(),
             iso_dir: DEFAULT_ISO_DIR.into(),
+            qemu_binary: "qemu-system-x86_64".into(),
             max_disk_gb: 64,
             max_memory_mb: 4096,
             max_vcpus: 2,
@@ -925,6 +974,78 @@ mod tests {
             load_config(&env(&[("HOME", "/home/u")])).unwrap().iso_dir,
             "/home/u/.local/share/qmp-mcp/isos"
         );
+    }
+
+    #[test]
+    fn qemu_binary_defaults_to_x86_64_when_unset() {
+        assert_eq!(
+            load_config(&env(&[])).unwrap().qemu_binary,
+            "qemu-system-x86_64"
+        );
+        assert_eq!(
+            resolve_qemu_binary(&env(&[])).unwrap(),
+            "qemu-system-x86_64"
+        );
+    }
+
+    #[test]
+    fn qemu_binary_explicit_override_is_honored() {
+        // A non-x86 emulator selects the guest architecture; a bare name and an
+        // absolute path are both accepted.
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "qemu-system-aarch64")]))
+                .unwrap()
+                .qemu_binary,
+            "qemu-system-aarch64"
+        );
+        assert_eq!(
+            load_config(&env(&[(
+                "QMP_MCP_QEMU_BINARY",
+                " /usr/bin/qemu-system-riscv64 "
+            )]))
+            .unwrap()
+            .qemu_binary,
+            "/usr/bin/qemu-system-riscv64"
+        );
+    }
+
+    #[test]
+    fn qemu_binary_blank_or_whitespace_reads_as_default() {
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "")]))
+                .unwrap()
+                .qemu_binary,
+            "qemu-system-x86_64"
+        );
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "   ")]))
+                .unwrap()
+                .qemu_binary,
+            "qemu-system-x86_64"
+        );
+    }
+
+    #[test]
+    fn qemu_binary_fails_closed_on_unsafe_values() {
+        // Shell metacharacters / whitespace / relative paths are rejected, naming
+        // the variable and the allowed form.
+        for value in [
+            "qemu; rm -rf",
+            "qemu-system-x86_64 --enable-kvm",
+            "qemu\tsystem",
+            "$(rm -rf /)",
+            "qemu|nc",
+            "../bin/qemu-system-aarch64",
+            "./qemu",
+            "build/qemu-system-aarch64",
+        ] {
+            let err = load_config(&env(&[("QMP_MCP_QEMU_BINARY", value)])).unwrap_err();
+            assert!(
+                err.0.contains("QMP_MCP_QEMU_BINARY"),
+                "value {value:?} gave {:?}",
+                err.0
+            );
+        }
     }
 
     #[test]
