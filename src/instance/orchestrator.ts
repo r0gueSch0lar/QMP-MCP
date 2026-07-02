@@ -28,6 +28,7 @@ import {
   resolveIsoDir,
   resolveMaxMemoryMb,
   resolveMaxVcpus,
+  resolveQemuBinary,
   resolveViewerHost,
   resolveViewerPassword,
   resolveViewerPort,
@@ -696,7 +697,10 @@ function generateVncPassword(): string {
 
 /** The process-global Orchestrator singleton, wired to the real QEMU driver. */
 export const orchestrator = new Orchestrator(new RealQemuDriver(), {
-  binary: 'qemu-system-x86_64',
+  // argv[0] for the launched guest; QMP_MCP_QEMU_BINARY selects the guest
+  // architecture (e.g. qemu-system-aarch64), while the spec's machine/cpu still
+  // shape the rest of the argv (issue #15).
+  binary: resolveQemuBinary(process.env),
   qmpSocketPath: defaultQmpSocketPath(),
   // Resolve disk names against the configured Image Store (ADR-0006).
   imageDir: resolveImageDir(process.env),

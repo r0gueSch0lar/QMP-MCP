@@ -44,6 +44,14 @@ export interface PortRange {
  */
 export const DEFAULT_HOSTFWD_PORT_RANGE: PortRange = { low: 1024, high: 65535 };
 
+/**
+ * Default `qemu-system-*` binary the Orchestrator launches as argv[0] when
+ * `QMP_MCP_QEMU_BINARY` is unset. x86_64 is the historical default; selecting a
+ * non-x86 emulator (e.g. `qemu-system-aarch64`) chooses the guest architecture.
+ * Shared by {@link resolveQemuBinary} and the Orchestrator singleton (issue #15).
+ */
+export const DEFAULT_QEMU_BINARY = 'qemu-system-x86_64';
+
 export interface Config {
   /** Which transport(s) the server should expose. */
   transport: TransportMode;
@@ -81,6 +89,13 @@ export interface Config {
    * referenced by name within it, never by host path, and it is never written to.
    */
   isoDir: string;
+  /**
+   * The `qemu-system-*` binary the Orchestrator launches as argv[0]
+   * (`QMP_MCP_QEMU_BINARY`, default {@link DEFAULT_QEMU_BINARY}). Selects the guest
+   * architecture — e.g. `qemu-system-aarch64` builds an ARM guest — while the
+   * Hardware Spec's `machine`/`cpu` still shape the rest of the argv (issue #15).
+   */
+  qemuBinary: string;
   /**
    * Hard cap, in GiB, on the virtual size of a disk image {@link createImage}
    * may allocate. A larger request is rejected naming this cap.
@@ -286,6 +301,44 @@ export function resolveIsoDir(env: NodeJS.ProcessEnv): string {
   return join(tmpdir(), 'qmp-mcp', 'isos');
 }
 
+/**
+ * Resolve and validate the `qemu-system-*` binary the Orchestrator launches as
+ * argv[0] (`QMP_MCP_QEMU_BINARY`, default {@link DEFAULT_QEMU_BINARY}). Undefined
+ * or blank/whitespace-only reads as the default (mirroring the other string
+ * resolvers); an explicit value is trimmed and must be a **bare command name**
+ * (resolved via `PATH`) or an **absolute path**, over the safe charset
+ * `[A-Za-z0-9._/+-]`.
+ *
+ * The value is spawned as argv[0] with NO shell (execFile), but we still fail
+ * closed on whitespace, shell metacharacters, and control characters — and on a
+ * relative path (`./qemu`, `build/qemu`, `../bin/qemu`) — so a foot-gun never
+ * reaches the spawn. The Hardware Spec's `machine`/`cpu` still shape the rest of
+ * the argv, so an aarch64 binary plus `machine: 'virt'` / `cpu: 'cortex-a72'`
+ * builds an ARM guest. Exported so the Orchestrator singleton and
+ * {@link loadConfig} share one source of truth (issue #15).
+ */
+export function resolveQemuBinary(env: NodeJS.ProcessEnv): string {
+  const raw = env.QMP_MCP_QEMU_BINARY;
+  if (raw === undefined) return DEFAULT_QEMU_BINARY;
+  const value = raw.trim();
+  if (value === '') return DEFAULT_QEMU_BINARY;
+  // Safe charset: ASCII letters/digits plus the path and version punctuation that
+  // legitimate binary names and absolute paths use (`^[A-Za-z0-9._/+-]+$`). A '/'
+  // is only allowed when the value is an absolute path; a bare command name carries
+  // no slash, so this also rejects relative paths, which resolve against an ambient
+  // CWD rather than a stable location.
+  const charsetOk = /^[A-Za-z0-9._/+-]+$/.test(value);
+  const shapeOk = !value.includes('/') || value.startsWith('/');
+  if (!charsetOk || !shapeOk) {
+    throw new ConfigError(
+      `QMP_MCP_QEMU_BINARY must be a bare command name or an absolute path over ` +
+        `[A-Za-z0-9._/+-] (no whitespace, shell metacharacters, or control ` +
+        `characters) (got "${value}").`,
+    );
+  }
+  return value;
+}
+
 /** Resolve the maximum disk size cap in GiB (`QMP_MCP_MAX_DISK_GB`, default 64). */
 export function resolveMaxDiskGb(env: NodeJS.ProcessEnv): number {
   return parsePositiveInt('QMP_MCP_MAX_DISK_GB', env.QMP_MCP_MAX_DISK_GB, 64);
@@ -462,6 +515,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     allowInsecure,
     imageDir: resolveImageDir(env),
     isoDir: resolveIsoDir(env),
+    qemuBinary: resolveQemuBinary(env),
     maxDiskGb: resolveMaxDiskGb(env),
     maxMemoryMb: resolveMaxMemoryMb(env),
     maxVcpus: resolveMaxVcpus(env),
