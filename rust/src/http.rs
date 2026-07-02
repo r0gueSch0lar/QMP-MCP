@@ -5,13 +5,22 @@
 //! [`StreamableHttpService`] nested under the configured endpoint and puts the
 //! security posture in front of it as ordinary axum middleware:
 //!
-//! - **API-key auth** ([`require_api_key`]): a request must carry an `X-API-Key`
-//!   header whose value is one of the configured keys, or it is rejected with `401`
-//!   BEFORE the MCP service ever sees it. This mirrors the TS `APIKeyAuthProvider`
-//!   (same default header, same "any configured key admits" semantics). It is
-//!   skipped entirely — and a cleartext warning logged by the caller — only when
-//!   `QMP_MCP_ALLOW_INSECURE=true` (local dev). stdio never routes through here and
-//!   stays auth-free.
+//! - **API-key auth** ([`require_api_key`], the default): a request must carry an
+//!   `X-API-Key` header whose value is one of the configured keys, or it is rejected
+//!   with `401` BEFORE the MCP service ever sees it. This mirrors the TS
+//!   `APIKeyAuthProvider` (same default header, same "any configured key admits"
+//!   semantics). It is skipped entirely — and a cleartext warning logged by the
+//!   caller — only when `QMP_MCP_ALLOW_INSECURE=true` (local dev). stdio never routes
+//!   through here and stays auth-free.
+//! - **JWT auth** ([`require_jwt`], selected by `QMP_MCP_AUTH=jwt`): a request must
+//!   carry an `Authorization: Bearer <token>` header whose JWT verifies against the
+//!   configured `QMP_MCP_JWT_SECRET`, or it is rejected with `401` before the MCP
+//!   service runs. Verification is **pinned to HS256** — the algorithm is fixed by
+//!   the verifier, never read from the token's own header — so a token presenting
+//!   `alg: none` or a weaker/other algorithm is refused, not trusted. This mirrors
+//!   the TS `JWTAuthProvider` built with `algorithms: ['HS256']`. Exactly one of the
+//!   API-key or JWT layer is installed (per `QMP_MCP_AUTH`); insecure mode installs
+//!   neither.
 //! - **DNS-rebinding / CORS origin guard** ([`guard_origin`]): a browser request
 //!   whose `Origin` is not in the configured allowlist is rejected with `403`
 //!   before any handler runs; a request with no `Origin` (curl, MCP SDK clients) is
@@ -32,22 +41,27 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use crate::config::Config;
+use crate::config::{AuthMode, Config};
 use crate::server::QmpMcpServer;
 
 /// Shared, immutable configuration for the two guard middlewares, cheap to clone
 /// (both fields are `Arc`) so each request handler gets its own handle.
 #[derive(Clone)]
 struct GuardState {
-    /// The set of accepted API keys. Empty only in insecure mode, where the
-    /// [`require_api_key`] layer is not installed at all.
+    /// The set of accepted API keys. Non-empty (and consulted) only in `apikey`
+    /// mode, where the [`require_api_key`] layer is installed.
     api_keys: Arc<Vec<String>>,
     /// Browser origins permitted by the DNS-rebinding guard.
     allowed_origins: Arc<Vec<String>>,
+    /// HS256 signing-secret bytes for the JWT guard. Non-empty (and consulted) only
+    /// in `jwt` mode, where the [`require_jwt`] layer is installed; config has already
+    /// failed closed if the secret was missing, so it is guaranteed present there.
+    jwt_secret: Arc<Vec<u8>>,
 }
 
 /// True when `headers` carries an `X-API-Key` whose value exactly equals one of
@@ -59,6 +73,40 @@ fn api_key_ok(headers: &HeaderMap, keys: &[String]) -> bool {
         return false;
     };
     keys.iter().any(|k| k == provided)
+}
+
+/// Whether `headers` carries a valid `Authorization: Bearer <jwt>` whose token
+/// verifies against `secret` under **HS256 only**. The algorithm is fixed by the
+/// verifier (`Validation::new(Algorithm::HS256)`), never taken from the token's own
+/// `alg` header, so a token presenting `alg: none` or any other/weaker algorithm is
+/// rejected rather than trusted (parity with the TS `JWTAuthProvider` built with
+/// `algorithms: ['HS256']`). An absent header, a non-`Bearer` scheme, a malformed
+/// token, a bad signature, an expired token, or a wrong algorithm all read as false —
+/// the request is unauthenticated. Header lookup is case-insensitive.
+///
+/// The claim-*presence* checks are relaxed to match the TS provider exactly: npm
+/// `jsonwebtoken.verify(token, secret, { algorithms: ['HS256'] })` requires no claims
+/// and only checks `aud` when an expected audience is configured, whereas the Rust
+/// crate's defaults would additionally *require* `exp` and reject any token carrying
+/// an `aud`. Clearing `required_spec_claims` and disabling the audience check restores
+/// parity while KEEPING signature verification, the HS256 pin, and expiry validation
+/// (a token whose `exp` is in the past is still rejected).
+fn jwt_ok(headers: &HeaderMap, secret: &[u8]) -> bool {
+    let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    // Require the `Bearer` scheme; the token is the remainder (parity with the TS
+    // provider's `requireBearer` default). A missing or different scheme is unauthed.
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.required_spec_claims.clear();
+    validation.validate_aud = false;
+    decode::<serde_json::Value>(token, &DecodingKey::from_secret(secret), &validation).is_ok()
 }
 
 /// Whether a request's `Origin` is permitted by the DNS-rebinding guard. A request
@@ -89,6 +137,22 @@ async fn require_api_key(
         (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: a valid X-API-Key header is required.\n",
+        )
+            .into_response()
+    }
+}
+
+/// axum middleware: reject any request that does not carry a valid `Authorization:
+/// Bearer <jwt>` (HS256, verified against the configured secret) with `401` before it
+/// can reach the MCP service (ADR-0005 fail-closed). Installed only when
+/// `QMP_MCP_AUTH=jwt` and not in insecure mode. Mirrors the TS `JWTAuthProvider`.
+async fn require_jwt(State(state): State<GuardState>, request: Request, next: Next) -> Response {
+    if jwt_ok(request.headers(), &state.jwt_secret) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized: a valid Authorization: Bearer <JWT> is required.\n",
         )
             .into_response()
     }
@@ -125,25 +189,33 @@ fn build_mcp_service(server: QmpMcpServer) -> StreamableHttpService<QmpMcpServer
 /// fronted by the origin guard (always) and — unless `config.allow_insecure` — the
 /// fail-closed API-key auth layer.
 ///
-/// Layer order matters: axum runs the LAST-added layer first, so the origin guard is
-/// added last and executes ahead of the auth layer — a DNS-rebinding attempt is
-/// refused (`403`) before the key is ever inspected. By the time this runs the
-/// config has already failed closed if a required key was missing (`crate::config`),
-/// so an authenticated build always has a non-empty key set.
+/// The auth provider is selected by `config.auth_mode`: `apikey` installs the
+/// [`require_api_key`] layer (the default), `jwt` installs [`require_jwt`]; insecure
+/// mode installs neither. Layer order matters: axum runs the LAST-added layer first,
+/// so the origin guard is added last and executes ahead of the auth layer — a
+/// DNS-rebinding attempt is refused (`403`) before any credential is inspected. By the
+/// time this runs the config has already failed closed if the selected provider's
+/// credential was missing (`crate::config`), so an authenticated build always has the
+/// key set (or JWT secret) it needs.
 pub fn build_router(config: &Config, server: QmpMcpServer) -> Router {
     let state = GuardState {
         api_keys: Arc::new(config.api_keys.clone()),
         allowed_origins: Arc::new(config.allowed_origins.clone()),
+        jwt_secret: Arc::new(config.jwt_secret.clone().unwrap_or_default().into_bytes()),
     };
 
     let mut app = Router::new().nest_service(&config.http_endpoint, build_mcp_service(server));
 
-    // Auth first (inner), so it is closest to the MCP service.
+    // Auth first (inner), so it is closest to the MCP service. Exactly one provider is
+    // installed, chosen by config.auth_mode; insecure mode installs none.
     if !config.allow_insecure {
-        app = app.layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ));
+        app = match config.auth_mode {
+            AuthMode::ApiKey => app.layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_key,
+            )),
+            AuthMode::Jwt => app.layer(middleware::from_fn_with_state(state.clone(), require_jwt)),
+        };
     }
     // Origin guard last (outer), so it runs before auth.
     app.layer(middleware::from_fn_with_state(state, guard_origin))
@@ -219,6 +291,120 @@ mod tests {
     #[test]
     fn api_key_denies_everything_when_no_keys_configured() {
         assert!(!api_key_ok(&headers(&[("X-API-Key", "k1")]), &[]));
+    }
+
+    /// The HS256 signing secret used across the JWT unit tests.
+    const JWT_SECRET: &[u8] = b"jwt-signing-secret";
+
+    /// Current UNIX time in whole seconds, for minting `exp`/`nbf` claims.
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Mint a JWT signed with `secret` under `alg` from a JSON claims value. Used to
+    /// build both valid HS256 tokens and adversarial ones (wrong secret / wrong alg).
+    fn mint(secret: &[u8], alg: Algorithm, claims: &serde_json::Value) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        encode(&Header::new(alg), claims, &EncodingKey::from_secret(secret)).unwrap()
+    }
+
+    /// Wrap a raw token in an `Authorization: Bearer <token>` header map.
+    fn bearer(token: &str) -> HeaderMap {
+        let value = format!("Bearer {token}");
+        headers(&[("Authorization", value.as_str())])
+    }
+
+    #[test]
+    fn jwt_allows_a_valid_hs256_token() {
+        let token = mint(
+            JWT_SECRET,
+            Algorithm::HS256,
+            &serde_json::json!({ "sub": "agent", "exp": now_secs() + 3600 }),
+        );
+        assert!(jwt_ok(&bearer(&token), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_allows_a_valid_token_without_exp() {
+        // Parity with the TS provider: `exp` is optional (not required), so a signed
+        // token carrying no expiry is accepted.
+        let token = mint(
+            JWT_SECRET,
+            Algorithm::HS256,
+            &serde_json::json!({ "sub": "agent" }),
+        );
+        assert!(jwt_ok(&bearer(&token), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_denies_missing_or_malformed_authorization() {
+        let token = mint(
+            JWT_SECRET,
+            Algorithm::HS256,
+            &serde_json::json!({ "sub": "agent" }),
+        );
+        // No Authorization header at all.
+        assert!(!jwt_ok(&headers(&[]), JWT_SECRET));
+        // Present, valid token, but WITHOUT the required `Bearer ` scheme prefix.
+        assert!(!jwt_ok(
+            &headers(&[("Authorization", token.as_str())]),
+            JWT_SECRET
+        ));
+        // A different scheme carrying the valid token does not count.
+        let token_scheme = format!("Token {token}");
+        assert!(!jwt_ok(
+            &headers(&[("Authorization", token_scheme.as_str())]),
+            JWT_SECRET
+        ));
+        // Bearer scheme but a non-JWT garbage token.
+        assert!(!jwt_ok(&bearer("not-a-jwt"), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_denies_bad_signature() {
+        // A correctly-formed HS256 token, but signed with a different secret.
+        let token = mint(
+            b"a-different-secret",
+            Algorithm::HS256,
+            &serde_json::json!({ "sub": "agent", "exp": now_secs() + 3600 }),
+        );
+        assert!(!jwt_ok(&bearer(&token), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_denies_wrong_algorithm() {
+        // Signed with HS384 (a different algorithm) using the SAME secret. The verifier
+        // is pinned to HS256, so the token's chosen alg is refused — a token can never
+        // pick the algorithm it is verified under.
+        let token = mint(
+            JWT_SECRET,
+            Algorithm::HS384,
+            &serde_json::json!({ "sub": "agent", "exp": now_secs() + 3600 }),
+        );
+        assert!(!jwt_ok(&bearer(&token), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_denies_alg_none() {
+        // The classic downgrade attack: an unsigned token whose header is
+        // {"alg":"none","typ":"JWT"} with an empty signature segment. HS256 pinning
+        // rejects it outright — there is no signature to verify.
+        const ALG_NONE: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhbGctbm9uZSJ9.";
+        assert!(!jwt_ok(&bearer(ALG_NONE), JWT_SECRET));
+    }
+
+    #[test]
+    fn jwt_denies_expired_token() {
+        // `exp` an hour in the past — beyond the crate's default 60s leeway.
+        let token = mint(
+            JWT_SECRET,
+            Algorithm::HS256,
+            &serde_json::json!({ "sub": "agent", "exp": now_secs() - 3600 }),
+        );
+        assert!(!jwt_ok(&bearer(&token), JWT_SECRET));
     }
 
     #[test]

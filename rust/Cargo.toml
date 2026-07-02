@@ -79,6 +79,14 @@ bytes = "1"
 # TS orchestrator's `crypto.randomInt`. Already in the tree transitively; used
 # directly here for the one password draw. No modulo bias.
 getrandom = "0.4"
+# JWT verification for the HTTP transport's `QMP_MCP_AUTH=jwt` middleware (slice #29,
+# ADR-0005/0011), mirroring the TS `JWTAuthProvider` (which wraps npm `jsonwebtoken`).
+# The `jsonwebtoken` crate is the well-maintained Rust equivalent. The middleware pins
+# verification to HS256 via `Validation::new(Algorithm::HS256)`, so a token's own `alg`
+# header can never downgrade to `none` or a weaker algorithm — the verifier chooses the
+# algorithm, not the attacker. v9's default `ring` backend needs only a C compiler
+# (present in the rust image), avoiding v10's mandatory crypto-backend selection.
+jsonwebtoken = "9"
 
 # Release artifacts (per-architecture binaries from `cargo build --release`,
 # `cargo install`, and the Docker image) are stripped of symbols so the shipped
