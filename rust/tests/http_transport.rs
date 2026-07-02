@@ -5,9 +5,12 @@
 //! fake-free `QmpMcpServer`, serves it on an ephemeral loopback port with the same
 //! `axum::serve` the binary uses, and drives it over a real TCP socket with
 //! hand-written HTTP/1.1 requests. No qemu is ever launched: the assertions are all
-//! about the guard layer (`401` without a key, `403` for a rebinding Origin) and the
-//! MCP handshake reaching the service (`200` for an authenticated `initialize`), and
-//! none of those paths invoke a tool, so the wired `RealQemuDriver` is never called.
+//! about the guard layer (`401` without a key or JWT, `403` for a rebinding Origin)
+//! and the MCP handshake reaching the service (`200` for an authenticated
+//! `initialize`), and none of those paths invoke a tool, so the wired
+//! `RealQemuDriver` is never called. Both auth providers are exercised end to end:
+//! the default `apikey` mode (`X-API-Key`) and `jwt` mode (`Authorization: Bearer`,
+//! HS256).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -192,4 +195,66 @@ async fn insecure_mode_serves_without_a_key() {
     let addr = spawn_server(&config).await;
     let status = post_mcp(addr, &[], INITIALIZE_BODY).await;
     assert_eq!(status, 200, "insecure mode must serve without a key");
+}
+
+/// The HS256 signing secret for the JWT-mode cases.
+const JWT_SECRET: &str = "itest-jwt-signing-secret";
+
+/// Build the HTTP config for the JWT cases: `http` transport, `jwt` auth, a secret.
+fn jwt_config() -> Config {
+    let env: HashMap<String, String> = [
+        ("QMP_MCP_TRANSPORT", "http"),
+        ("QMP_MCP_AUTH", "jwt"),
+        ("QMP_MCP_JWT_SECRET", JWT_SECRET),
+        ("QMP_MCP_HTTP_HOST", "127.0.0.1"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .collect();
+    load_config(&env).expect("valid http config with a JWT secret")
+}
+
+/// Mint an HS256 JWT signed with `JWT_SECRET`, expiring `ttl_secs` from now (pass a
+/// negative value to mint an already-expired token). `Header::default()` is HS256.
+fn jwt(ttl_secs: i64) -> String {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = serde_json::json!({ "sub": "itest-agent", "exp": now + ttl_secs });
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// Under `jwt` auth, a POST with no `Authorization` header is rejected with `401`
+/// before the MCP service runs.
+#[tokio::test]
+async fn jwt_rejects_request_without_token() {
+    let addr = spawn_server(&jwt_config()).await;
+    let status = post_mcp(addr, &[], INITIALIZE_BODY).await;
+    assert_eq!(status, 401, "missing JWT must be 401");
+}
+
+/// Under `jwt` auth, a POST bearing a valid HS256 token reaches the MCP service and
+/// gets `200` — the JWT layer let it through.
+#[tokio::test]
+async fn jwt_accepts_initialize_with_valid_token() {
+    let addr = spawn_server(&jwt_config()).await;
+    let auth = format!("Authorization: Bearer {}", jwt(3600));
+    let status = post_mcp(addr, &[&auth], INITIALIZE_BODY).await;
+    assert_eq!(status, 200, "valid JWT + initialize must be 200");
+}
+
+/// Under `jwt` auth, an expired token is rejected with `401`.
+#[tokio::test]
+async fn jwt_rejects_expired_token() {
+    let addr = spawn_server(&jwt_config()).await;
+    let auth = format!("Authorization: Bearer {}", jwt(-3600));
+    let status = post_mcp(addr, &[&auth], INITIALIZE_BODY).await;
+    assert_eq!(status, 401, "expired JWT must be 401");
 }

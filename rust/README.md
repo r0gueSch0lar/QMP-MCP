@@ -161,10 +161,11 @@ QMP_MCP_API_KEYS=replace-with-a-strong-key \
 The HTTP transport **fails closed** (ADR-0005): it refuses to start unless you provide
 auth — `QMP_MCP_API_KEYS=...` (sent in the `X-API-Key` header). For throwaway local use
 you can opt out with `QMP_MCP_ALLOW_INSECURE=true`, but never expose that on an
-untrusted network. (`QMP_MCP_AUTH=jwt` is defined by the shared config surface but not
-yet implemented in this variant — it fails closed with an actionable message; use
-`apikey` or the insecure override.) `QMP_MCP_TRANSPORT=both` serves stdio and HTTP
-concurrently.
+untrusted network. As an alternative to API keys, set `QMP_MCP_AUTH=jwt` with a
+`QMP_MCP_JWT_SECRET`: each request must then carry an `Authorization: Bearer <token>`
+whose JWT is verified against that secret and **pinned to HS256** (a token presenting
+`alg: none` or any other algorithm is rejected). `QMP_MCP_TRANSPORT=both` serves stdio
+and HTTP concurrently.
 
 ## Run with Docker
 
@@ -286,9 +287,9 @@ the Command Policy, [`../policy.example.yaml`](../policy.example.yaml).
 | `QMP_MCP_HTTP_PORT` | `8080` | HTTP listen port. |
 | `QMP_MCP_HTTP_ENDPOINT` | `/mcp` | HTTP MCP endpoint path. |
 | `QMP_MCP_HTTP_ALLOWED_ORIGINS` | loopback origins | Comma-separated browser origins for the DNS-rebinding/CORS guard. |
-| `QMP_MCP_AUTH` | `apikey` | HTTP auth provider: `apikey` \| `jwt` (`jwt` not yet implemented in this variant). |
+| `QMP_MCP_AUTH` | `apikey` | HTTP auth provider: `apikey` (`X-API-Key`) \| `jwt` (`Authorization: Bearer`, HS256). |
 | `QMP_MCP_API_KEYS` | _(empty)_ | Comma-separated API keys (`X-API-Key`) for `apikey` auth. |
-| `QMP_MCP_JWT_SECRET` | _(unset)_ | HS256 signing secret for `jwt` auth. |
+| `QMP_MCP_JWT_SECRET` | _(unset)_ | HS256 signing secret for `jwt` auth (required when `QMP_MCP_AUTH=jwt`). |
 | `QMP_MCP_ALLOW_INSECURE` | `false` | Run HTTP unauthenticated (local dev only). |
 | `QMP_MCP_IMAGE_DIR` | XDG/HOME path | Read-write Image Store directory (ADR-0006). |
 | `QMP_MCP_ISO_DIR` | XDG/HOME path | Read-only ISO Store directory (ADR-0006). |

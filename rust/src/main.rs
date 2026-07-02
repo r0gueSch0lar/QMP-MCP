@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use qmp_mcp::config::{self, AuthMode, Config, TransportMode};
+use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::http;
 use qmp_mcp::instance::hardware_spec::probe_kvm;
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
@@ -69,32 +69,17 @@ async fn main() -> ExitCode {
 }
 
 /// Serve the configured transport(s). Returns an error (which `main` logs and turns
-/// into exit 1) for an unsupported auth mode and for any serve-time failure.
+/// into exit 1) for any serve-time failure.
 ///
 /// Mirrors `../../src/index.ts`: `stdio` serves one auth-free stdio transport;
 /// `http` serves the streamable HTTP transport behind the fail-closed auth +
-/// origin guards; `both` runs stdio and HTTP concurrently. In every case any
-/// running Instance is torn down before returning, so qemu is never orphaned
-/// (ADR-0004).
+/// origin guards (API-key or JWT, per `QMP_MCP_AUTH`); `both` runs stdio and HTTP
+/// concurrently. In every case any running Instance is torn down before returning,
+/// so qemu is never orphaned (ADR-0004).
 async fn run(
     config: Config,
     command_policy: ResolvedPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // JWT auth is defined by the shared config surface but not yet implemented in
-    // this variant; refuse to serve HTTP under it rather than silently ignoring the
-    // configured mode. Fail-closed and actionable (API-key or explicit insecure).
-    if config.transport.exposes_http()
-        && !config.allow_insecure
-        && config.auth_mode == AuthMode::Jwt
-    {
-        return Err(
-            "QMP_MCP_AUTH=jwt is not yet implemented in the Rust variant. \
-             Use QMP_MCP_AUTH=apikey with QMP_MCP_API_KEYS, \
-             or set QMP_MCP_ALLOW_INSECURE=true to run unauthenticated (local dev only)."
-                .into(),
-        );
-    }
-
     // The single-instance Orchestrator, shared behind an async mutex so concurrent
     // tool calls serialise on the one Instance (ADR-0011). It is wired to the real
     // QEMU driver, which spawns `qemu-system-*` on the server-managed QMP UNIX socket
