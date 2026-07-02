@@ -1,0 +1,33 @@
+# Cross-compilation configuration for the qmp-mcp binary.
+#
+# `cargo build --release --target <triple>` produces the server for that host
+# platform. The server is portable Rust (tokio, axum, libc/getrandom on unix); it
+# only needs `qemu-system-*` + `qemu-img` on PATH at RUNTIME on the target host.
+# With no --target, cargo builds for the host. See rust/README.md
+# ("Building for other platforms") for the full matrix and prerequisites.
+#
+# This file is picked up when cargo is invoked from within rust/ (e.g.
+# `cd rust && cargo build --target …`). Run cross-builds from the crate directory.
+
+# --- Linux aarch64 (ARM64), cross-built from an x86_64 Linux host ---
+# Needs the GNU cross linker (Debian/Ubuntu: `apt-get install gcc-aarch64-linux-gnu`),
+# then: `rustup target add aarch64-unknown-linux-gnu`
+#       `cargo build --release --target aarch64-unknown-linux-gnu`
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# --- macOS (x86_64-apple-darwin / aarch64-apple-darwin) ---
+# Build these ON macOS — the Apple SDK + linker are required, and cross-building a
+# macOS binary from Linux needs osxcross (out of scope here). No linker override is
+# needed on a Mac (cargo uses the system `cc`/clang). On macOS:
+#   rustup target add aarch64-apple-darwin x86_64-apple-darwin
+#   cargo build --release --target aarch64-apple-darwin   # Apple Silicon
+#   cargo build --release --target x86_64-apple-darwin    # Intel
+#   # optional universal binary:
+#   lipo -create -output qmp-mcp \
+#     target/aarch64-apple-darwin/release/qmp-mcp \
+#     target/x86_64-apple-darwin/release/qmp-mcp
+#
+# Runtime on macOS: install QEMU with `brew install qemu`. KVM is Linux-only, so
+# `accel: "auto"` resolves to TCG on macOS (no /dev/kvm); hardware HVF acceleration
+# is not yet a spec option.
