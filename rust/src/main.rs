@@ -214,7 +214,10 @@ async fn serve_both(
 /// server owns it; ADR-0004).
 fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> OrchestratorOptions {
     OrchestratorOptions {
-        binary: "qemu-system-x86_64".to_string(),
+        // argv[0] for the launched guest; `QMP_MCP_QEMU_BINARY` selects the
+        // architecture (e.g. `qemu-system-aarch64`), with the Hardware Spec's
+        // `machine`/`cpu` shaping the rest of the argv (issue #15).
+        binary: config.qemu_binary.clone(),
         qmp_socket_path: default_qmp_socket_path(),
         image_dir: Some(config.image_dir.clone()),
         iso_dir: Some(config.iso_dir.clone()),
