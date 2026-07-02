@@ -26,6 +26,8 @@ modes and never needs `--privileged` (ADR-0008).
 - **Rust** 1.96+ (edition 2021) to build.
 - **QEMU** at runtime: `qemu-system-x86_64` and `qemu-img` on `PATH` (the default
   Hardware Spec targets x86; `create_image` shells out to `qemu-img`).
+- **Platforms:** builds and runs on Linux (x86-64, ARM64) and macOS (Intel &
+  Apple Silicon) — see [Building for other platforms](#building-for-other-platforms-cross-compilation).
 
 ## Build
 
@@ -46,6 +48,64 @@ docker compose exec -T rust-dev cargo test
 docker compose exec -T rust-dev cargo clippy --all-targets --all-features -- -D warnings
 docker compose exec -T rust-dev cargo fmt --all -- --check
 ```
+
+## Building for other platforms (cross-compilation)
+
+The server is portable Rust and builds for Linux and macOS. The default target is
+x86-64 Linux; pass `--target <triple>` for the rest, running cargo from the crate
+directory (`rust/`) so the per-target linker settings in
+[`.cargo/config.toml`](./.cargo/config.toml) apply. Add a target's std once with
+`rustup target add <triple>`. Every build needs `qemu-system-*` + `qemu-img` on
+`PATH` at **runtime** on the host it runs on.
+
+| Target triple | Platform | Build on | How |
+| --- | --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | Linux x86-64 (default) | Linux | `cargo build --release` |
+| `aarch64-unknown-linux-gnu` | Linux ARM64 | Linux (cross) | see below |
+| `aarch64-apple-darwin` | macOS Apple Silicon | macOS | see below |
+| `x86_64-apple-darwin` | macOS Intel | macOS | see below |
+
+Release binaries are stripped (`[profile.release] strip = true`).
+
+### macOS
+
+macOS binaries must be built **on macOS** — the Apple SDK + linker are required, and
+cross-building them from Linux needs osxcross (out of scope). No linker override is
+needed on a Mac. On a Mac with the Rust toolchain:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cd rust
+cargo build --release --target aarch64-apple-darwin   # Apple Silicon
+cargo build --release --target x86_64-apple-darwin    # Intel
+# optional single universal (fat) binary spanning both Mac arches:
+lipo -create -output qmp-mcp \
+  target/aarch64-apple-darwin/release/qmp-mcp \
+  target/x86_64-apple-darwin/release/qmp-mcp
+```
+
+Install the runtime with `brew install qemu` (`qemu-system-*` + `qemu-img`). Note:
+KVM is Linux-only, so `accel: "auto"` resolves to **TCG** on macOS (there is no
+`/dev/kvm`); hardware **HVF** acceleration is not yet a Hardware Spec option.
+
+### Linux ARM64 (cross-build from x86-64)
+
+Install the GNU cross linker (already wired in `.cargo/config.toml`), add the
+target, and build:
+
+```bash
+sudo apt-get install -y gcc-aarch64-linux-gnu    # Debian/Ubuntu
+rustup target add aarch64-unknown-linux-gnu
+cd rust && cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+### CI
+
+The `rust-release-linux-amd64` job (in [`../.gitlab-ci.yml`](../.gitlab-ci.yml))
+produces the stripped x86-64 Linux binary as a downloadable artifact — automatically
+on a version tag, and as a **manual** job on `rust`-labelled MRs. macOS and ARM
+artifacts are built with the commands above (on a Mac / macOS runner, or a Linux ARM
+cross-build).
 
 ## Install (the `cargo install` "npx-equivalent")
 

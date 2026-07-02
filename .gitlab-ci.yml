@@ -243,6 +243,35 @@ rust-image:
         echo "Registry credentials not set — built the image but skipping push (push is optional)."
       fi
 
+# Produce the stripped x86-64 Linux release binary of the Rust server as a
+# downloadable artifact. Runs automatically on a version TAG (blocking, so a broken
+# release build fails the tag pipeline); on `rust`-labelled MRs and the default
+# branch it is a MANUAL, non-blocking job so it never gates normal pipelines. macOS
+# and Linux-ARM64 binaries are built with the commands in rust/README.md (on a Mac /
+# macOS runner, or a Linux ARM cross-build) — cross-building macOS from Linux needs
+# osxcross and is intentionally not automated here.
+rust-release-linux-amd64:
+  stage: package
+  extends: .cargo
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)rust(,|$)/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+  script:
+    # x86_64-unknown-linux-gnu is the image's host triple, so no cross toolchain is
+    # needed; --locked honors the committed Cargo.lock for a reproducible build.
+    - cargo build --release --locked --target x86_64-unknown-linux-gnu
+    - install -Dm755 target/x86_64-unknown-linux-gnu/release/qmp-mcp "$CI_PROJECT_DIR/release/qmp-mcp-x86_64-unknown-linux-gnu"
+  artifacts:
+    name: "qmp-mcp-$CI_COMMIT_REF_SLUG-x86_64-linux"
+    paths:
+      - release/qmp-mcp-x86_64-unknown-linux-gnu
+    expire_in: 30 days
+
 # Publish to npm, but ONLY on a version tag and ONLY when an NPM_TOKEN variable is
 # set. `npm publish` runs prepublishOnly (npm run build) to produce dist/ first.
 npm-publish:
