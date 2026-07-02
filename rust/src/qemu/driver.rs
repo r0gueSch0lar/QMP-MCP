@@ -41,6 +41,12 @@ pub struct LaunchRequest {
 #[error("{0}")]
 pub struct DriverError(pub String);
 
+/// A future that resolves when an Instance's qemu process / QMP Session has exited for
+/// ANY reason (crash, guest-initiated poweroff, external kill, or an explicit close).
+/// Boxed so the [`InstanceHandle`] trait stays object-safe. Mirrors the TS
+/// `InstanceProcess.exited` promise.
+pub type ExitedFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// A launched Instance with an established QMP Session. The handle owns the QMP
 /// channel: callers drive the Guest exclusively through [`execute`](InstanceHandle::execute)
 /// and tear everything down with [`close`](InstanceHandle::close).
@@ -65,6 +71,15 @@ pub trait InstanceHandle: Send + Sync {
     /// created, so the buffer spans the Instance's whole life.
     fn subscribe_events(&self) -> broadcast::Receiver<QmpEvent>;
 
+    /// A future that resolves when this Instance's qemu process / QMP Session has
+    /// exited — the hook the Orchestrator's exit-watch task awaits to reconcile a
+    /// crashed / powered-off / externally-killed Instance back to NONE without an
+    /// explicit `destroy_instance` (issue #28). Resolves immediately when the Session
+    /// has already closed. The real driver wires this to the QMP socket close (which
+    /// qemu triggers on exit); the fake driver fires it on `close` or on a
+    /// test-driven simulated exit. Mirrors the TS `InstanceProcess.exited`.
+    fn exited(&self) -> ExitedFuture;
+
     /// Terminate the process and close the QMP Session. Idempotent.
     async fn close(&self) -> Result<(), DriverError>;
 }
@@ -87,6 +102,8 @@ pub trait QemuDriver: Send + Sync {
 
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use tokio::sync::watch;
 
 /// Records every launch and hands back a [`FakeInstanceHandle`]. Spawns no process
 /// and opens no socket; this is what makes the Orchestrator's lifecycle testable
@@ -106,6 +123,11 @@ pub(crate) struct FakeQemuDriver {
     /// later Instance. A test reads this (via [`events_slot`](FakeQemuDriver::events_slot))
     /// after `create_instance` to emit synthetic events into the current Instance.
     last_events: Arc<Mutex<Option<broadcast::Sender<QmpEvent>>>>,
+    /// The exit-signal sender for the MOST-RECENTLY launched Instance. Each launch
+    /// installs a FRESH latch here, so a test can drive an unexpected qemu exit
+    /// (crash/SIGKILL) on the current Instance via [`exit_slot`](FakeQemuDriver::exit_slot)
+    /// — the fake equivalent of the TS fake process's `simulateExit` (issue #28).
+    last_exit: Arc<Mutex<Option<Arc<watch::Sender<bool>>>>>,
 }
 
 #[cfg(test)]
@@ -115,6 +137,7 @@ impl Default for FakeQemuDriver {
             launch_error: None,
             launches: Arc::new(Mutex::new(Vec::new())),
             last_events: Arc::new(Mutex::new(None)),
+            last_exit: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -148,6 +171,16 @@ impl FakeQemuDriver {
     pub(crate) fn events_slot(&self) -> Arc<Mutex<Option<broadcast::Sender<QmpEvent>>>> {
         Arc::clone(&self.last_events)
     }
+
+    /// A handle onto the current Instance's exit-signal sender, readable after a launch
+    /// so a test can drive an unexpected qemu exit (crash/SIGKILL) on the running
+    /// Instance — the equivalent of the TS fake process's `simulateExit`. Sending `true`
+    /// resolves the handle's [`exited`](InstanceHandle::exited) future WITHOUT going
+    /// through `close`, letting a test exercise the Orchestrator's exit-reconciliation
+    /// path (issue #28). Each launch replaces the latch with a fresh one.
+    pub(crate) fn exit_slot(&self) -> Arc<Mutex<Option<Arc<watch::Sender<bool>>>>> {
+        Arc::clone(&self.last_exit)
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +199,11 @@ impl QemuDriver for FakeQemuDriver {
         // emits via the recorded sender clone.
         let (events_tx, _rx) = broadcast::channel(256);
         *self.last_events.lock().expect("fake events slot mutex") = Some(events_tx.clone());
-        Ok(Box::new(FakeInstanceHandle::new(events_tx)))
+        // A fresh per-Instance exit latch: the handle fires it on close (or a test fires
+        // it via the recorded slot to simulate an unexpected qemu exit).
+        let exit_tx = Arc::new(watch::channel(false).0);
+        *self.last_exit.lock().expect("fake exit slot mutex") = Some(Arc::clone(&exit_tx));
+        Ok(Box::new(FakeInstanceHandle::new(events_tx, exit_tx)))
     }
 }
 
@@ -188,17 +225,22 @@ struct FakeInstanceHandle {
     state: Mutex<FakeHandleState>,
     /// The shared synthetic event stream this handle exposes via `subscribe_events`.
     events_tx: broadcast::Sender<QmpEvent>,
+    /// Latches `true` when the Instance "exits" — either an explicit `close` or a
+    /// test-driven simulated unexpected exit (crash/SIGKILL) via the driver's exit slot.
+    /// `exited` resolves once it is set, mirroring the real QMP-session close (issue #28).
+    exit_tx: Arc<watch::Sender<bool>>,
 }
 
 #[cfg(test)]
 impl FakeInstanceHandle {
-    fn new(events_tx: broadcast::Sender<QmpEvent>) -> Self {
+    fn new(events_tx: broadcast::Sender<QmpEvent>, exit_tx: Arc<watch::Sender<bool>>) -> Self {
         Self {
             state: Mutex::new(FakeHandleState {
                 running: true,
                 closed: false,
             }),
             events_tx,
+            exit_tx,
         }
     }
 }
@@ -270,8 +312,21 @@ impl InstanceHandle for FakeInstanceHandle {
         self.events_tx.subscribe()
     }
 
+    fn exited(&self) -> ExitedFuture {
+        let mut rx = self.exit_tx.subscribe();
+        Box::pin(async move {
+            // `wait_for` checks the current value first, so an already-exited handle
+            // resolves at once; an error (sender dropped) also means it is gone.
+            let _ = rx.wait_for(|&exited| exited).await;
+        })
+    }
+
     async fn close(&self) -> Result<(), DriverError> {
         self.state.lock().expect("fake handle mutex").closed = true;
+        // An explicit close also fires the exit latch (mirrors the TS fake's `close`,
+        // which resolves `exited`); the Orchestrator's watcher is guarded so this is a
+        // no-op reconcile.
+        let _ = self.exit_tx.send(true);
         Ok(())
     }
 }
