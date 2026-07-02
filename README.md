@@ -176,6 +176,7 @@ the most-used variables:
 | `QMP_MCP_ALLOW_INSECURE` | `false` | Run HTTP unauthenticated (local dev only). |
 | `QMP_MCP_IMAGE_DIR` | XDG/HOME path | Read-write Image Store directory (ADR-0006). |
 | `QMP_MCP_ISO_DIR` | XDG/HOME path | Read-only ISO Store directory (ADR-0006). |
+| `QMP_MCP_QEMU_BINARY` | `qemu-system-x86_64` | `qemu-system-*` binary launched as argv[0] — selects the guest architecture (e.g. `qemu-system-aarch64`); the Hardware Spec's `machine`/`cpu` still shape the argv. Must be a bare command name or an absolute path (issue #15). |
 | `QMP_MCP_MAX_DISK_GB` | `64` | Hard cap on a created image's virtual size (GiB). |
 | `QMP_MCP_MAX_MEMORY_MB` | `4096` | Hard cap on a spec's `memoryMb`. |
 | `QMP_MCP_MAX_VCPUS` | `2` | Hard cap on a spec's `vcpus`. |

@@ -23,6 +23,7 @@ const DEFAULTS: Config = {
   allowInsecure: false,
   imageDir: DEFAULT_IMAGE_DIR,
   isoDir: DEFAULT_ISO_DIR,
+  qemuBinary: 'qemu-system-x86_64',
   maxDiskGb: 64,
   maxMemoryMb: 4096,
   maxVcpus: 2,
@@ -294,6 +295,48 @@ describe('loadConfig', () => {
     it('derives the default dir from XDG_DATA_HOME, then HOME', () => {
       expect(loadConfig({ XDG_DATA_HOME: '/x/data' }).isoDir).toBe('/x/data/qmp-mcp/isos');
       expect(loadConfig({ HOME: '/home/u' }).isoDir).toBe('/home/u/.local/share/qmp-mcp/isos');
+    });
+  });
+
+  describe('QEMU binary (issue #15)', () => {
+    it('defaults to qemu-system-x86_64 when unset', () => {
+      expect(loadConfig({}).qemuBinary).toBe('qemu-system-x86_64');
+    });
+
+    it('honors an explicit override, selecting the guest architecture', () => {
+      // A non-x86 emulator selects the guest architecture; a bare name and an
+      // absolute path are both accepted, and the value is trimmed.
+      expect(loadConfig({ QMP_MCP_QEMU_BINARY: 'qemu-system-aarch64' }).qemuBinary).toBe(
+        'qemu-system-aarch64',
+      );
+      expect(loadConfig({ QMP_MCP_QEMU_BINARY: ' /usr/bin/qemu-system-riscv64 ' }).qemuBinary).toBe(
+        '/usr/bin/qemu-system-riscv64',
+      );
+    });
+
+    it('treats blank/whitespace-only as unset (falls back to the default)', () => {
+      expect(loadConfig({ QMP_MCP_QEMU_BINARY: '' }).qemuBinary).toBe('qemu-system-x86_64');
+      expect(loadConfig({ QMP_MCP_QEMU_BINARY: '   ' }).qemuBinary).toBe('qemu-system-x86_64');
+    });
+
+    it.each([
+      'qemu; rm -rf',
+      'qemu-system-x86_64 --enable-kvm',
+      'qemu\tsystem',
+      '$(rm -rf /)',
+      'qemu|nc',
+      '../bin/qemu-system-aarch64',
+      './qemu',
+      'build/qemu-system-aarch64',
+    ])('fails closed on the unsafe value %p, naming the variable', (value) => {
+      let thrown: unknown;
+      try {
+        loadConfig({ QMP_MCP_QEMU_BINARY: value });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message).toContain('QMP_MCP_QEMU_BINARY');
     });
   });
 
