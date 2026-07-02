@@ -685,7 +685,7 @@ mod tests {
             start_viewer: None,
             kvm_available: Box::new(|| false),
         };
-        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(Box::new(driver), options)));
+        let orchestrator = Orchestrator::new_shared(Box::new(driver), options);
         let image_store = ImageStore::new(ImageStoreOptions {
             dir: "/nonexistent/qmp-mcp-image-store".to_string(),
             max_disk_gb: 64,

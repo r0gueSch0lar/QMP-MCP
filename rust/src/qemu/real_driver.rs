@@ -23,7 +23,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 
-use super::driver::{DriverError, InstanceHandle, LaunchRequest, QemuDriver};
+use super::driver::{DriverError, ExitedFuture, InstanceHandle, LaunchRequest, QemuDriver};
 use super::qmp_client::QmpClient;
 
 /// How long to wait for QEMU to create and accept on the QMP socket.
@@ -247,6 +247,14 @@ impl InstanceHandle for RealInstanceHandle {
     /// from (slice #24). Delegates to the hand-rolled QMP client's broadcast.
     fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<super::qmp_client::QmpEvent> {
         self.client.subscribe_events()
+    }
+
+    /// The Instance's exit signal — the QMP Session closing, which QEMU triggers when
+    /// its process exits for any reason (crash, guest poweroff, external kill). The
+    /// Orchestrator's exit-watch task awaits this to reconcile the Instance to NONE
+    /// without an explicit destroy (issue #28). Delegates to the hand-rolled QMP client.
+    fn exited(&self) -> ExitedFuture {
+        Box::pin(self.client.exited())
     }
 
     async fn close(&self) -> Result<(), DriverError> {
