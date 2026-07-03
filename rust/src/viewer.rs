@@ -20,7 +20,7 @@
 //! embedded into the page so noVNC auto-authenticates: one human-facing secret, with
 //! the internal VNC password still guarding the loopback VNC from other local
 //! processes as a second layer. A second implementation of the shared bounded context,
-//! mirroring `../../src/viewer/viewer.ts` behaviorally (auth, anti-clickjacking,
+//! mirroring `../../typescript/src/viewer/viewer.ts` behaviorally (auth, anti-clickjacking,
 //! Origin check, connection cap + backpressure + max payload, ws-path enforcement,
 //! cleartext-on-non-loopback warning).
 

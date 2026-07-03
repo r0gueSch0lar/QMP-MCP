@@ -2,7 +2,7 @@
 
 A Rust implementation of qmp-mcp living in this `rust/` subtree, as a second
 implementation of the one shared bounded context (see root `CONTEXT.md`). It targets
-**full behavioral parity** with the TypeScript server in `../src`, built incrementally,
+**full behavioral parity** with the TypeScript server in `../typescript/src`, built incrementally,
 each slice cross-validated against the same domain ADRs and — for the deterministic
 parts — the shared golden fixtures in `../testdata`.
 
@@ -10,7 +10,7 @@ parts — the shared golden fixtures in `../testdata`.
 - **Foundational decisions**: ADR-0011 (rmcp + tokio, `Arc<Mutex>` orchestrator, tower
   auth middleware, hand-rolled dynamic QMP client), ADR-0012 (shared parity fixtures).
   All of ADR-0001…0010 apply unchanged — they are language-agnostic.
-- **Reference implementation**: `../src` (TypeScript, ~317 tests, all 17 tools).
+- **Reference implementation**: `../typescript/src` (TypeScript, ~317 tests, all 17 tools).
 
 ## Tech stance (from the grilling)
 

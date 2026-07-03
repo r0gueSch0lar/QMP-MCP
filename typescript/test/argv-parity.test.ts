@@ -24,7 +24,7 @@ import { type Accel, buildArgv, parseHardwareSpec } from '../src/instance/hardwa
 
 /** A fixed, deterministic QMP socket path stand-in (interpolated verbatim). */
 const SOCKET = '/run/qmp-mcp/qmp.sock';
-const FIXTURES_DIR = fileURLToPath(new URL('../testdata/argv/', import.meta.url));
+const FIXTURES_DIR = fileURLToPath(new URL('../../testdata/argv/', import.meta.url));
 
 interface FixtureOptions {
   accel: Accel;

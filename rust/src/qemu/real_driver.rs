@@ -5,7 +5,7 @@
 //! removes the socket file.
 //!
 //! A second implementation of the shared bounded context, mirroring
-//! `../../src/qemu/real-driver.ts`: same dial/retry loop, the same fail-fast on an
+//! `../../typescript/src/qemu/real-driver.ts`: same dial/retry loop, the same fail-fast on an
 //! early qemu exit, the same refuse-on-occupied-socket startup check, and the same
 //! TERM-then-KILL teardown. The QMP socket path is server-managed and never
 //! network-exposed (a UNIX socket the server owns).

@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { buildPolicy, decideCommand } from '../src/policy/command-policy.js';
 
-const FIXTURES_DIR = fileURLToPath(new URL('../testdata/policy/', import.meta.url));
+const FIXTURES_DIR = fileURLToPath(new URL('../../testdata/policy/', import.meta.url));
 
 interface Fixture {
   command: string;
