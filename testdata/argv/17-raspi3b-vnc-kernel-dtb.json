@@ -1,0 +1,26 @@
+{
+  "description": "A raspi3b SBC (issue #4): fixed hardware means NO -cpu/-smp/-m; it direct-boots an external -kernel + -dtb (by name in the Image Store) with a -append cmdline, mounts the SD image on if=sd, and exposes a loopback VNC Display the noVNC Viewer bridges. console=tty1 puts the console on the framebuffer so the Viewer shows a graphical boot.",
+  "spec": {
+    "machine": "raspi3b",
+    "display": "vnc",
+    "kernel": "kernel8.img",
+    "dtb": "merged.dtb",
+    "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+    "disks": [{ "image": "dietpi.img", "interface": "sd", "format": "raw" }]
+  },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "raspi3b,accel=tcg",
+    "-kernel", "{{IMAGE_DIR}}/kernel8.img",
+    "-dtb", "{{IMAGE_DIR}}/merged.dtb",
+    "-append", "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-drive", "file={{IMAGE_DIR}}/dietpi.img,format=raw,if=sd,media=disk",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

@@ -89,6 +89,16 @@ Which architecture you emulate is part of this too: by default the server launch
 `riscv64`, …) and the same kind of spec builds a guest of that architecture, with the
 `machine` and `cpu` fields shaping the rest.
 
+Some machines don't boot from a disk at all. QEMU's Raspberry Pi boards (`raspi3b` and
+friends) have fixed hardware — a set CPU, core count, and RAM — and they expect the kernel
+handed to them directly rather than read off an SD-card bootloader. For those the spec grows
+three optional fields: **`kernel`** and **`dtb`** (a kernel image and device-tree blob, each
+a name in the Image Store) and **`appendCmdline`** (the kernel command line). The server
+emits `-kernel`/`-dtb`/`-append` and, because the board's hardware is fixed, omits
+`-cpu`/`-smp`/`-m`; attach the SD image with `"interface": "sd"` (sized to a power of two, or
+QEMU refuses it). None of this is Pi-only — any direct-kernel boot (a bare `virt` machine,
+say) can use `kernel`/`appendCmdline` alongside the usual CPU and memory settings.
+
 ### How fast it runs: the accelerator
 
 `accel: "auto"` (the default) uses hardware **KVM** when the host can reach a `/dev/kvm`,
@@ -276,6 +286,31 @@ Start the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, then:
 
 (If you also need to *build* the Rust binary for a non-x86 host, see its
 [cross-compilation guide](rust/README.md#building-for-other-platforms).)
+
+### 6. Emulate a Raspberry Pi board
+
+QEMU's Raspberry Pi machines boot a kernel directly and render a framebuffer you can watch
+in the browser Viewer. Put the extracted kernel and device tree in the Image Store, start
+the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, and:
+
+> *"Boot a Raspberry Pi 3 and show me the console."*
+
+```json
+{
+  "machine": "raspi3b",
+  "accel": "tcg",
+  "kernel": "kernel8.img",
+  "dtb": "bcm2710-rpi-3-b.dtb",
+  "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+  "disks": [{ "image": "raspios.img", "interface": "sd", "format": "raw" }],
+  "display": "vnc"
+}
+```
+
+`console=tty1` puts the console on the framebuffer, so the noVNC Viewer shows the Pi booting
+— logos and all. No `cpu`/`vcpus`/`memoryMb`: the board's hardware is fixed. (On a Pi 3,
+merge the `disable-bt` device-tree overlay into the dtb first, or the console stays glued to
+the Bluetooth-shared UART instead of the screen.)
 
 ## Choosing an implementation
 
