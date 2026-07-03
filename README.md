@@ -1,176 +1,329 @@
 # qmp-mcp
 
-Give an AI agent its own virtual machine — one it can build, boot, drive, and tear
-down on its own, without ever letting it near your host.
+**qmp-mcp** is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server
+that gives an AI agent the controls of a single [QEMU](https://www.qemu.org) virtual
+machine. The agent describes the hardware it wants; the server builds that machine, boots
+it, and exposes a set of tools to drive it — pause and resume it, reset it, watch its
+screen, send it low-level QEMU commands, react to its events, and tear it down when it's
+finished.
 
-**qmp-mcp** is a [Model Context Protocol](https://modelcontextprotocol.io) server that
-hands an AI assistant the controls of a single [QEMU](https://www.qemu.org) virtual
-machine. The agent describes the hardware it wants — CPU, memory, disks, a boot ISO,
-networking — and the server builds and runs it, then exposes tools to pause it, reset
-it, watch its screen, send commands over QEMU's control channel, and clean it up when
-it's done.
+The whole design rests on one idea: the *tools are the boundary*. The agent never hands
+raw arguments to QEMU or reaches into your filesystem. It fills in a structured, validated
+description of the machine; the server turns that into a locked-down QEMU command line and
+mediates every request. Everything the agent can touch — disk images, boot media, the
+commands it can run against the live VM, the ports it can open — passes through allowlists
+you control. The VM is the blast radius, and the tools are the walls.
 
-The trick that makes this safe to hand to an autonomous agent: it never gets to pass
-raw arguments to QEMU or touch arbitrary files on your machine. It fills in a
-structured *hardware spec* that the server validates and turns into a locked-down QEMU
-command line. Everything the agent can reach — disk images, boot ISOs, the commands it
-can send the running VM — goes through allowlists you control.
+It ships as **two interchangeable implementations** — one in
+**[TypeScript](typescript/)**, one in **[Rust](rust/)** — that behave identically. This
+page explains what the server *is* and how it thinks; the per-implementation READMEs cover
+installing, running, and deploying each one.
 
-## Why you might want this
+> New to the vocabulary? [`CONTEXT.md`](CONTEXT.md) is the one-page glossary. The words
+> below — *Instance*, *Guest*, *Hardware Spec*, *Command Policy*, *Image Store*, *Viewer*
+> — each mean something specific, and this README uses them deliberately.
 
-- **Let an agent do real systems work.** Spin up a throwaway Linux box, install
-  something, test it, tear it down — driven entirely by an assistant, on a real kernel
-  with real hardware emulation, not a sandbox that only pretends.
-- **Keep it contained.** The VM is the blast radius. The agent can't run arbitrary
-  QEMU flags, can't read or write files outside the folders you designate, and can't
-  open network ports you didn't allow. The server runs unprivileged and won't expose
-  anything over the network without authentication.
-- **Watch it happen.** Turn on the optional browser viewer and you get a live noVNC
-  window into the guest's screen — handy for booting an installer, or just seeing what
-  the agent is up to.
+## How it works
 
-## What the agent can do
+### One machine at a time: the Instance
 
-Once it's connected, an assistant has tools to:
+The server manages exactly one **Instance** — the running `qemu-system-*` process together
+with its hardware configuration and the live control connection to it. There's never more
+than one; asking to create another while one exists is refused. An Instance's life is tied
+to the server's: shut the server down and it tears the VM down with it, so nothing is left
+orphaned.
 
-- **Build & run a VM** from a validated hardware spec (machine type, CPU, memory,
-  vCPUs, disks, a boot ISO, a display) — and tear it back down.
-- **Drive its lifecycle** — pause and resume the CPUs, hard-reset it, ask for a
-  graceful shutdown.
-- **Inspect it** — the current run state, block devices, per-CPU info, and a PNG
-  screenshot of the display.
-- **Send control commands** to the live VM (`qmp_execute`), gated by a policy so only
-  safe ones get through.
-- **React to events** — read the VM's recent QEMU events, or block until a specific
-  one arrives (a shutdown, a reset, …).
-- **Manage media** — create disk images, and list the disks and boot ISOs it's
-  allowed to use.
+An Instance moves through a small lifecycle — from nothing, to starting, to **running**,
+optionally **paused** and back, to stopped, and back to nothing:
 
-## Two implementations, same behavior
-
-This repo ships the server twice:
-
-- **[`typescript/`](typescript/)** — the original, on Node and the `mcp-framework` SDK.
-- **[`rust/`](rust/)** — a second implementation on the official Rust MCP SDK (`rmcp`)
-  and tokio, distributable as a single self-contained binary.
-
-They are behaviorally identical: same tools, same hardware-spec validation, same
-security rules, same environment variables. And they're kept honest against each
-other — a shared set of golden fixtures in [`testdata/`](testdata/) pins the exact QEMU
-command line each hardware spec must produce and the exact verdict the command policy
-must return, and **both** servers are tested against that same corpus. Drift on either
-side fails the build.
-
-Pick whichever fits your stack. Not sure? Start with `typescript/` if you live in Node;
-reach for `rust/` if you'd rather ship one binary.
-
-## Quick start (using it)
-
-You need **QEMU installed** wherever the server runs — it shells out to `qemu-system-*`
-and `qemu-img`. (The Docker images bundle it for you.)
-
-Nothing is published to a public registry yet, so the paths that work today start from
-a checkout of this repo.
-
-### Run it in Docker
-
-```bash
-git clone <this-repo> qmp-mcp && cd qmp-mcp
-
-# TypeScript image:
-docker build -f typescript/Dockerfile -t qmp-mcp typescript
-# …or the Rust image:
-docker build -f rust/Dockerfile -t qmp-mcp:rust rust
-
-docker run --rm -p 8080:8080 \
-  -e QMP_MCP_API_KEYS=pick-a-strong-key \
-  -v qmp-images:/var/lib/qmp-mcp/images \
-  -v qmp-isos:/var/lib/qmp-mcp/isos \
-  qmp-mcp            # or qmp-mcp:rust
+```
+NONE → STARTING → RUNNING ⇄ PAUSED → STOPPED → NONE
 ```
 
-The HTTP transport **won't start without authentication** — you either give it an API
-key (sent in the `X-API-Key` header) or explicitly opt into insecure mode for local
-tinkering. A server that can build and run VMs has no business being reachable
-unauthenticated.
+If the underlying QEMU process exits on its own — a guest shutdown, a crash, an external
+kill — the server notices and reconciles back to `NONE`, so the next request starts from a
+clean slate.
 
-Faster VMs are one flag away: add `--device /dev/kvm --group-add "$(getent group kvm |
-cut -d: -f3)"` for hardware acceleration. Without it you get TCG software emulation,
-which works anywhere with zero privileges.
+The thing running *inside* the Instance — the operating system or workload — is the
+**Guest**. The server manages the machine; what you install and run on it is up to you and
+your agent.
 
-### Or point a stdio client straight at it
+### Describing the machine: the Hardware Spec
 
-Most MCP clients launch a server over stdio. From a checkout:
+The agent doesn't run QEMU. It submits a **Hardware Spec** — a structured, validated
+description of the machine it wants: machine type and CPU, how many vCPUs and how much
+memory, which disks and boot media, the network, the display, the accelerator. The server
+validates every field and *generates* the QEMU command line from it. The agent never
+supplies raw argv.
 
-```jsonc
+A spec is just the JSON arguments to `create_instance`:
+
+```json
 {
-  "mcpServers": {
-    "qmp": {
-      "command": "node",                     // TypeScript: after `cd typescript && npm ci && npm run build`
-      "args": ["typescript/dist/index.js"],
-      "env": {
-        "QMP_MCP_IMAGE_DIR": "/srv/qmp/images",
-        "QMP_MCP_ISO_DIR":   "/srv/qmp/isos"
-      }
-    }
-  }
+  "machine": "q35",
+  "cpu": "host",
+  "vcpus": 2,
+  "memoryMb": 2048,
+  "accel": "auto",
+  "disks": [{ "image": "root.qcow2" }],
+  "cdrom": { "iso": "debian-13.iso" },
+  "boot": "dc",
+  "display": "vnc"
 }
 ```
 
-Then ask your assistant something like *"create a VM with 2 GB of RAM and boot the
-Alpine ISO in my ISO folder"* and watch it call `create_instance`.
+Validation isn't a formality — it's the safety boundary. Fields are range- and
+character-checked, and anything that could smuggle an extra option into the command line (a
+stray comma in a disk entry, say) is escaped or rejected. Sizes are capped, with ceilings
+you set on disk, memory, and vCPUs. If a spec is invalid, `create_instance` fails *before*
+QEMU is launched, with a message that says exactly what was wrong.
 
-Per-implementation install and run details (npm/`npx`, `cargo install`, transports,
-the browser viewer) live in **[`typescript/README.md`](typescript/README.md)** and
-**[`rust/README.md`](rust/README.md)**.
+There is an escape hatch — **extraArgs**, which appends raw QEMU flags to the generated
+command line — but it's off unless you explicitly enable it. It's meant for trusted,
+single-tenant setups where you've decided the agent can be handed the keys.
 
-### Watching the screen
+Which architecture you emulate is part of this too: by default the server launches
+`qemu-system-x86_64`, but point `QMP_MCP_QEMU_BINARY` at `qemu-system-aarch64` (or
+`riscv64`, …) and the same kind of spec builds a guest of that architecture, with the
+`machine` and `cpu` fields shaping the rest.
 
-Set `QMP_MCP_VIEWER_PASSWORD`, ask for a VM with a `vnc` display, and open
-`http://<host>:6080/` in a browser (publish port `6080` too if you're in Docker). You
-get an interactive noVNC session into the guest. The raw VNC port never leaves
-loopback, and the viewer is password-gated.
+### How fast it runs: the accelerator
 
-## How it keeps you safe
+`accel: "auto"` (the default) uses hardware **KVM** when the host can reach a `/dev/kvm`,
+and otherwise falls back to **TCG** software emulation — reporting which it chose. Ask for
+`kvm` explicitly and it fails loudly if KVM isn't available; ask for `tcg` and you always
+get portable, zero-privilege emulation. KVM is never required — it's a performance upgrade
+you opt into, not a privilege the server demands.
 
-Handing VM controls to an autonomous agent only works if the controls *are* the
-boundary. The choices that make that true:
+### Driving the running VM: the QMP Session
 
-- **No raw QEMU.** The agent fills a structured hardware spec; the server generates the
-  command line. Fields are range- and character-checked, and values that could smuggle
-  extra options (a comma inside a `-drive`, say) are escaped or rejected. There's an
-  `extraArgs` escape hatch for raw flags — off unless you turn it on.
-- **Files stay in their lane.** Guest disk images live in one folder you designate
-  (read-write); boot ISOs in another (read-only). The agent references them by name,
-  and a name that tries to climb out — `../`, a symlink, an absolute path — is refused.
-- **A command allowlist.** The generic `qmp_execute` runs arbitrary QEMU Machine
-  Protocol commands, but only ones on a default-safe allowlist. A hard denylist can
-  never be re-enabled; you can tighten or widen the rest with an env var or a policy
-  file.
-- **Sandboxed networking.** Guests get user-mode networking by default; port-forwards
-  are limited to a non-privileged range and bound to loopback.
-- **Fail-closed and unprivileged.** The HTTP transport refuses to start without auth.
-  The server runs as a non-root user and never needs `--privileged` — hardware
-  acceleration is an opt-in device, not a requirement.
+Once an Instance is up, the server talks to it over the **QMP Session** — QEMU's own
+Machine Protocol, a JSON control channel on a private socket the server owns and never
+exposes on the network. The server negotiates the session at launch (reads the greeting,
+sends `qmp_capabilities`), and from then on every "drive the VM" tool is a QMP command
+underneath: `pause_instance` stops the CPUs, `get_status` asks QEMU its run state,
+`screendump` grabs a framebuffer snapshot, and so on.
+
+For anything without a purpose-built tool, there's `qmp_execute` — a generic "run this QMP
+command" — which brings us to the guardrail on it.
+
+### What the agent may command: the Command Policy
+
+`qmp_execute` could in principle run *any* QMP command, which is both powerful and
+dangerous. The **Command Policy** decides which ones actually go through. Out of the box
+it's a safe-by-default allowlist; genuinely dangerous commands — `migrate`,
+`dump-guest-memory`, `human-monitor-command`, and their kin — sit behind a **hard denylist
+that can't be re-enabled**. You can widen or narrow the middle ground with an environment
+variable or a policy file.
+
+One subtlety: the policy gates commands by *name*, not by their arguments. So a command
+whose *arguments* could be dangerous — a screen capture that writes to a host file, for
+instance — isn't exposed through the generic tool at all. It gets a purpose-built tool that
+validates the arguments for you.
+
+### Where files live: the Image Store and ISO Store
+
+The agent refers to disks and boot media *by name*, never by host path — and those names
+resolve inside two folders you designate:
+
+- The **Image Store** is a single read-write directory for guest disk images. The agent
+  can list what's there and create new blank images in it, and disks in a spec are looked
+  up by name within it.
+- The **ISO Store** is a separate read-only directory for installation and boot ISOs.
+  Keeping it distinct means install media can never be written to.
+
+Both are enforced with real-path containment: a name that tries to climb out — `../`, an
+absolute path, a symlink pointing elsewhere — is refused. These two folders *are* the
+agent's view of the filesystem; it has no other.
+
+### Sandboxed networking
+
+Guests get user-mode networking by default — a sandboxed NAT stack, no host privileges, no
+bridge. To reach a service inside the guest you add **host forwards**, and those are
+bounded: only ports in a non-privileged range, bound to loopback.
+
+```json
+{ "network": { "hostForwards": [{ "hostPort": 2222, "guestPort": 22 }] } }
+```
+
+Host-level networking (`tap`/`bridge`) exists but is gated off unless you turn it on — it
+needs privileges that don't fit the server's unprivileged posture.
+
+### Watching what happens: events, the Display, and the Viewer
+
+Two ways to see what the VM is doing:
+
+- **Events.** QEMU emits async events — a reset, a shutdown, a device change. The server
+  keeps a bounded ring buffer of the recent ones for the current Instance, and the agent
+  reads it pull-style: `get_events` drains what's new since a cursor, `wait_for_event`
+  blocks until a named event arrives (or times out). No firehose to manage.
+- **The Display and the Viewer.** Ask for a `vnc` **Display** in the spec and QEMU exposes
+  the guest's screen over VNC, on loopback only. Turn on the **Viewer** — an optional,
+  in-process noVNC bridge — and you can watch and control that screen in a browser. The
+  Viewer is password-gated and reads the Display *only*; it never touches the QMP Session.
+  It's ideal for babysitting an OS installer, or just seeing what the agent sees.
+
+### Talking to the server: transports and authentication
+
+The server speaks MCP over **stdio** (the default — how most clients launch a server
+directly; no network, no auth) or over **HTTP** (for a networked deployment), or both at
+once. The HTTP transport is **fail-closed**: it refuses to start without authentication —
+an API key, or a signed HS256 token — unless you explicitly opt into insecure mode for
+local use. A server that can build and run VMs has no business being reachable
+unauthenticated. It runs as a non-root user in every mode and never needs `--privileged`.
+
+## The tools
+
+The agent's vocabulary — the actions it can take:
+
+| Tool | What it does |
+| --- | --- |
+| `create_instance` / `destroy_instance` | build & launch the Instance from a Hardware Spec / tear it down |
+| `get_instance` / `get_status` | the current Instance + lifecycle state / the live guest run state |
+| `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
+| `reset_instance` / `powerdown_instance` | hard reset / request a graceful ACPI shutdown |
+| `list_block_devices` / `query_cpus` | the VM's disks & backing media / per-CPU info |
+| `screendump` | a PNG screenshot of the Display |
+| `get_events` / `wait_for_event` | recent QEMU events / block until a named one arrives |
+| `qmp_execute` | a raw QMP command, gated by the Command Policy |
+| `create_image` / `list_images` / `list_isos` | make a disk image / list disks / list boot ISOs |
+
+For the exact per-implementation tool tables, see the
+[TypeScript](typescript/README.md#the-tools) and [Rust](rust/README.md#the-tools) READMEs.
+
+## Quick start: common scenarios
+
+The server runs wherever QEMU is installed. First get one of the implementations running
+and point your MCP client at it —
+**[run the TypeScript variant](typescript/README.md#run-it)** or
+**[run the Rust variant](rust/README.md#run-it)** — then ask your agent to do something.
+The scenarios below are what that looks like: each is a Hardware Spec (the arguments to
+`create_instance`) plus whatever you had to put in place first.
+
+### 1. A scratch VM to poke at
+
+Nothing to set up — just ask for a small machine and drive it.
+
+> *"Boot a 1 GB Linux VM and tell me its run state."*
+
+The agent calls `create_instance` with a minimal spec, then `get_status`; `destroy_instance`
+cleans up:
+
+```json
+{ "machine": "q35", "cpu": "host", "vcpus": 1, "memoryMb": 1024, "accel": "auto" }
+```
+
+(With no disk or ISO there's nothing to boot — perfect for a smoke test; add media for the
+real thing.)
+
+### 2. Install an OS from an ISO
+
+Put the installer ISO in your **ISO Store** folder; the agent creates a blank disk for it
+and boots from the CD first (`boot: "dc"`).
+
+> *"Create a 20 GB disk and install Debian from debian-13.iso onto it."*
+
+It calls `create_image` (into the Image Store), then `create_instance`:
+
+```json
+{
+  "machine": "q35", "cpu": "host", "vcpus": 2, "memoryMb": 2048, "accel": "auto",
+  "disks": [{ "image": "debian.qcow2" }],
+  "cdrom": { "iso": "debian-13.iso" },
+  "boot": "dc",
+  "display": "vnc"
+}
+```
+
+Because it asked for `display: "vnc"`, you can watch the installer run — see scenario 4.
+
+### 3. A headless server you can SSH into
+
+Add a **host forward** so a port on your host reaches a port in the guest.
+
+> *"Run my server image headless and forward host port 2222 to guest 22."*
+
+```json
+{
+  "machine": "q35", "cpu": "host", "vcpus": 2, "memoryMb": 2048, "accel": "auto",
+  "disks": [{ "image": "server.qcow2" }],
+  "network": { "hostForwards": [{ "hostPort": 2222, "guestPort": 22 }] }
+}
+```
+
+Once it's booted, `ssh -p 2222 user@localhost` from the host reaches the guest's SSH.
+
+### 4. Watch it in a browser
+
+Set `QMP_MCP_VIEWER_PASSWORD`, ask for a `vnc` display, and open the Viewer. The setup
+details are in the [TypeScript](typescript/README.md#browser-viewer) /
+[Rust](rust/README.md#browser-viewer) READMEs; any spec with `"display": "vnc"` then gets a
+live, interactive screen at `http://<host>:6080/`.
+
+### 5. Emulate a different architecture
+
+Point the server at another emulator and pick a matching machine and CPU.
+
+> *"Bring up an ARM64 virtual machine."*
+
+Start the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, then:
+
+```json
+{ "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 2048, "accel": "tcg" }
+```
+
+(If you also need to *build* the Rust binary for a non-x86 host, see its
+[cross-compilation guide](rust/README.md#building-for-other-platforms).)
+
+## Choosing an implementation
+
+The two are interchangeable — same tools, same specs, same behavior, continuously checked
+against each other. Pick by ecosystem:
+
+| | TypeScript | Rust |
+| --- | --- | --- |
+| Built on | Node + `mcp-framework` | `rmcp` + tokio |
+| Ships as | an npm package / `node dist/index.js` | a single self-contained binary |
+| Get it running | [Run it →](typescript/README.md#run-it) | [Run it →](rust/README.md#run-it) |
+| In Docker | [Docker →](typescript/README.md#docker) | [Docker →](rust/README.md#docker) |
+
+Everything deployment- and usage-specific lives in those two READMEs:
+
+- **TypeScript** — [Run it](typescript/README.md#run-it) ·
+  [Transports & auth](typescript/README.md#transports) ·
+  [Docker](typescript/README.md#docker) ·
+  [Browser viewer](typescript/README.md#browser-viewer) ·
+  [Configuration](typescript/README.md#configuration) ·
+  [Developing](typescript/README.md#developing)
+- **Rust** — [Run it](rust/README.md#run-it) ·
+  [Transports & auth](rust/README.md#transports) ·
+  [Docker](rust/README.md#docker) ·
+  [KVM acceleration](rust/README.md#faster-vms-with-kvm) ·
+  [Browser viewer](rust/README.md#browser-viewer) ·
+  [Cross-compilation](rust/README.md#building-for-other-platforms) ·
+  [Configuration](rust/README.md#configuration) ·
+  [Developing](rust/README.md#developing)
 
 ## Configuration
 
-Everything is configured through `QMP_MCP_*` environment variables — the **same names
-and defaults for both implementations**. The fully-commented reference is in
-**[`.env.example`](.env.example)**, and the command-policy file format in
-**[`policy.example.yaml`](policy.example.yaml)**. The ones you'll reach for most:
+Both implementations are configured entirely through `QMP_MCP_*` environment variables —
+**the same names and defaults for each**. The fully-commented reference is
+[`.env.example`](.env.example), and the command-policy file format is
+[`policy.example.yaml`](policy.example.yaml). The ones you'll reach for:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `QMP_MCP_TRANSPORT` | `stdio` | `stdio`, `http`, or `both` |
-| `QMP_MCP_API_KEYS` | _(unset)_ | comma-separated API keys for the HTTP transport (required unless insecure) |
-| `QMP_MCP_QEMU_BINARY` | `qemu-system-x86_64` | which emulator to launch — set `qemu-system-aarch64` for ARM guests, etc. |
-| `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the read-write disk folder / read-only ISO folder |
-| `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the noVNC viewer (required to request a `vnc` display) |
-| `QMP_MCP_ALLOW_RAW_ARGS` | `false` | let a spec pass raw QEMU flags (the escape hatch) |
+| `QMP_MCP_API_KEYS` | _(unset)_ | API keys for the HTTP transport (required unless insecure) |
+| `QMP_MCP_QEMU_BINARY` | `qemu-system-x86_64` | which emulator to launch — i.e. the guest architecture |
+| `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
+| `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
+| `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |
 
-…plus caps on disk/memory/vCPUs, the port-forward range, the command-policy allow/deny
-lists, and the event-buffer size. See `.env.example` for the whole list.
+…plus caps on disk/memory/vCPUs, the host-forward port range, the Command Policy allow/deny
+lists and policy file, and the Event Buffer size. See [`.env.example`](.env.example) for
+the full list, or each variant's Configuration section in context
+([TypeScript](typescript/README.md#configuration) · [Rust](rust/README.md#configuration)).
 
 ## For developers
 
@@ -180,41 +333,31 @@ lists, and the event-buffer size. See `.env.example` for the whole list.
 qmp-mcp/
 ├── typescript/          the Node / mcp-framework implementation
 ├── rust/                the Rust / rmcp implementation
-├── testdata/            shared golden fixtures both implementations test against
+├── testdata/            shared golden fixtures both implementations assert
 ├── docs/                design notes and rationale
 ├── CONTEXT.md           the domain glossary — the shared vocabulary
 ├── .env.example         every QMP_MCP_* variable, commented
 └── policy.example.yaml  the command-policy file format
 ```
 
-The two implementations are independent codebases that share three things at the repo
-root: the **domain model** ([`CONTEXT.md`](CONTEXT.md) — read it first; words like
-*Instance*, *Hardware Spec*, *Command Policy*, *Image Store*, and *Viewer* mean
-specific things), the **golden fixtures** ([`testdata/`](testdata/)), and the **config
-surface** ([`.env.example`](.env.example)).
+The two implementations are independent codebases that share three things at the root: the
+**domain model** ([`CONTEXT.md`](CONTEXT.md) — read it first), the **golden fixtures**
+([`testdata/`](testdata/)), and the **config surface** ([`.env.example`](.env.example)).
 
-### Working on a variant
+### How the two stay identical
 
-Each implementation is self-contained in its folder, with its own README, build, and
-tests:
+Parity here isn't a promise, it's a test. [`testdata/`](testdata/) holds language-neutral
+golden fixtures that pin the exact QEMU command line each Hardware Spec must produce and the
+exact verdict the Command Policy must return — and **both** implementations are tested
+against that same corpus. Change how a spec becomes a command line, or what the policy
+allows, and you update the shared fixture; the TypeScript suite *and* the Rust suite have to
+agree, or the build fails. Teach one implementation a new trick and you add the fixture the
+other has to satisfy.
 
-- **TypeScript** → [`typescript/README.md`](typescript/README.md). In short:
-  `cd typescript && npm ci && npm test`.
-- **Rust** → [`rust/README.md`](rust/README.md). In short: `cd rust && cargo test`.
-
-This repo runs its toolchains in Docker so they never clutter your host — each variant's
-README has the specifics.
-
-### Keeping the two in sync
-
-The whole point of `testdata/` is that parity isn't a promise, it's a test. Change how
-a hardware spec becomes a command line, or what the command policy allows, and you
-update the shared fixture — which is asserted by the TypeScript suite *and* the Rust
-suite. So when you teach one implementation a new trick, add the matching fixture and
-the other has to keep up.
-
-The [`docs/`](docs/) folder has the longer-form rationale behind the trickier design
-decisions, if you want the "why."
+Working on a variant is self-contained in its folder —
+[developing TypeScript](typescript/README.md#developing) ·
+[developing Rust](rust/README.md#developing). The [`docs/`](docs/) folder holds the
+longer-form rationale behind the trickier decisions.
 
 ## License
 
