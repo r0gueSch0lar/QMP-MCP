@@ -11,7 +11,9 @@ import { describe, expect, it } from 'vitest';
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = dirname(here);
+// This file lives at typescript/src/; the shared .env.example is two levels up at
+// the repo root (the config surface is shared by both implementations).
+const repoRoot = dirname(dirname(here));
 const ENV_VAR = /QMP_MCP_[A-Z0-9_]+/g;
 
 /** Recursively collect non-test `.ts` source files under a directory. */

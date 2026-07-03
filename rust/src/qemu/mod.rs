@@ -1,6 +1,6 @@
 //! The QEMU integration boundary: the single injectable driver seam the
 //! Orchestrator depends on (ADR-0011). A second implementation of the shared
-//! bounded context, mirroring `../../src/qemu/*`.
+//! bounded context, mirroring `../../typescript/src/qemu/*`.
 //!
 //! The seam itself is the [`driver::QemuDriver`] port with its in-memory
 //! [`driver::FakeQemuDriver`] test double (slice #20). The production driver

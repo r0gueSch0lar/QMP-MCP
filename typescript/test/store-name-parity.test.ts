@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { assertValidImageName } from '../src/instance/image-store.js';
 
-const FIXTURES_DIR = fileURLToPath(new URL('../testdata/store-name/', import.meta.url));
+const FIXTURES_DIR = fileURLToPath(new URL('../../testdata/store-name/', import.meta.url));
 
 interface Fixture {
   name: string;

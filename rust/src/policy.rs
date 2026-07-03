@@ -2,7 +2,7 @@
 //! tool may run a given QMP command **name**.
 //!
 //! A second implementation of the shared bounded context, mirroring
-//! `../../src/policy/command-policy.ts` — the same three layers, in strict
+//! `../../typescript/src/policy/command-policy.ts` — the same three layers, in strict
 //! precedence:
 //!
 //!   1. An immutable HARD DENYLIST ([`HARD_DENYLIST`]). A command on it is ALWAYS
