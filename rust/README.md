@@ -7,7 +7,7 @@ API. The agent never supplies raw QEMU arguments: it fills a structured, validat
 **Hardware Spec** and the server generates the `qemu-system-*` argv from it.
 
 This is the **Rust variant** — a second implementation of the same bounded context as
-the TypeScript server in [`../src`](../src), built on the official MCP Rust SDK
+the TypeScript server in [`../typescript/src`](../typescript/src), built on the official MCP Rust SDK
 ([`rmcp`](https://docs.rs/rmcp) 0.16) + [tokio](https://tokio.rs), and targeting full
 behavioral parity (same spec → same argv, same Command Policy verdicts, same
 fail-closed behavior). See [`../CONTEXT.md`](../CONTEXT.md) for the domain glossary

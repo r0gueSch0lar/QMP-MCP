@@ -2,7 +2,7 @@
 //!
 //! QMP is QEMU's own JSON protocol, spoken over a UNIX socket as newline-delimited
 //! JSON objects in both directions. This is a second implementation of the shared
-//! bounded context, mirroring `../../src/qemu/qmp-client.ts` behaviorally: same
+//! bounded context, mirroring `../../typescript/src/qemu/qmp-client.ts` behaviorally: same
 //! handshake sequence, same id-correlation, the same per-command timeout semantics,
 //! and the same `{class, desc}` error mapping.
 //!

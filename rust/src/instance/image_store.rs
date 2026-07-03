@@ -8,7 +8,7 @@
 //! reuses verbatim so the two stores cannot drift. [`resolve_image_path`] and
 //! [`assert_valid_image_name`] are thin Image-Store-flavoured wrappers over it, kept
 //! exported so every traversal case stays unit-testable without spawning anything.
-//! Mirrors `../../src/instance/image-store.ts`.
+//! Mirrors `../../typescript/src/instance/image-store.ts`.
 
 use std::path::Path;
 use std::sync::Arc;

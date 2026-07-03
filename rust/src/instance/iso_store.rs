@@ -9,7 +9,7 @@
 //! same shared [`resolve_in_store`] the Image Store uses, specialised only by
 //! [`ISO_LABELS`]. Sharing one resolver is the whole point: the security-critical
 //! code exists once and both stores move together. Mirrors
-//! `../../src/instance/iso-store.ts`.
+//! `../../typescript/src/instance/iso-store.ts`.
 
 use schemars::JsonSchema;
 use serde::Serialize;
