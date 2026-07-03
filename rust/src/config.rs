@@ -1,7 +1,7 @@
 //! Configuration surface for the server, parsed from `QMP_MCP_*` environment
 //! variables. This module is a **pure function of its input env map**: it never
 //! reads the process environment directly, which keeps it trivially unit-testable
-//! (mirroring `../../src/config.ts`).
+//! (mirroring `../../typescript/src/config.ts`).
 //!
 //! Fail-closed: any value that is present but invalid returns a [`ConfigError`]
 //! naming the offending variable and the allowed values, rather than silently
@@ -140,7 +140,7 @@ pub const DEFAULT_HOSTFWD_PORT_RANGE: PortRange = PortRange {
 };
 
 /// The validated configuration. Every field mirrors `Config` in
-/// `../../src/config.ts` (same defaults and validation).
+/// `../../typescript/src/config.ts` (same defaults and validation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Which transport(s) the server should expose.

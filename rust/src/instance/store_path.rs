@@ -16,7 +16,7 @@
 //! never `.`/`..`. Nested names are rejected. This keeps every store flat, makes
 //! the traversal analysis trivial (the only path component below the store is the
 //! leaf itself), and is the simplest thing that is obviously correct. Mirrors
-//! `../../src/instance/store-path.ts`.
+//! `../../typescript/src/instance/store-path.ts`.
 
 use std::path::{Path, PathBuf};
 

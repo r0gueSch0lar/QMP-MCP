@@ -30,12 +30,14 @@ workflow:
 cache:
   key:
     files:
-      - package-lock.json
+      - typescript/package-lock.json
   paths:
     - .npm/
 
+# The TypeScript variant lives in typescript/, so every Node job runs from there.
 .node:
   before_script:
+    - cd typescript
     - npm ci
 
 lint:
@@ -63,7 +65,7 @@ build:
     - npm run build
   artifacts:
     paths:
-      - dist/
+      - typescript/dist/
     expire_in: 1 week
 
 # Auto-merge the merge request once this pipeline (lint -> typecheck -> test ->
@@ -110,12 +112,12 @@ docker-build:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
-        - Dockerfile
-        - .dockerignore
-        - package.json
-        - package-lock.json
-        - tsconfig.json
-        - src/**/*
+        - typescript/Dockerfile
+        - typescript/.dockerignore
+        - typescript/package.json
+        - typescript/package-lock.json
+        - typescript/tsconfig.json
+        - typescript/src/**/*
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
   image: docker:27
@@ -139,7 +141,7 @@ docker-build:
       done
       docker info
   script:
-    - docker build -t "qmp-mcp:${CI_COMMIT_SHORT_SHA}" .
+    - docker build -f typescript/Dockerfile -t "qmp-mcp:${CI_COMMIT_SHORT_SHA}" typescript
     - |
       if [ -n "$CI_REGISTRY" ] && [ -n "$CI_REGISTRY_IMAGE" ] && [ -n "$CI_REGISTRY_USER" ] && [ -n "$CI_REGISTRY_PASSWORD" ]; then
         echo "Registry credentials present — pushing the image."
@@ -293,4 +295,6 @@ npm-publish:
     - echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
     - npm publish
   after_script:
-    - rm -f .npmrc
+    # after_script runs in a fresh shell (no `cd typescript` from before_script),
+    # so clean the .npmrc at its real path under the crate directory.
+    - rm -f typescript/.npmrc
