@@ -1,5 +1,7 @@
 # qmp-mcp
 
+[![CI](https://github.com/r0gueSch0lar/QMP-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/r0gueSch0lar/QMP-MCP/actions/workflows/ci.yml)
+
 **qmp-mcp** is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server
 that gives an AI agent the controls of a single [QEMU](https://www.qemu.org) virtual
 machine. The agent describes the hardware it wants; the server builds that machine, boots
