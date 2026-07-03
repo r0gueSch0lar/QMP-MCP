@@ -168,3 +168,21 @@ jobs:
           fi
           npm ci
           npm publish
+
+  # A single aggregate check for branch protection: green unless one of the gate
+  # jobs actually failed (a change-scoped job that was *skipped* is fine). Require
+  # this one context in the main branch protection rule instead of the individual
+  # jobs, which would otherwise block a lane-scoped PR on a "skipped" required check.
+  ci-status:
+    if: always()
+    needs: [changes, typescript, rust, docker-typescript, docker-rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the gate jobs
+        run: |
+          echo "results: ${{ join(needs.*.result, ', ') }}"
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] \
+             || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "A required job failed."; exit 1
+          fi
+          echo "All required jobs succeeded (skips are OK)."
