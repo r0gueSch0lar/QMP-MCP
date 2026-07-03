@@ -19,8 +19,10 @@ import { IsoStoreError, resolveIsoPath } from './iso-store.js';
 /** Concrete accelerators QEMU can be launched with. */
 export type Accel = 'kvm' | 'tcg';
 
-/** Guest-visible disk controller a disk attaches through. */
-export const DISK_INTERFACES = ['virtio', 'ide', 'scsi'] as const;
+/** Guest-visible disk controller a disk attaches through. `sd` is the SD/MMC
+ * slot the `raspi*` boards boot from (`if=sd`); the image must be sized to a
+ * power of two or QEMU rejects it at launch. */
+export const DISK_INTERFACES = ['virtio', 'ide', 'scsi', 'sd'] as const;
 export type DiskInterface = (typeof DISK_INTERFACES)[number];
 
 /**
@@ -220,6 +222,41 @@ const machineCpuMessage =
   "or hyphen, with no leading hyphen and no comma, space, or '=' (these could inject " +
   'QEMU -machine/-cpu properties).';
 
+/**
+ * QEMU Raspberry Pi machine types. These are Single-Board-Computer boards with
+ * FIXED hardware — the CPU model, core count and RAM are baked into the machine —
+ * so the argv generator OMITS `-cpu`/`-smp`/`-m` for them (QEMU rejects those,
+ * e.g. "Invalid RAM size, should be 1024 MB"). They also do not read a bootloader
+ * from the SD card, so they must be direct-kernel-booted (`kernel`/`dtb`).
+ * `raspi4b` needs QEMU >= 9.2; the rest are in QEMU >= 7.2.
+ */
+export const RASPI_MACHINES = new Set([
+  'raspi0',
+  'raspi1ap',
+  'raspi2b',
+  'raspi3ap',
+  'raspi3b',
+  'raspi4b',
+]);
+
+/** True when `machine` is a fixed-hardware Raspberry Pi board (see {@link RASPI_MACHINES}). */
+export function isRaspiMachine(machine: string): boolean {
+  return RASPI_MACHINES.has(machine);
+}
+
+/**
+ * The kernel command line (`-append`) is emitted as a SINGLE argv token, so
+ * spaces/`=`/`,` are safe (they cannot split off another argv element or inject a
+ * QemuOpts property). The one thing we forbid is control characters (newlines,
+ * NULs), which have no place on a cmdline and would corrupt logs.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally forbids control chars.
+const VALID_APPEND_CMDLINE = /^[^\x00-\x1f\x7f]+$/;
+
+const appendCmdlineMessage =
+  'appendCmdline must be a single line of printable characters (no control characters or ' +
+  'newlines). It is emitted as one -append token, so spaces are fine.';
+
 export const hardwareSpecSchema = z
   .object({
     machine: z
@@ -267,6 +304,33 @@ export const hardwareSpecSchema = z
       .describe(
         "Optional boot order as QEMU drive letters, e.g. 'd' (CD-ROM first) or 'dc'. Emitted as -boot order=.",
       ),
+    kernel: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Optional external kernel image to direct-boot, by NAME in the Image Store (emitted as ' +
+          '-kernel). REQUIRED for the raspi* boards, which do not read a bootloader from the SD ' +
+          'card; also usable for any direct-kernel boot (e.g. the "virt" machine).',
+      ),
+    dtb: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Optional device tree blob to pass the kernel, by NAME in the Image Store (emitted as ' +
+          '-dtb). Requires kernel. For a raspi, extract it from the SD image (and merge the ' +
+          'disable-bt overlay on Pi 3 so the console attaches to the PL011 UART).',
+      ),
+    appendCmdline: z
+      .string()
+      .max(2048)
+      .regex(VALID_APPEND_CMDLINE, appendCmdlineMessage)
+      .optional()
+      .describe(
+        'Optional kernel command line, emitted as a single -append token. Requires kernel. For a ' +
+          'raspi framebuffer console visible over the noVNC Viewer, include "console=tty1".',
+      ),
     network: networkSchema
       .default({})
       .describe('Guest NIC; defaults to user-mode (SLiRP) networking with no port-forwards.'),
@@ -302,7 +366,26 @@ export class HardwareSpecError extends Error {
  */
 export function parseHardwareSpec(candidate: unknown): HardwareSpec {
   const result = hardwareSpecSchema.safeParse(candidate);
-  if (result.success) return result.data;
+  if (result.success) {
+    // Cross-field rules kept out of the zod object so `hardwareSpecSchema` stays a
+    // plain ZodObject (create_instance reuses it as the MCP tool inputSchema).
+    // -dtb/-append are meaningless without a -kernel to hand them to; fail closed
+    // rather than emit an ineffective flag.
+    const spec = result.data;
+    if (spec.dtb !== undefined && spec.kernel === undefined) {
+      throw new HardwareSpecError(
+        'Invalid Hardware Spec — dtb: dtb requires kernel (a device tree is only passed to a ' +
+          'direct-booted kernel). Set kernel, or remove dtb.',
+      );
+    }
+    if (spec.appendCmdline !== undefined && spec.kernel === undefined) {
+      throw new HardwareSpecError(
+        'Invalid Hardware Spec — appendCmdline: appendCmdline requires kernel (a command line is ' +
+          'only passed to a direct-booted kernel). Set kernel, or remove appendCmdline.',
+      );
+    }
+    return spec;
+  }
   const detail = result.error.issues
     .map((issue) => {
       const path = issue.path.length > 0 ? issue.path.join('.') : '(spec root)';
@@ -524,6 +607,33 @@ function buildCdromArgs(cdrom: Cdrom, isoDir: string | undefined): [string, stri
 }
 
 /**
+ * Resolve a boot artifact (kernel or dtb) name to a safe in-Store path for
+ * `-kernel`/`-dtb`. Like a disk, it is referenced by NAME in the Image Store and
+ * resolved through the same containment boundary (any traversal/out-of-store name
+ * is rejected here at argv time). It is emitted as its own standalone argv token
+ * (not a QemuOpts property), so no comma-escaping is needed. A boot artifact with
+ * no Image Store configured fails closed naming `QMP_MCP_IMAGE_DIR`.
+ */
+function resolveBootArtifact(
+  name: string,
+  imageDir: string | undefined,
+  kind: 'kernel' | 'dtb',
+): string {
+  if (imageDir === undefined || imageDir.trim() === '') {
+    throw new HardwareSpecError(
+      `A ${kind} ("${name}") was requested but the Image Store directory is not configured. ` +
+        `Set QMP_MCP_IMAGE_DIR to the Image Store path.`,
+    );
+  }
+  try {
+    return resolveImagePath(name, imageDir);
+  } catch (err) {
+    const detail = err instanceof ImageStoreError ? err.message : String(err);
+    throw new HardwareSpecError(`Invalid ${kind} reference: ${detail}`);
+  }
+}
+
+/**
  * Fixed id tying a `-netdev` backend to its `-device` NIC. A single NIC is
  * supported per Instance in this slice, so a constant id is sufficient — and
  * being a constant (not agent-controlled) it can carry no injected option.
@@ -644,19 +754,27 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   // Resource caps (memory/vCPUs) are operator policy, injected from config and
   // checked before anything else so an over-cap spec never reaches qemu.
   assertWithinResourceCaps(spec, options);
-  const argv = [
-    '-machine',
-    `${escapeQemuOptsValue(spec.machine)},accel=${options.accel}`,
-    '-cpu',
-    spec.cpu,
-    '-smp',
-    String(spec.vcpus),
-    '-m',
-    String(spec.memoryMb),
-    '-nodefaults',
-    '-nographic',
-    '-S',
-  ];
+  const raspi = isRaspiMachine(spec.machine);
+  const argv = ['-machine', `${escapeQemuOptsValue(spec.machine)},accel=${options.accel}`];
+  // The raspi* boards have fixed CPU/core-count/RAM baked into the machine and
+  // QEMU rejects -cpu/-smp/-m for them, so emit those ONLY for other machines.
+  if (!raspi) {
+    argv.push('-cpu', spec.cpu, '-smp', String(spec.vcpus), '-m', String(spec.memoryMb));
+  }
+  // Direct-kernel boot (-kernel/-dtb/-append). Required for the raspi* machines
+  // (they do not boot the SD card's firmware), and usable for any machine. The
+  // schema guarantees dtb/appendCmdline only appear alongside a kernel. -append is
+  // one argv token, so its spaces cannot split off another token.
+  if (spec.kernel !== undefined) {
+    argv.push('-kernel', resolveBootArtifact(spec.kernel, options.imageDir, 'kernel'));
+  }
+  if (spec.dtb !== undefined) {
+    argv.push('-dtb', resolveBootArtifact(spec.dtb, options.imageDir, 'dtb'));
+  }
+  if (spec.appendCmdline !== undefined) {
+    argv.push('-append', spec.appendCmdline);
+  }
+  argv.push('-nodefaults', '-nographic', '-S');
   if (spec.display === 'vnc') {
     // Loopback-only VNC Display (ADR-0010). `password=on` REQUIRES a password but
     // does NOT carry one: the Orchestrator sets it after launch over QMP

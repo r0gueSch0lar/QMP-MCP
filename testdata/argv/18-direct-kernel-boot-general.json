@@ -1,0 +1,26 @@
+{
+  "description": "Direct-kernel boot on a general (non-raspi) machine (issue #4): -kernel/-append are NOT raspi-only, so they appear alongside the normal -cpu/-smp/-m — those are omitted ONLY for the fixed-hardware raspi* boards. The kernel/dtb/append block always sits right before -nodefaults.",
+  "spec": {
+    "machine": "virt",
+    "cpu": "cortex-a72",
+    "vcpus": 2,
+    "memoryMb": 512,
+    "kernel": "vmlinuz",
+    "appendCmdline": "console=ttyAMA0 root=/dev/vda"
+  },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "virt,accel=tcg",
+    "-cpu", "cortex-a72",
+    "-smp", "2",
+    "-m", "512",
+    "-kernel", "{{IMAGE_DIR}}/vmlinuz",
+    "-append", "console=ttyAMA0 root=/dev/vda",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
