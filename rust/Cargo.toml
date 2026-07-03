@@ -50,7 +50,7 @@ thiserror = "2"
 # fake). Already in the tree as a transitive rmcp dependency.
 async-trait = "0.1"
 # Only used by the real driver's teardown to send SIGTERM before SIGKILL (parity
-# with the TS TERM-then-KILL grace), mirroring `../../src/qemu/real-driver.ts`.
+# with the TS TERM-then-KILL grace), mirroring `../../typescript/src/qemu/real-driver.ts`.
 # Already in the tree as a transitive tokio dependency.
 libc = "0.2"
 # The HTTP transport's web stack (slice #25, ADR-0005/0011). rmcp's

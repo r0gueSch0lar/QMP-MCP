@@ -4,7 +4,7 @@
 //!   NONE → STARTING → RUNNING ⇄ PAUSED → STOPPED → NONE
 //!
 //! A second implementation of the shared bounded context, mirroring
-//! `../../src/instance/orchestrator.ts`: same state names, same reject-while-running
+//! `../../typescript/src/instance/orchestrator.ts`: same state names, same reject-while-running
 //! wording, same instance-lifetime = server-lifetime teardown.
 //!
 //! The Orchestrator depends on the [`QemuDriver`] port by injection (it holds a

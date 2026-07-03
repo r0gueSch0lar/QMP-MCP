@@ -4,7 +4,7 @@
 //! from it via the pure [`build_argv`] function.
 //!
 //! This is a second implementation of the shared bounded context (ADR-0011),
-//! mirroring `../../src/instance/hardware-spec.ts` **behaviorally**: the same
+//! mirroring `../../typescript/src/instance/hardware-spec.ts` **behaviorally**: the same
 //! defaults, the same security validation, and — asserted by the shared golden
 //! fixtures (ADR-0012, `../../testdata/argv/*.json`) — byte-for-byte the same argv.
 //!
