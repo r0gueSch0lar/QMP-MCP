@@ -91,6 +91,9 @@ pub enum DiskInterface {
     Ide,
     /// Emulated SCSI.
     Scsi,
+    /// SD/MMC slot the `raspi*` boards boot from (`if=sd`). The image must be sized
+    /// to a power of two or QEMU rejects it at launch.
+    Sd,
 }
 
 impl DiskInterface {
@@ -100,6 +103,7 @@ impl DiskInterface {
             Self::Virtio => "virtio",
             Self::Ide => "ide",
             Self::Scsi => "scsi",
+            Self::Sd => "sd",
         }
     }
 }
@@ -210,6 +214,38 @@ fn is_valid_machine_cpu(s: &str) -> bool {
 /// (the `^[a-dnp]+$` allowlist).
 fn is_valid_boot_order(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| matches!(c, 'a'..='d' | 'n' | 'p'))
+}
+
+/// QEMU Raspberry Pi machine types. These are Single-Board-Computer boards with
+/// FIXED hardware — CPU model, core count and RAM are baked into the machine — so
+/// [`build_argv`] OMITS `-cpu`/`-smp`/`-m` for them (QEMU rejects those, e.g.
+/// "Invalid RAM size, should be 1024 MB"). They also do not boot the SD card's
+/// firmware, so they must be direct-kernel-booted (`kernel`/`dtb`). `raspi4b` needs
+/// QEMU >= 9.2; the rest are in QEMU >= 7.2. Mirrors the TS `RASPI_MACHINES`.
+const RASPI_MACHINES: [&str; 6] = [
+    "raspi0", "raspi1ap", "raspi2b", "raspi3ap", "raspi3b", "raspi4b",
+];
+
+/// True when `machine` is a fixed-hardware Raspberry Pi board (see [`RASPI_MACHINES`]).
+fn is_raspi_machine(machine: &str) -> bool {
+    RASPI_MACHINES.contains(&machine)
+}
+
+const APPEND_CMDLINE_MESSAGE: &str =
+    "appendCmdline must be a single line of printable characters (no control characters or \
+     newlines). It is emitted as one -append token, so spaces are fine.";
+
+/// Validate the kernel command line. It is emitted as a SINGLE argv token, so
+/// spaces/`=`/`,` are safe (they cannot split off another argv element); the only
+/// thing forbidden is control characters (newlines, NULs). Mirrors the TS
+/// `VALID_APPEND_CMDLINE` regex `^[^\x00-\x1f\x7f]+$` plus the 2048-char cap.
+fn validate_append_cmdline(s: &str) -> Result<(), HardwareSpecError> {
+    if s.is_empty() || s.chars().count() > 2048 || s.chars().any(|c| c.is_control()) {
+        return Err(HardwareSpecError(format!(
+            "Invalid Hardware Spec — appendCmdline: {APPEND_CMDLINE_MESSAGE}"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +398,20 @@ pub struct HardwareSpecParams {
     /// Optional boot order as QEMU drive letters, e.g. `d` or `dc`.
     #[serde(default)]
     pub boot: Option<String>,
+    /// Optional external kernel image to direct-boot, by NAME in the Image Store
+    /// (emitted as `-kernel`). REQUIRED for the raspi* boards; also usable for any
+    /// direct-kernel boot (e.g. the `virt` machine).
+    #[serde(default)]
+    pub kernel: Option<String>,
+    /// Optional device tree blob, by NAME in the Image Store (emitted as `-dtb`).
+    /// Requires `kernel`.
+    #[serde(default)]
+    pub dtb: Option<String>,
+    /// Optional kernel command line, emitted as a single `-append` token. Requires
+    /// `kernel`. For a raspi framebuffer console visible over the noVNC Viewer,
+    /// include `console=tty1`.
+    #[serde(default)]
+    pub append_cmdline: Option<String>,
     /// Guest NIC; defaults to user-mode (SLiRP) networking with no port-forwards.
     #[serde(default)]
     pub network: NetworkParams,
@@ -452,6 +502,12 @@ pub struct HardwareSpec {
     pub cdrom: Option<Cdrom>,
     /// Optional validated boot order.
     pub boot: Option<BootOrder>,
+    /// Optional external kernel image (by name in the Image Store) to direct-boot.
+    pub kernel: Option<String>,
+    /// Optional device tree blob (by name in the Image Store). Only set with `kernel`.
+    pub dtb: Option<String>,
+    /// Optional kernel command line (emitted as one `-append` token). Only set with `kernel`.
+    pub append_cmdline: Option<String>,
     /// Guest NIC.
     pub network: Network,
     /// Optional raw-args escape hatch (gated by `QMP_MCP_ALLOW_RAW_ARGS`).
@@ -547,6 +603,30 @@ pub fn parse_hardware_spec(
     let cdrom = params.cdrom.map(validate_cdrom).transpose()?;
     let network = validate_network(params.network)?;
 
+    // Boot artifacts. Names are containment-checked against the Image Store at argv
+    // time (like disks), so here we only reject an empty name and enforce the
+    // cross-field rule that -dtb/-append are meaningless without a -kernel.
+    let kernel = validate_optional_name("kernel", params.kernel)?;
+    let dtb = validate_optional_name("dtb", params.dtb)?;
+    let append_cmdline = params.append_cmdline;
+    if let Some(cmdline) = &append_cmdline {
+        validate_append_cmdline(cmdline)?;
+    }
+    if dtb.is_some() && kernel.is_none() {
+        return Err(HardwareSpecError(
+            "Invalid Hardware Spec — dtb: dtb requires kernel (a device tree is only passed to a \
+             direct-booted kernel). Set kernel, or remove dtb."
+                .to_string(),
+        ));
+    }
+    if append_cmdline.is_some() && kernel.is_none() {
+        return Err(HardwareSpecError(
+            "Invalid Hardware Spec — appendCmdline: appendCmdline requires kernel (a command line \
+             is only passed to a direct-booted kernel). Set kernel, or remove appendCmdline."
+                .to_string(),
+        ));
+    }
+
     Ok(HardwareSpec {
         machine,
         cpu,
@@ -557,9 +637,27 @@ pub fn parse_hardware_spec(
         disks,
         cdrom,
         boot,
+        kernel,
+        dtb,
+        append_cmdline,
         network,
         extra_args: params.extra_args,
     })
+}
+
+/// Validate an optional bare name (kernel/dtb): reject an empty string, matching
+/// the TS `z.string().min(1)`. Containment against the Image Store happens at argv
+/// time in [`resolve_boot_artifact`].
+fn validate_optional_name(
+    field: &str,
+    value: Option<String>,
+) -> Result<Option<String>, HardwareSpecError> {
+    match value {
+        Some(s) if s.is_empty() => Err(HardwareSpecError(format!(
+            "Invalid Hardware Spec — {field}: {field} must be a non-empty string."
+        ))),
+        other => Ok(other),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +850,31 @@ fn build_cdrom_args(
     Ok(vec!["-drive".to_string(), parts.join(",")])
 }
 
+/// Resolve a boot artifact (kernel or dtb) name to a safe in-Store path for
+/// `-kernel`/`-dtb`. Referenced by NAME in the Image Store and resolved through the
+/// same containment boundary as a disk (any traversal/out-of-store name is rejected
+/// here at argv time). Emitted as its own standalone argv token (not a QemuOpts
+/// property), so no comma-escaping is needed. A boot artifact with no Image Store
+/// configured fails closed naming `QMP_MCP_IMAGE_DIR`. Mirrors the TS
+/// `resolveBootArtifact`.
+fn resolve_boot_artifact(
+    name: &str,
+    image_dir: Option<&str>,
+    kind: &str,
+) -> Result<String, HardwareSpecError> {
+    let dir = match image_dir {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => {
+            return Err(HardwareSpecError(format!(
+                "A {kind} (\"{name}\") was requested but the Image Store directory is not \
+                 configured. Set QMP_MCP_IMAGE_DIR to the Image Store path."
+            )));
+        }
+    };
+    resolve_image_path(name, dir)
+        .map_err(|e| HardwareSpecError(format!("Invalid {kind} reference: {}", e.0)))
+}
+
 /// Render the `-netdev`/`-device` pair for the guest NIC (ADR-0009). `user` mode
 /// emits SLiRP NAT plus any loopback-pinned `hostfwd=` entries (host port bounded
 /// to `hostfwd_port_range`); `tap`/`bridge` is refused unless `allow_host_net`.
@@ -875,6 +998,7 @@ pub fn build_argv(
     // anything else so an over-cap spec never reaches qemu.
     assert_within_resource_caps(spec, options)?;
 
+    let raspi = is_raspi_machine(spec.machine.as_str());
     let mut argv: Vec<String> = vec![
         "-machine".to_string(),
         format!(
@@ -882,16 +1006,44 @@ pub fn build_argv(
             escape_qemu_opts_value(spec.machine.as_str()),
             options.accel.as_str()
         ),
-        "-cpu".to_string(),
-        spec.cpu.as_str().to_string(),
-        "-smp".to_string(),
-        spec.vcpus.to_string(),
-        "-m".to_string(),
-        spec.memory_mb.to_string(),
-        "-nodefaults".to_string(),
-        "-nographic".to_string(),
-        "-S".to_string(),
     ];
+    // The raspi* boards have fixed CPU/core-count/RAM baked into the machine and
+    // QEMU rejects -cpu/-smp/-m for them, so emit those ONLY for other machines.
+    if !raspi {
+        argv.push("-cpu".to_string());
+        argv.push(spec.cpu.as_str().to_string());
+        argv.push("-smp".to_string());
+        argv.push(spec.vcpus.to_string());
+        argv.push("-m".to_string());
+        argv.push(spec.memory_mb.to_string());
+    }
+    // Direct-kernel boot (-kernel/-dtb/-append). Required for the raspi* machines
+    // (they do not boot the SD card's firmware), and usable for any machine. The
+    // schema guarantees dtb/appendCmdline only appear alongside a kernel. -append is
+    // one argv token, so its spaces cannot split off another token.
+    if let Some(kernel) = &spec.kernel {
+        argv.push("-kernel".to_string());
+        argv.push(resolve_boot_artifact(
+            kernel,
+            options.image_dir.as_deref(),
+            "kernel",
+        )?);
+    }
+    if let Some(dtb) = &spec.dtb {
+        argv.push("-dtb".to_string());
+        argv.push(resolve_boot_artifact(
+            dtb,
+            options.image_dir.as_deref(),
+            "dtb",
+        )?);
+    }
+    if let Some(cmdline) = &spec.append_cmdline {
+        argv.push("-append".to_string());
+        argv.push(cmdline.clone());
+    }
+    argv.push("-nodefaults".to_string());
+    argv.push("-nographic".to_string());
+    argv.push("-S".to_string());
 
     if spec.display == DisplayMode::Vnc {
         // Loopback-only VNC Display (ADR-0010). `password=on` REQUIRES a password
@@ -1468,6 +1620,116 @@ mod tests {
         );
         let e = resolve_accel(AccelMode::Kvm, || false).unwrap_err();
         assert!(e.0.contains("/dev/kvm"));
+    }
+
+    // --- raspi / direct-kernel boot (issue #4) ------------------------------
+
+    #[test]
+    fn omits_cpu_smp_mem_for_a_fixed_hardware_raspi_board() {
+        let argv = build_argv(&spec(json!({ "machine": "raspi3b" })), &opts()).unwrap();
+        assert!(!argv.iter().any(|s| s == "-cpu"));
+        assert!(!argv.iter().any(|s| s == "-smp"));
+        assert!(!argv.iter().any(|s| s == "-m"));
+        assert_eq!(value_after(&argv, "-machine"), "raspi3b,accel=tcg");
+    }
+
+    #[test]
+    fn emits_kernel_dtb_append_and_if_sd_for_raspi() {
+        let store = TempDir::new("hw-raspi");
+        for f in ["kernel8.img", "merged.dtb", "dietpi.img"] {
+            std::fs::write(store.path.join(f), b"").unwrap();
+        }
+        let mut o = opts();
+        o.image_dir = Some(store.path.to_string_lossy().into_owned());
+
+        let argv = build_argv(
+            &spec(json!({
+                "machine": "raspi3b",
+                "display": "vnc",
+                "kernel": "kernel8.img",
+                "dtb": "merged.dtb",
+                "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+                "disks": [{ "image": "dietpi.img", "interface": "sd", "format": "raw" }]
+            })),
+            &o,
+        )
+        .unwrap();
+        assert!(value_after(&argv, "-kernel").ends_with("/kernel8.img"));
+        assert!(value_after(&argv, "-dtb").ends_with("/merged.dtb"));
+        // -append is one token — spaces stay inside it.
+        assert_eq!(
+            value_after(&argv, "-append"),
+            "console=tty1 root=/dev/mmcblk0p2 rootwait rw"
+        );
+        assert!(value_after(&argv, "-drive").contains("if=sd"));
+        // The kernel block sits before -nodefaults.
+        assert!(index_of(&argv, "-kernel") < index_of(&argv, "-nodefaults"));
+    }
+
+    #[test]
+    fn keeps_cpu_smp_mem_for_a_non_raspi_direct_kernel_boot() {
+        let store = TempDir::new("hw-virt");
+        std::fs::write(store.path.join("vmlinuz"), b"").unwrap();
+        let mut o = opts();
+        o.image_dir = Some(store.path.to_string_lossy().into_owned());
+
+        let argv = build_argv(
+            &spec(json!({
+                "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 512,
+                "kernel": "vmlinuz"
+            })),
+            &o,
+        )
+        .unwrap();
+        assert_eq!(value_after(&argv, "-cpu"), "cortex-a72");
+        assert_eq!(value_after(&argv, "-smp"), "2");
+        assert_eq!(value_after(&argv, "-m"), "512");
+        assert!(value_after(&argv, "-kernel").ends_with("/vmlinuz"));
+    }
+
+    #[test]
+    fn kernel_without_image_store_fails_closed() {
+        let e = build_argv(
+            &spec(json!({ "machine": "raspi3b", "kernel": "kernel8.img" })),
+            &opts(),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("QMP_MCP_IMAGE_DIR"));
+    }
+
+    #[test]
+    fn rejects_traversing_kernel_reference_at_argv_time() {
+        let store = TempDir::new("hw-raspi2");
+        let mut o = opts();
+        o.image_dir = Some(store.path.to_string_lossy().into_owned());
+        let e = build_argv(
+            &spec(json!({ "machine": "raspi3b", "kernel": "../vmlinuz" })),
+            &o,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("kernel reference"));
+    }
+
+    #[test]
+    fn rejects_dtb_or_append_without_kernel_and_bad_cmdline() {
+        let e =
+            parse_hardware_spec(json!({ "machine": "raspi3b", "dtb": "merged.dtb" })).unwrap_err();
+        assert!(e.0.contains("dtb requires kernel"));
+        let e =
+            parse_hardware_spec(json!({ "machine": "raspi3b", "appendCmdline": "console=tty1" }))
+                .unwrap_err();
+        assert!(e.0.contains("appendCmdline requires kernel"));
+        // A control character (newline) in the cmdline is rejected.
+        assert!(parse_hardware_spec(
+            json!({ "machine": "raspi3b", "kernel": "kernel8.img", "appendCmdline": "a\nb" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_sd_as_a_disk_interface() {
+        let s = spec(json!({ "disks": [{ "image": "dietpi.img", "interface": "sd" }] }));
+        assert_eq!(s.disks[0].interface, DiskInterface::Sd);
     }
 
     /// A best-effort self-cleaning temp directory for the filesystem-touching argv

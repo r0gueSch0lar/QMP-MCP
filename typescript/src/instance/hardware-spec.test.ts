@@ -813,3 +813,104 @@ describe('resolveAccel', () => {
     expect(resolveAccel('kvm', () => true).accel).toBe('kvm');
   });
 });
+
+describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
+  let store: string;
+
+  beforeAll(async () => {
+    store = await mkdtemp(join(tmpdir(), 'hw-raspi-'));
+    // Leaf files need not exist for path resolution, but create them so the test
+    // reads like a real Image Store.
+    await writeFile(join(store, 'kernel8.img'), '');
+    await writeFile(join(store, 'merged.dtb'), '');
+    await writeFile(join(store, 'dietpi.img'), '');
+    await writeFile(join(store, 'vmlinuz'), '');
+  });
+
+  afterAll(async () => {
+    await rm(store, { recursive: true, force: true });
+  });
+
+  it('omits -cpu/-smp/-m for a fixed-hardware raspi board', () => {
+    const argv = buildArgv(spec({ machine: 'raspi3b' }), { accel: 'tcg', qmpSocketPath: SOCK });
+    expect(argv).not.toContain('-cpu');
+    expect(argv).not.toContain('-smp');
+    expect(argv).not.toContain('-m');
+    // The machine is still emitted with its accel.
+    expect(argv[argv.indexOf('-machine') + 1]).toBe('raspi3b,accel=tcg');
+  });
+
+  it('emits -kernel/-dtb/-append (resolved by name in the Image Store) and if=sd', () => {
+    const argv = buildArgv(
+      spec({
+        machine: 'raspi3b',
+        display: 'vnc',
+        kernel: 'kernel8.img',
+        dtb: 'merged.dtb',
+        appendCmdline: 'console=tty1 root=/dev/mmcblk0p2 rootwait rw',
+        disks: [{ image: 'dietpi.img', interface: 'sd', format: 'raw' }],
+      }),
+      { accel: 'tcg', qmpSocketPath: SOCK, imageDir: store },
+    );
+    expect(argv[argv.indexOf('-kernel') + 1]).toBe(join(store, 'kernel8.img'));
+    expect(argv[argv.indexOf('-dtb') + 1]).toBe(join(store, 'merged.dtb'));
+    // -append is one token — spaces stay inside it.
+    expect(argv[argv.indexOf('-append') + 1]).toBe('console=tty1 root=/dev/mmcblk0p2 rootwait rw');
+    expect(argv[argv.indexOf('-drive') + 1]).toContain('if=sd');
+    // The kernel/dtb/append block sits before -nodefaults.
+    expect(argv.indexOf('-kernel')).toBeLessThan(argv.indexOf('-nodefaults'));
+  });
+
+  it('keeps -cpu/-smp/-m for a NON-raspi direct-kernel boot (kernel is not raspi-only)', () => {
+    const argv = buildArgv(
+      spec({ machine: 'virt', cpu: 'cortex-a72', vcpus: 2, memoryMb: 512, kernel: 'vmlinuz' }),
+      { accel: 'tcg', qmpSocketPath: SOCK, imageDir: store },
+    );
+    expect(argv[argv.indexOf('-cpu') + 1]).toBe('cortex-a72');
+    expect(argv[argv.indexOf('-smp') + 1]).toBe('2');
+    expect(argv[argv.indexOf('-m') + 1]).toBe('512');
+    expect(argv[argv.indexOf('-kernel') + 1]).toBe(join(store, 'vmlinuz'));
+  });
+
+  it('fails closed when a kernel is requested but no Image Store is configured', () => {
+    expect(() =>
+      buildArgv(spec({ machine: 'raspi3b', kernel: 'kernel8.img' }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      }),
+    ).toThrowError(/QMP_MCP_IMAGE_DIR/);
+  });
+
+  it('rejects a traversing kernel reference at argv time', () => {
+    expect(() =>
+      buildArgv(spec({ machine: 'raspi3b', kernel: '../vmlinuz' }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        imageDir: store,
+      }),
+    ).toThrowError(/kernel reference/);
+  });
+
+  it('rejects dtb without kernel (a dtb is only passed to a direct-booted kernel)', () => {
+    expect(() => parseHardwareSpec({ machine: 'raspi3b', dtb: 'merged.dtb' })).toThrowError(
+      /dtb requires kernel/,
+    );
+  });
+
+  it('rejects appendCmdline without kernel', () => {
+    expect(() =>
+      parseHardwareSpec({ machine: 'raspi3b', appendCmdline: 'console=tty1' }),
+    ).toThrowError(/appendCmdline requires kernel/);
+  });
+
+  it('rejects an appendCmdline containing a control character (newline)', () => {
+    expect(() =>
+      parseHardwareSpec({ machine: 'raspi3b', kernel: 'kernel8.img', appendCmdline: 'a\nb' }),
+    ).toThrowError(HardwareSpecError);
+  });
+
+  it('accepts sd as a disk interface', () => {
+    const parsed = parseHardwareSpec({ disks: [{ image: 'dietpi.img', interface: 'sd' }] });
+    expect(parsed.disks[0]?.interface).toBe('sd');
+  });
+});
