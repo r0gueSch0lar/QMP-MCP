@@ -6,7 +6,7 @@
 //! contract.
 //!
 //! A second implementation of the shared bounded context, mirroring
-//! `../../src/instance/event-buffer.ts` behaviorally: the same cursor semantics, the
+//! `../../typescript/src/instance/event-buffer.ts` behaviorally: the same cursor semantics, the
 //! same FIFO overflow, the same race-safe long-poll, and the same clean-timeout
 //! outcome (a timeout is never an error).
 //!

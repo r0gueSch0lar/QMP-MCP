@@ -1,6 +1,6 @@
 //! Entrypoint for the qmp-mcp Rust variant (ADR-0011).
 //!
-//! Mirrors `../../src/index.ts`: load the config (failing closed with an
+//! Mirrors `../../typescript/src/index.ts`: load the config (failing closed with an
 //! actionable message and exit code 1 on a [`config::ConfigError`]), set the log
 //! level, construct the single-instance Orchestrator behind a shared async mutex,
 //! then serve the MCP server — tearing down any running Instance on shutdown so
@@ -71,7 +71,7 @@ async fn main() -> ExitCode {
 /// Serve the configured transport(s). Returns an error (which `main` logs and turns
 /// into exit 1) for any serve-time failure.
 ///
-/// Mirrors `../../src/index.ts`: `stdio` serves one auth-free stdio transport;
+/// Mirrors `../../typescript/src/index.ts`: `stdio` serves one auth-free stdio transport;
 /// `http` serves the streamable HTTP transport behind the fail-closed auth +
 /// origin guards (API-key or JWT, per `QMP_MCP_AUTH`); `both` runs stdio and HTTP
 /// concurrently. In every case any running Instance is torn down before returning,

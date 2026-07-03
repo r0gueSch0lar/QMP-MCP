@@ -7,7 +7,7 @@
 //! in-memory [`FakeQemuDriver`] with no real process or socket, while production
 //! wires in the real driver.
 //!
-//! Mirrors `../../src/qemu/driver.ts` and `../../src/qemu/fake-driver.ts`
+//! Mirrors `../../typescript/src/qemu/driver.ts` and `../../typescript/src/qemu/fake-driver.ts`
 //! behaviorally. The seam is deliberately narrow: a single [`QemuDriver::launch`]
 //! hands back a live [`InstanceHandle`], and everything else flows through that
 //! handle (`execute` for QMP commands — including `query-status` and the
