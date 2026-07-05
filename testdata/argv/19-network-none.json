@@ -1,0 +1,21 @@
+{
+  "description": "network.mode 'none' (issue #6) attaches NO NIC — no -netdev/-device pair is emitted. The escape hatch for boards whose bus can't host any allowlisted NIC (here a raspi3b, which has no PCI bus), or any headless-with-no-network case.",
+  "spec": {
+    "machine": "raspi3b",
+    "kernel": "kernel8.img",
+    "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+    "disks": [{ "image": "dietpi.img", "interface": "sd", "format": "raw" }],
+    "network": { "mode": "none" }
+  },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "raspi3b,accel=tcg",
+    "-kernel", "{{IMAGE_DIR}}/kernel8.img",
+    "-append", "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-drive", "file={{IMAGE_DIR}}/dietpi.img,format=raw,if=sd,media=disk",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

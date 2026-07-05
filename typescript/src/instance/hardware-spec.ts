@@ -109,19 +109,26 @@ export type Cdrom = z.infer<typeof cdromSchema>;
  * never a free string: a free string could carry a comma to inject extra
  * `-device` properties (e.g. a second device, an `addr=`), or an unknown model.
  * Keep this list short and boring — paravirtual `virtio-net-pci` plus two widely
- * emulated legacy NICs for guests without virtio drivers.
+ * emulated legacy NICs for guests without virtio drivers, and `usb-net` for boards
+ * with a USB bus but no PCI (the `raspi*` machines). The three PCI models need a PCI
+ * bus; `usb-net` needs a USB bus. {@link buildNetworkArgs} refuses a model the
+ * machine can't host, so QEMU never aborts on an unattachable device.
  */
-export const NIC_MODELS = ['virtio-net-pci', 'e1000', 'rtl8139'] as const;
+export const NIC_MODELS = ['virtio-net-pci', 'e1000', 'rtl8139', 'usb-net'] as const;
 export type NicModel = (typeof NIC_MODELS)[number];
+
+/** NIC models that attach to a PCI bus (everything except `usb-net`). */
+const PCI_NIC_MODELS: ReadonlySet<NicModel> = new Set(['virtio-net-pci', 'e1000', 'rtl8139']);
 
 /**
  * Guest networking backend. `user` is QEMU user-mode networking (SLiRP): NAT'd
  * outbound with the host network unexposed and inbound only via explicit
  * port-forwards — the safe, unprivileged default (ADR-0009). `tap`/`bridge` put
  * the guest on the host LAN and need host privileges, so they are env-gated off
- * (see `QMP_MCP_ALLOW_HOST_NET`).
+ * (see `QMP_MCP_ALLOW_HOST_NET`). `none` attaches NO NIC at all — the escape hatch
+ * for boards where the default PCI NIC can't attach (e.g. the `raspi*` machines).
  */
-export const NETWORK_MODES = ['user', 'tap', 'bridge'] as const;
+export const NETWORK_MODES = ['user', 'tap', 'bridge', 'none'] as const;
 export type NetworkMode = (typeof NETWORK_MODES)[number];
 
 /** Transport protocol for a user-mode port-forward. */
@@ -172,14 +179,16 @@ export const networkSchema = z
       .enum(NETWORK_MODES)
       .default('user')
       .describe(
-        "Networking backend: 'user' (default, SLiRP NAT) or 'tap'/'bridge' (host networking, " +
-          'requires QMP_MCP_ALLOW_HOST_NET=true).',
+        "Networking backend: 'user' (default, SLiRP NAT), 'tap'/'bridge' (host networking, " +
+          "requires QMP_MCP_ALLOW_HOST_NET=true), or 'none' (no NIC — required for the raspi* " +
+          'boards, which have no PCI bus for the default NIC).',
       ),
     model: z
       .enum(NIC_MODELS)
       .default('virtio-net-pci')
       .describe(
-        "Guest NIC model from a fixed allowlist: 'virtio-net-pci' (default), 'e1000', or 'rtl8139'.",
+        "Guest NIC model from a fixed allowlist: 'virtio-net-pci' (default), 'e1000', 'rtl8139' " +
+          "(all PCI), or 'usb-net' (USB — for boards with a USB bus but no PCI, e.g. raspi*).",
       ),
     hostForwards: z
       .array(hostForwardSchema)
@@ -658,26 +667,52 @@ const NETDEV_ID = 'net0';
  *   the server never configures the host). `hostForwards` are a user-mode-only
  *   concept, so supplying them with `tap`/`bridge` is REFUSED rather than
  *   silently ignored.
+ * - `none` mode attaches NO NIC (no `-netdev`/`-device`) — the escape hatch for
+ *   boards whose bus can't host any allowlisted NIC (e.g. the `raspi*` machines
+ *   have no PCI bus for the PCI models).
  *
- * The NIC `model` and `mode` are closed enums, so no agent free-text reaches the
- * option string; the model is comma-escaped anyway as defense-in-depth so it can
- * never split off an extra `-device`/`-netdev` property.
+ * The NIC `model`/`mode` are closed enums, so no agent free-text reaches the option
+ * string; the model is comma-escaped anyway as defense-in-depth. `model` is checked
+ * against the machine's bus (PCI models need a PCI bus, `usb-net` needs a USB bus),
+ * so the server never emits a `-device` QEMU would reject with "No 'PCI'/'USB' bus".
  */
-function buildNetworkArgs(network: Network, options: ArgvOptions): string[] {
-  // model is an allowlisted enum; escape defensively so it can never inject an
-  // extra -device property no matter how the allowlist evolves.
-  const device = `${escapeQemuOptsValue(network.model)},netdev=${NETDEV_ID}`;
-
+function buildNetworkArgs(network: Network, machine: string, options: ArgvOptions): string[] {
   // hostForwards are a user-mode (SLiRP) concept only; QEMU has nowhere to apply
-  // them under tap/bridge. Refuse rather than silently drop them so the agent
+  // them under tap/bridge/none. Refuse rather than silently drop them so the agent
   // is told its forwards would not take effect (fail-closed, ADR-0009).
   if (network.mode !== 'user' && network.hostForwards.length > 0) {
     throw new HardwareSpecError(
       `network.hostForwards are only valid for user-mode networking (mode "user"), but mode is ` +
-        `"${network.mode}". Host-level (${network.mode}) networking puts the guest on the host LAN, ` +
-        `where QEMU user-mode port-forwards do not apply. Remove hostForwards, or use mode "user".`,
+        `"${network.mode}". Remove hostForwards, or use mode "user".`,
     );
   }
+
+  // 'none' — attach no NIC. The escape hatch for boards where no allowlisted NIC
+  // can attach; emit nothing.
+  if (network.mode === 'none') return [];
+
+  // NIC model must match a bus the machine actually has, or QEMU aborts at launch
+  // ("No 'PCI' bus found for device ..."). Fail closed here with an actionable
+  // message instead. The raspi* boards have a USB bus but no PCI bus; every other
+  // machine we target has PCI (via -nodefaults) but no built-in USB controller.
+  const raspi = isRaspiMachine(machine);
+  if (network.model === 'usb-net' && !raspi) {
+    throw new HardwareSpecError(
+      `network.model "usb-net" needs a USB bus, but machine "${machine}" has none (only the ` +
+        `raspi* boards expose a built-in USB bus). Use a PCI NIC (virtio-net-pci/e1000/rtl8139), ` +
+        `or network.mode "none".`,
+    );
+  }
+  if (PCI_NIC_MODELS.has(network.model) && raspi) {
+    throw new HardwareSpecError(
+      `network.model "${network.model}" is a PCI NIC, but the raspi* board "${machine}" has no PCI ` +
+        `bus. Use network.model "usb-net", or network.mode "none" for no networking.`,
+    );
+  }
+
+  // model is an allowlisted enum; escape defensively so it can never inject an
+  // extra -device property no matter how the allowlist evolves.
+  const device = `${escapeQemuOptsValue(network.model)},netdev=${NETDEV_ID}`;
 
   if (network.mode === 'user') {
     const range = options.hostfwdPortRange ?? DEFAULT_HOSTFWD_PORT_RANGE;
@@ -795,8 +830,9 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
     // a second -boot option or an extra argv token.
     argv.push('-boot', `order=${escapeQemuOptsValue(spec.boot)}`);
   }
-  // Guest NIC: user-mode (SLiRP) by default; tap/bridge only when env-gated on.
-  argv.push(...buildNetworkArgs(spec.network, options));
+  // Guest NIC: user-mode (SLiRP) by default; tap/bridge only when env-gated on;
+  // 'none' emits nothing. The model is checked against the machine's bus.
+  argv.push(...buildNetworkArgs(spec.network, spec.machine, options));
   argv.push('-qmp', `unix:${options.qmpSocketPath},server=on,wait=off`);
   // extraArgs (ADR-0002): the opt-in raw-args escape hatch. Raw QEMU arguments are
   // host-compromise-equivalent (e.g. `-drive file=/etc/shadow`, host `-netdev`
