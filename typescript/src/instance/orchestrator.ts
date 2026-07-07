@@ -68,8 +68,11 @@ import {
 
 /**
  * The lifecycle states an Instance moves through. `PAUSED` is entered by
- * {@link Orchestrator.pauseInstance} (QMP `stop`) and left by
- * {@link Orchestrator.resumeInstance} (QMP `cont`).
+ * {@link Orchestrator.pauseInstance} (QMP `stop`) — and by
+ * {@link Orchestrator.createInstance} when the Guest loads frozen at the `-S`
+ * startup pause (the default, unless `QMP_MCP_AUTO_START` resumes it) — and is left
+ * by {@link Orchestrator.resumeInstance} (QMP `cont`). In `PAUSED` the Guest CPUs are
+ * not executing, which `get_status`/`query-status` reports as `paused`/`prelaunch`.
  */
 export type InstanceState = 'NONE' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'STOPPED';
 
@@ -82,9 +85,11 @@ export interface InstanceView {
   accel?: Accel;
 }
 
-/** The result of a successful {@link Orchestrator.createInstance}. */
+/** The result of a successful {@link Orchestrator.createInstance}. `RUNNING` when
+ * the Guest was auto-started (`QMP_MCP_AUTO_START`), else `PAUSED` (loaded, frozen
+ * at `-S` until `resume_instance`). */
 export interface CreateInstanceResult {
-  state: 'RUNNING';
+  state: 'RUNNING' | 'PAUSED';
   /** The validated Hardware Spec the Instance was built from. */
   spec: HardwareSpec;
   /** The accelerator actually chosen (KVM or TCG). */
@@ -389,7 +394,13 @@ export class Orchestrator {
       this.#viewer = viewer;
       this.#spec = spec;
       this.#accel = resolution.accel;
-      this.#state = 'RUNNING';
+      // Auto-start (issues #8, #10) decides the lifecycle state create lands in.
+      // The Guest launches frozen at the `-S` startup pause; unless we resume it
+      // below it is NOT executing, so the honest lifecycle state is PAUSED — which
+      // agrees with get_status/query-status (the Guest reads paused/prelaunch until
+      // resume_instance). With QMP_MCP_AUTO_START on we `cont` it and land in RUNNING.
+      const started = this.#options.autoStart === true;
+      this.#state = started ? 'RUNNING' : 'PAUSED';
       this.#launchToken = undefined;
       // Start a fresh Event Buffer for this Instance and capture its QMP async
       // events from here on — no events carry over from a previous Instance.
@@ -398,19 +409,20 @@ export class Orchestrator {
       // If the process exits on its own, reflect that the Instance is gone.
       void process.exited.then(() => this.#onProcessExit());
 
-      // Auto-start (issue #8): by default the Guest stays frozen at the `-S`
-      // startup pause (deterministic pre-run inspection) and only runs on an
-      // explicit resume_instance. When QMP_MCP_AUTO_START is on, issue `cont` here
-      // so the reported RUNNING is truthful and the Guest begins executing at once.
-      // Done AFTER event capture is wired so the boot's QMP events are recorded.
-      if (this.#options.autoStart === true) {
+      // When auto-start is on, resume the Guest now (QMP `cont`) so it begins
+      // executing; done AFTER event capture is wired so the boot's QMP events are
+      // recorded. Otherwise it stays PAUSED, frozen at `-S`, until resume_instance.
+      if (started) {
         await process.execute('cont');
-        logger.info('Instance auto-started (QMP_MCP_AUTO_START; QMP cont)');
+        logger.info(`Instance RUNNING (auto-started; ${resolution.reason})`);
+      } else {
+        logger.info(
+          `Instance PAUSED — loaded, frozen at the -S startup pause; call resume_instance ` +
+            `to start it (${resolution.reason})`,
+        );
       }
-
-      logger.info(`Instance RUNNING (${resolution.reason})`);
       return {
-        state: 'RUNNING',
+        state: started ? 'RUNNING' : 'PAUSED',
         spec,
         accel: resolution.accel,
         accelReason: resolution.reason,
