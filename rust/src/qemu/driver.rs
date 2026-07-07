@@ -263,8 +263,12 @@ impl FakeInstanceHandle {
         commands: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         Self {
+            // Starts NOT running, modelling QEMU's `-S` startup pause: the Guest is
+            // loaded but frozen until the first `cont` (resume_instance, or create's
+            // auto-start). So `query-status` reads `paused` right after create,
+            // matching the PAUSED lifecycle state the Orchestrator defaults to (#10).
             state: Mutex::new(FakeHandleState {
-                running: true,
+                running: false,
                 closed: false,
             }),
             events_tx,

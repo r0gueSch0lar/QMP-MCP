@@ -42,9 +42,12 @@ use crate::qemu::driver::{DriverError, ExitedFuture, InstanceHandle, LaunchReque
 use crate::viewer::{RealViewerFactory, ViewerFactory, ViewerHandle, ViewerOptions};
 
 /// The lifecycle states an Instance moves through. `PAUSED` is entered by
-/// [`Orchestrator::pause_instance`] (QMP `stop`) and left by
-/// [`Orchestrator::resume_instance`] (QMP `cont`). The names match the TS
-/// `InstanceState` union exactly.
+/// [`Orchestrator::pause_instance`] (QMP `stop`) — and by
+/// [`Orchestrator::create_instance`] when the Guest loads frozen at the `-S` startup
+/// pause (the default, unless `QMP_MCP_AUTO_START` resumes it) — and left by
+/// [`Orchestrator::resume_instance`] (QMP `cont`). In `PAUSED` the Guest CPUs are not
+/// executing (`get_status`/`query-status` reads `paused`/`prelaunch`). The names
+/// match the TS `InstanceState` union exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceState {
     /// No Instance exists.
@@ -93,7 +96,8 @@ pub struct InstanceView {
 /// The result of a successful [`Orchestrator::create_instance`].
 #[derive(Debug, Clone)]
 pub struct CreateInstanceResult {
-    /// Always [`InstanceState::Running`] on success.
+    /// `RUNNING` when the Guest was auto-started (`QMP_MCP_AUTO_START`), else `PAUSED`
+    /// (loaded, frozen at `-S` until `resume_instance`) — issue #10.
     pub state: InstanceState,
     /// The validated Hardware Spec the Instance was built from.
     pub spec: HardwareSpec,
@@ -385,25 +389,38 @@ impl Orchestrator {
                 // so a stale watcher for a prior Instance can never clobber this one.
                 self.generation = self.generation.wrapping_add(1);
                 let generation = self.generation;
-                self.state = InstanceState::Running;
+                // Auto-start (issues #8, #10) decides the state create lands in. The
+                // Guest launches frozen at the `-S` startup pause; unless we resume it
+                // below it is NOT executing, so the honest state is PAUSED — which
+                // agrees with get_status/query-status (paused/prelaunch until
+                // resume_instance). With QMP_MCP_AUTO_START on we `cont` and land RUNNING.
+                let started = self.options.auto_start;
+                self.state = if started {
+                    InstanceState::Running
+                } else {
+                    InstanceState::Paused
+                };
                 self.spawn_exit_watcher(generation, exited);
-                // Auto-start (issue #8): by default the Guest stays frozen at the
-                // `-S` startup pause (deterministic pre-run inspection) and only runs
-                // on an explicit resume_instance. When QMP_MCP_AUTO_START is on, issue
-                // `cont` here so the reported RUNNING is truthful. Event capture is
-                // already wired above, so the boot's QMP events are recorded.
-                if self.options.auto_start {
+                // When auto-start is on, resume the Guest now (QMP `cont`) so it begins
+                // executing; done AFTER event capture is wired so the boot's events are
+                // recorded. Otherwise it stays PAUSED, frozen at `-S`, until resume.
+                if started {
                     self.handle
                         .as_ref()
                         .expect("handle present after publish")
                         .execute("cont", None)
                         .await
                         .map_err(|e| LifecycleError(e.0))?;
-                    tracing::info!("Instance auto-started (QMP_MCP_AUTO_START; QMP cont)");
+                    tracing::info!("Instance RUNNING (auto-started; {})", resolution.reason);
+                } else {
+                    tracing::info!(
+                        "Instance PAUSED — loaded, frozen at the -S startup pause; call \
+                         resume_instance to start it ({})",
+                        resolution.reason
+                    );
                 }
-                tracing::info!("Instance RUNNING ({})", resolution.reason);
                 Ok(CreateInstanceResult {
-                    state: InstanceState::Running,
+                    state: self.state,
                     spec,
                     accel: resolution.accel,
                     accel_reason: resolution.reason,
@@ -999,6 +1016,15 @@ mod tests {
         Orchestrator::new(Box::new(driver), test_options())
     }
 
+    /// An Orchestrator with auto-start on, so `create_instance` lands in RUNNING —
+    /// the starting point for tests that exercise pause/resume/reset semantics on a
+    /// running Guest (issue #10; default create now lands in PAUSED).
+    fn orchestrator_autostart(driver: FakeQemuDriver) -> Orchestrator {
+        let mut options = test_options();
+        options.auto_start = true;
+        Orchestrator::new(Box::new(driver), options)
+    }
+
     #[tokio::test]
     async fn create_does_not_cont_by_default_guest_stays_paused() {
         // issue #8: without auto-start, create must NOT issue `cont` — the Guest
@@ -1206,7 +1232,7 @@ mod tests {
         let orch = Orchestrator::new_shared(Box::new(driver), test_options());
 
         orch.lock().await.create_instance(json!({})).await.unwrap();
-        assert_eq!(orch.lock().await.state(), InstanceState::Running);
+        assert_eq!(orch.lock().await.state(), InstanceState::Paused);
 
         // qemu vanishes on its own (crash/SIGKILL) — the exit signal fires without an
         // explicit destroy. Release the lock first so the watcher can reconcile.
@@ -1231,7 +1257,7 @@ mod tests {
             .create_instance(json!({}))
             .await
             .expect("a fresh create is accepted after an unexpected exit");
-        assert_eq!(orch.lock().await.state(), InstanceState::Running);
+        assert_eq!(orch.lock().await.state(), InstanceState::Paused);
         assert_eq!(
             launches.lock().unwrap().len(),
             2,
@@ -1281,7 +1307,7 @@ mod tests {
 
         // A reconcile for an OLDER generation leaves the current Instance untouched.
         orch.reconcile_unexpected_exit(gen1 - 1).await;
-        assert_eq!(orch.state(), InstanceState::Running);
+        assert_eq!(orch.state(), InstanceState::Paused);
 
         // Destroy + recreate: the new Instance carries a NEWER generation.
         orch.destroy_instance().await.unwrap();
@@ -1291,7 +1317,7 @@ mod tests {
         // The stale watcher for the destroyed Instance (generation gen1) must NOT tear
         // down the newer one.
         orch.reconcile_unexpected_exit(gen1).await;
-        assert_eq!(orch.state(), InstanceState::Running);
+        assert_eq!(orch.state(), InstanceState::Paused);
 
         // The CURRENT generation does reconcile to NONE.
         let current = orch.current_generation();
@@ -1362,17 +1388,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_brings_instance_to_running_then_destroy_returns_to_none() {
+    async fn create_loads_instance_paused_then_destroy_returns_to_none() {
         let mut orch = orchestrator_with(FakeQemuDriver::new());
         assert_eq!(orch.state(), InstanceState::None);
         assert_eq!(orch.get_instance().state, InstanceState::None);
 
         let result = orch.create_instance(json!({})).await.expect("create ok");
-        assert_eq!(result.state, InstanceState::Running);
+        // Default (no auto-start): loaded but frozen at -S, so the honest state is
+        // PAUSED — and get_status agrees (query-status not running) — issue #10.
+        assert_eq!(result.state, InstanceState::Paused);
         assert_eq!(result.accel, Accel::Tcg); // kvm_available == false → TCG
+        assert_eq!(orch.get_status().await.unwrap()["running"], false);
 
         let view = orch.get_instance();
-        assert_eq!(view.state, InstanceState::Running);
+        assert_eq!(view.state, InstanceState::Paused);
         assert!(view.spec.is_some());
         assert_eq!(view.accel, Some(Accel::Tcg));
 
@@ -1406,10 +1435,10 @@ mod tests {
         let err = orch.create_instance(json!({})).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("An Instance already exists"), "got: {msg}");
-        assert!(msg.contains("state RUNNING"), "got: {msg}");
+        assert!(msg.contains("state PAUSED"), "got: {msg}");
         assert!(msg.contains("destroy_instance"), "got: {msg}");
-        // Still exactly one Instance, still RUNNING.
-        assert_eq!(orch.state(), InstanceState::Running);
+        // Still exactly one Instance (PAUSED by default — issue #10).
+        assert_eq!(orch.state(), InstanceState::Paused);
     }
 
     #[tokio::test]
@@ -1423,7 +1452,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_reflects_tracked_run_state_across_pause_resume() {
-        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        // Auto-start so the Guest begins RUNNING; then exercise pause/resume.
+        let mut orch = orchestrator_autostart(FakeQemuDriver::new());
         // No Instance → get_status is refused (get_instance is the NONE-safe view).
         assert!(orch.get_status().await.is_err());
 
@@ -1481,7 +1511,8 @@ mod tests {
 
     #[tokio::test]
     async fn reset_and_powerdown_leave_the_lifecycle_state_unchanged() {
-        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        // Auto-start so the Guest is RUNNING; reset/powerdown must leave it RUNNING.
+        let mut orch = orchestrator_autostart(FakeQemuDriver::new());
         // No Instance → both are refused with an actionable message.
         assert!(orch
             .reset_instance()
@@ -1570,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_command_allows_an_allowlisted_command_and_forwards_the_normalised_name() {
-        let mut orch = orchestrator_with(FakeQemuDriver::new());
+        let mut orch = orchestrator_autostart(FakeQemuDriver::new());
         orch.create_instance(json!({})).await.unwrap();
         // Stray case/space normalises to `query-status` and reaches the fake handle.
         let result = orch
@@ -1833,7 +1864,7 @@ mod tests {
         for task in tasks {
             match task.await.expect("task joined") {
                 Ok(result) => {
-                    assert_eq!(result.state, InstanceState::Running);
+                    assert_eq!(result.state, InstanceState::Paused);
                     wins += 1;
                 }
                 Err(err) => {
@@ -1855,6 +1886,6 @@ mod tests {
             1,
             "the driver must have launched exactly once"
         );
-        assert_eq!(orch.lock().await.state(), InstanceState::Running);
+        assert_eq!(orch.lock().await.state(), InstanceState::Paused);
     }
 }
