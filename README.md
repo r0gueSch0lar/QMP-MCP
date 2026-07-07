@@ -96,8 +96,11 @@ three optional fields: **`kernel`** and **`dtb`** (a kernel image and device-tre
 a name in the Image Store) and **`appendCmdline`** (the kernel command line). The server
 emits `-kernel`/`-dtb`/`-append` and, because the board's hardware is fixed, omits
 `-cpu`/`-smp`/`-m`; attach the SD image with `"interface": "sd"` (sized to a power of two, or
-QEMU refuses it). None of this is Pi-only — any direct-kernel boot (a bare `virt` machine,
-say) can use `kernel`/`appendCmdline` alongside the usual CPU and memory settings.
+QEMU refuses it). These boards also have no PCI bus, so the default NIC can't attach — pick
+`network.model` `usb-net` (their USB NIC) or `network.mode` `none`; the server refuses an
+unattachable NIC up front rather than letting QEMU abort. None of this is Pi-only — any
+direct-kernel boot (a bare `virt` machine, say) can use `kernel`/`appendCmdline` alongside the
+usual CPU and memory settings.
 
 ### How fast it runs: the accelerator
 
@@ -303,14 +306,17 @@ the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, and:
   "dtb": "bcm2710-rpi-3-b.dtb",
   "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
   "disks": [{ "image": "raspios.img", "interface": "sd", "format": "raw" }],
+  "network": { "model": "usb-net" },
   "display": "vnc"
 }
 ```
 
 `console=tty1` puts the console on the framebuffer, so the noVNC Viewer shows the Pi booting
-— logos and all. No `cpu`/`vcpus`/`memoryMb`: the board's hardware is fixed. (On a Pi 3,
-merge the `disable-bt` device-tree overlay into the dtb first, or the console stays glued to
-the Bluetooth-shared UART instead of the screen.)
+— logos and all. No `cpu`/`vcpus`/`memoryMb`: the board's hardware is fixed. The Pi has no
+PCI bus, so the default NIC can't attach — use `"network": { "model": "usb-net" }` for its USB
+NIC, or `"network": { "mode": "none" }` for no networking at all. (On a Pi 3, merge the
+`disable-bt` device-tree overlay into the dtb first, or the console stays glued to the
+Bluetooth-shared UART instead of the screen.)
 
 ## Choosing an implementation
 

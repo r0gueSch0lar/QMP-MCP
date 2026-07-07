@@ -113,16 +113,19 @@ impl DiskInterface {
 /// a free string could carry a comma to inject extra `-device` properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 pub enum NicModel {
-    /// Paravirtual virtio NIC (default).
+    /// Paravirtual virtio NIC (default). PCI.
     #[default]
     #[serde(rename = "virtio-net-pci")]
     VirtioNetPci,
-    /// Widely emulated Intel e1000.
+    /// Widely emulated Intel e1000. PCI.
     #[serde(rename = "e1000")]
     E1000,
-    /// Widely emulated Realtek RTL8139.
+    /// Widely emulated Realtek RTL8139. PCI.
     #[serde(rename = "rtl8139")]
     Rtl8139,
+    /// USB CDC/RNDIS NIC — for boards with a USB bus but no PCI (the `raspi*` boards).
+    #[serde(rename = "usb-net")]
+    UsbNet,
 }
 
 impl NicModel {
@@ -132,7 +135,13 @@ impl NicModel {
             Self::VirtioNetPci => "virtio-net-pci",
             Self::E1000 => "e1000",
             Self::Rtl8139 => "rtl8139",
+            Self::UsbNet => "usb-net",
         }
+    }
+
+    /// True when this NIC attaches to a PCI bus (everything except `usb-net`).
+    pub fn is_pci(self) -> bool {
+        !matches!(self, Self::UsbNet)
     }
 }
 
@@ -150,6 +159,9 @@ pub enum NetworkMode {
     Tap,
     /// Host bridge (requires `QMP_MCP_ALLOW_HOST_NET`).
     Bridge,
+    /// No NIC at all — the escape hatch for boards where no allowlisted NIC can
+    /// attach (e.g. the `raspi*` machines have no PCI bus for the PCI models).
+    None,
 }
 
 impl NetworkMode {
@@ -159,6 +171,7 @@ impl NetworkMode {
             Self::User => "user",
             Self::Tap => "tap",
             Self::Bridge => "bridge",
+            Self::None => "none",
         }
     }
 }
@@ -881,24 +894,49 @@ fn resolve_boot_artifact(
 /// `hostForwards` with a non-user mode are refused rather than silently dropped.
 fn build_network_args(
     network: &Network,
+    machine: &str,
     options: &ArgvOptions,
 ) -> Result<Vec<String>, HardwareSpecError> {
+    if network.mode != NetworkMode::User && !network.host_forwards.is_empty() {
+        let mode = network.mode.as_str();
+        return Err(HardwareSpecError(format!(
+            "network.hostForwards are only valid for user-mode networking (mode \"user\"), but \
+             mode is \"{mode}\". Remove hostForwards, or use mode \"user\"."
+        )));
+    }
+
+    // 'none' — attach no NIC. The escape hatch for boards where no allowlisted NIC
+    // can attach; emit nothing.
+    if network.mode == NetworkMode::None {
+        return Ok(vec![]);
+    }
+
+    // NIC model must match a bus the machine actually has, or QEMU aborts at launch
+    // ("No 'PCI' bus found for device ..."). Fail closed here with an actionable
+    // message instead. The raspi* boards have a USB bus but no PCI bus; every other
+    // machine we target has PCI (via -nodefaults) but no built-in USB controller.
+    let raspi = is_raspi_machine(machine);
+    if network.model == NicModel::UsbNet && !raspi {
+        return Err(HardwareSpecError(format!(
+            "network.model \"usb-net\" needs a USB bus, but machine \"{machine}\" has none (only \
+             the raspi* boards expose a built-in USB bus). Use a PCI NIC \
+             (virtio-net-pci/e1000/rtl8139), or network.mode \"none\"."
+        )));
+    }
+    if network.model.is_pci() && raspi {
+        return Err(HardwareSpecError(format!(
+            "network.model \"{}\" is a PCI NIC, but the raspi* board \"{machine}\" has no PCI bus. \
+             Use network.model \"usb-net\", or network.mode \"none\" for no networking.",
+            network.model.as_str()
+        )));
+    }
+
     // model is an allowlisted enum; escape defensively so it can never inject an
     // extra -device property no matter how the allowlist evolves.
     let device = format!(
         "{},netdev={NETDEV_ID}",
         escape_qemu_opts_value(network.model.as_str())
     );
-
-    if network.mode != NetworkMode::User && !network.host_forwards.is_empty() {
-        let mode = network.mode.as_str();
-        return Err(HardwareSpecError(format!(
-            "network.hostForwards are only valid for user-mode networking (mode \"user\"), but \
-             mode is \"{mode}\". Host-level ({mode}) networking puts the guest on the host LAN, \
-             where QEMU user-mode port-forwards do not apply. Remove hostForwards, or use mode \
-             \"user\"."
-        )));
-    }
 
     if network.mode == NetworkMode::User {
         let range = options
@@ -1069,7 +1107,11 @@ pub fn build_argv(
     }
 
     // Guest NIC: user-mode (SLiRP) by default; tap/bridge only when env-gated on.
-    argv.extend(build_network_args(&spec.network, options)?);
+    argv.extend(build_network_args(
+        &spec.network,
+        spec.machine.as_str(),
+        options,
+    )?);
 
     // The QMP monitor UNIX socket the server owns. The path is NOT comma-escaped —
     // it is emitted verbatim, matching the TS generator exactly.
@@ -1626,7 +1668,11 @@ mod tests {
 
     #[test]
     fn omits_cpu_smp_mem_for_a_fixed_hardware_raspi_board() {
-        let argv = build_argv(&spec(json!({ "machine": "raspi3b" })), &opts()).unwrap();
+        let argv = build_argv(
+            &spec(json!({ "machine": "raspi3b", "network": { "mode": "none" } })),
+            &opts(),
+        )
+        .unwrap();
         assert!(!argv.iter().any(|s| s == "-cpu"));
         assert!(!argv.iter().any(|s| s == "-smp"));
         assert!(!argv.iter().any(|s| s == "-m"));
@@ -1649,7 +1695,8 @@ mod tests {
                 "kernel": "kernel8.img",
                 "dtb": "merged.dtb",
                 "appendCmdline": "console=tty1 root=/dev/mmcblk0p2 rootwait rw",
-                "disks": [{ "image": "dietpi.img", "interface": "sd", "format": "raw" }]
+                "disks": [{ "image": "dietpi.img", "interface": "sd", "format": "raw" }],
+                "network": { "model": "usb-net" }
             })),
             &o,
         )
@@ -1690,7 +1737,7 @@ mod tests {
     #[test]
     fn kernel_without_image_store_fails_closed() {
         let e = build_argv(
-            &spec(json!({ "machine": "raspi3b", "kernel": "kernel8.img" })),
+            &spec(json!({ "machine": "raspi3b", "kernel": "kernel8.img", "network": { "mode": "none" } })),
             &opts(),
         )
         .unwrap_err();
@@ -1703,11 +1750,45 @@ mod tests {
         let mut o = opts();
         o.image_dir = Some(store.path.to_string_lossy().into_owned());
         let e = build_argv(
-            &spec(json!({ "machine": "raspi3b", "kernel": "../vmlinuz" })),
+            &spec(json!({ "machine": "raspi3b", "kernel": "../vmlinuz", "network": { "mode": "none" } })),
             &o,
         )
         .unwrap_err();
         assert!(e.0.contains("kernel reference"));
+    }
+
+    #[test]
+    fn network_none_emits_no_nic() {
+        let argv = build_argv(
+            &spec(json!({ "machine": "raspi3b", "network": { "mode": "none" } })),
+            &opts(),
+        )
+        .unwrap();
+        assert!(!argv.iter().any(|s| s == "-netdev"));
+        assert!(!argv.iter().any(|s| s == "-device"));
+    }
+
+    #[test]
+    fn emits_usb_net_for_raspi_and_refuses_pci_or_usb_mismatch() {
+        // usb-net on a raspi (USB bus, no PCI) is emitted verbatim.
+        let argv = build_argv(
+            &spec(json!({ "machine": "raspi3b", "network": { "model": "usb-net" } })),
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(value_after(&argv, "-device"), "usb-net,netdev=net0");
+        assert_eq!(value_after(&argv, "-netdev"), "user,id=net0");
+        // A PCI NIC (the default) on a raspi is refused, naming usb-net / none.
+        let e = build_argv(&spec(json!({ "machine": "raspi3b" })), &opts()).unwrap_err();
+        assert!(e.0.contains("no PCI bus"));
+        assert!(e.0.contains("usb-net") && e.0.contains("none"));
+        // usb-net on a non-raspi machine (no USB bus) is refused.
+        let e = build_argv(
+            &spec(json!({ "machine": "q35", "network": { "model": "usb-net" } })),
+            &opts(),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("usb-net") && e.0.contains("needs a USB bus"));
     }
 
     #[test]

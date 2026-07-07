@@ -832,7 +832,10 @@ describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
   });
 
   it('omits -cpu/-smp/-m for a fixed-hardware raspi board', () => {
-    const argv = buildArgv(spec({ machine: 'raspi3b' }), { accel: 'tcg', qmpSocketPath: SOCK });
+    const argv = buildArgv(spec({ machine: 'raspi3b', network: { mode: 'none' } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
     expect(argv).not.toContain('-cpu');
     expect(argv).not.toContain('-smp');
     expect(argv).not.toContain('-m');
@@ -849,6 +852,7 @@ describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
         dtb: 'merged.dtb',
         appendCmdline: 'console=tty1 root=/dev/mmcblk0p2 rootwait rw',
         disks: [{ image: 'dietpi.img', interface: 'sd', format: 'raw' }],
+        network: { model: 'usb-net' },
       }),
       { accel: 'tcg', qmpSocketPath: SOCK, imageDir: store },
     );
@@ -874,7 +878,7 @@ describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
 
   it('fails closed when a kernel is requested but no Image Store is configured', () => {
     expect(() =>
-      buildArgv(spec({ machine: 'raspi3b', kernel: 'kernel8.img' }), {
+      buildArgv(spec({ machine: 'raspi3b', kernel: 'kernel8.img', network: { mode: 'none' } }), {
         accel: 'tcg',
         qmpSocketPath: SOCK,
       }),
@@ -883,12 +887,54 @@ describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
 
   it('rejects a traversing kernel reference at argv time', () => {
     expect(() =>
-      buildArgv(spec({ machine: 'raspi3b', kernel: '../vmlinuz' }), {
+      buildArgv(spec({ machine: 'raspi3b', kernel: '../vmlinuz', network: { mode: 'none' } }), {
         accel: 'tcg',
         qmpSocketPath: SOCK,
         imageDir: store,
       }),
     ).toThrowError(/kernel reference/);
+  });
+
+  it('network.mode "none" emits no NIC (-netdev/-device)', () => {
+    const argv = buildArgv(spec({ machine: 'raspi3b', network: { mode: 'none' } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(argv).not.toContain('-netdev');
+    expect(argv).not.toContain('-device');
+  });
+
+  it('emits the usb-net NIC for a raspi (USB bus, no PCI)', () => {
+    const argv = buildArgv(spec({ machine: 'raspi3b', network: { model: 'usb-net' } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(argv[argv.indexOf('-device') + 1]).toBe('usb-net,netdev=net0');
+    expect(argv[argv.indexOf('-netdev') + 1]).toBe('user,id=net0');
+  });
+
+  it('refuses a PCI NIC on a raspi (no PCI bus), naming usb-net / none', () => {
+    expect(() =>
+      // virtio-net-pci is the default model — a bare raspi spec must fail closed.
+      buildArgv(spec({ machine: 'raspi3b' }), { accel: 'tcg', qmpSocketPath: SOCK }),
+    ).toThrowError(/no PCI bus.*usb-net.*none/s);
+  });
+
+  it('refuses usb-net on a non-raspi machine (no USB bus)', () => {
+    expect(() =>
+      buildArgv(spec({ machine: 'q35', network: { model: 'usb-net' } }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+      }),
+    ).toThrowError(/usb-net.*needs a USB bus/s);
+  });
+
+  it('allows network.mode "none" on a non-raspi machine too (no NIC)', () => {
+    const argv = buildArgv(spec({ machine: 'q35', network: { mode: 'none' } }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(argv).not.toContain('-device');
   });
 
   it('rejects dtb without kernel (a dtb is only passed to a direct-booted kernel)', () => {
