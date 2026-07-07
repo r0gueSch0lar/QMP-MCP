@@ -75,8 +75,14 @@ export class FakeInstanceProcess implements InstanceProcess {
   #responses: Record<string, unknown | ((args?: Record<string, unknown>) => unknown)>;
   #listeners = new Set<(event: QmpEvent) => void>();
   #resolveExited!: () => void;
-  /** Simulated Guest-CPU run-state: `stop` pauses it, `cont` resumes it. */
-  #running = true;
+  /**
+   * Simulated Guest-CPU run-state: `stop` pauses it, `cont` resumes it. Starts
+   * FALSE, modelling QEMU's `-S` startup pause — the Guest is loaded but frozen
+   * until the first `cont` (an explicit resume_instance, or create's auto-start).
+   * So `query-status` reads `paused` right after create, matching the PAUSED
+   * lifecycle state the Orchestrator lands in by default (issue #10).
+   */
+  #running = false;
 
   constructor(responses: Record<string, unknown | ((args?: Record<string, unknown>) => unknown)>) {
     this.#responses = responses;

@@ -257,9 +257,12 @@ impl QmpMcpServer {
     /// returning `RUNNING` on success. Rejected (with an actionable message) when an
     /// Instance already exists — only one runs at a time (ADR-0001/0004).
     #[tool(
-        description = "Build and launch the single managed QEMU Instance from a Hardware Spec, \
-                       bringing it to RUNNING. Rejected if an Instance already exists — destroy \
-                       it first. Only one Instance runs at a time."
+        description = "Build and launch the single managed QEMU Instance from a Hardware Spec and \
+                       negotiate its QMP session. Reports the chosen accelerator (KVM or TCG). \
+                       Rejected if an Instance already exists — destroy it first. The Guest loads \
+                       PAUSED (CPUs frozen at the -S startup pause for inspection) — call \
+                       resume_instance to start it, unless the server runs with \
+                       QMP_MCP_AUTO_START=true (then it auto-starts)."
     )]
     async fn create_instance(
         &self,
@@ -791,7 +794,7 @@ mod tests {
         assert_eq!(view.state, "NONE");
         assert!(server.get_status().await.is_err());
 
-        // Create → RUNNING.
+        // Create → PAUSED (loaded, frozen at -S; issue #10) — auto-start off.
         let created = server
             .create_instance(Parameters(
                 serde_json::from_value(serde_json::json!({})).unwrap(),
@@ -799,14 +802,15 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(created.state, "RUNNING");
+        assert_eq!(created.state, "PAUSED");
         assert_eq!(created.accel, "tcg");
 
         let view = server.get_instance().await.unwrap().0;
-        assert_eq!(view.state, "RUNNING");
+        assert_eq!(view.state, "PAUSED");
         assert!(view.spec.is_some());
+        // get_status (live query-status) agrees: the Guest is not executing.
         let status = server.get_status().await.unwrap().0;
-        assert_eq!(status.run_state["status"], "running");
+        assert_eq!(status.run_state["status"], "paused");
 
         // Create-while-running is rejected through the tool too.
         assert!(server
@@ -880,7 +884,8 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(ok.result["status"], "running");
+        // Auto-start off, so the Guest is paused; query-status forwards that faithfully.
+        assert_eq!(ok.result["status"], "paused");
 
         // A hard-denied command is refused with a reason naming the denylist. (A
         // `let else` avoids requiring `Debug` on the `Json` success type.)
