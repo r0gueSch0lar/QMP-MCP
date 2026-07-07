@@ -35,14 +35,17 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(makeOrchestrator(new FakeQemuDriver()).getInstance().state).toBe('NONE');
   });
 
-  it('create brings the Instance to RUNNING and launches via the driver port', async () => {
+  it('create loads the Instance PAUSED by default (frozen at -S) and launches via the driver port (issue #10)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver);
 
     const result = await orch.createInstance({ machine: 'q35', memoryMb: 128 });
 
-    expect(result.state).toBe('RUNNING');
-    expect(orch.getInstance().state).toBe('RUNNING');
+    // Default (no auto-start): the Guest is loaded but frozen at -S, so the honest
+    // lifecycle state is PAUSED — and get_status agrees (query-status: paused).
+    expect(result.state).toBe('PAUSED');
+    expect(orch.getInstance().state).toBe('PAUSED');
+    expect(await orch.getStatus()).toMatchObject({ running: false });
     expect(driver.launches).toHaveLength(1);
     expect(driver.launches[0]?.binary).toBe('qemu-system-x86_64');
     expect(driver.launches[0]?.qmpSocketPath).toBe(SOCK);
@@ -57,12 +60,15 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(driver.lastProcess?.executed.some((e) => e.command === 'cont')).toBe(false);
   });
 
-  it('auto-starts the Guest with a QMP cont on create when autoStart is set (issue #8)', async () => {
+  it('auto-starts the Guest with a QMP cont on create when autoStart is set (issues #8, #10)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver, { autoStart: true });
     const result = await orch.createInstance({});
     expect(result.state).toBe('RUNNING');
+    expect(orch.getInstance().state).toBe('RUNNING');
     expect(driver.lastProcess?.executed.some((e) => e.command === 'cont')).toBe(true);
+    // get_status agrees: the Guest is actually executing.
+    expect(await orch.getStatus()).toMatchObject({ running: true });
   });
 
   it('reports the chosen accelerator (auto -> tcg when no KVM)', async () => {
@@ -88,8 +94,8 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     await orch.createInstance({});
     await expect(orch.createInstance({})).rejects.toBeInstanceOf(LifecycleError);
     await expect(orch.createInstance({})).rejects.toThrow(/destroy_instance/);
-    // Still exactly one Instance.
-    expect(orch.getInstance().state).toBe('RUNNING');
+    // Still exactly one Instance (PAUSED by default — issue #10).
+    expect(orch.getInstance().state).toBe('PAUSED');
   });
 
   it('refuses to start when the QMP socket path is occupied, actionably', async () => {
@@ -147,7 +153,7 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     const orch = makeOrchestrator(driver);
     await orch.createInstance({});
     await orch.destroyInstance();
-    await expect(orch.createInstance({})).resolves.toMatchObject({ state: 'RUNNING' });
+    await expect(orch.createInstance({})).resolves.toMatchObject({ state: 'PAUSED' });
     expect(driver.launches).toHaveLength(2);
   });
 
@@ -168,7 +174,7 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver);
     await orch.createInstance({});
-    expect(orch.getInstance().state).toBe('RUNNING');
+    expect(orch.getInstance().state).toBe('PAUSED');
 
     // qemu vanishes on its own (crash/SIGKILL) without an explicit destroy.
     driver.lastProcess?.simulateExit();
@@ -176,7 +182,7 @@ describe('Orchestrator lifecycle (fake driver)', () => {
 
     expect(orch.getInstance().state).toBe('NONE');
     // The crashed Instance's handle was released, so a new create is accepted.
-    await expect(orch.createInstance({})).resolves.toMatchObject({ state: 'RUNNING' });
+    await expect(orch.createInstance({})).resolves.toMatchObject({ state: 'PAUSED' });
     expect(driver.launches).toHaveLength(2);
   });
 
@@ -192,7 +198,7 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(LifecycleError);
     // Crucially: only one qemu was ever launched.
     expect(driver.launches).toHaveLength(1);
-    expect(orch.getInstance().state).toBe('RUNNING');
+    expect(orch.getInstance().state).toBe('PAUSED');
   });
 });
 
@@ -265,7 +271,8 @@ describe('Orchestrator vnc Display + Viewer (fake driver, ADR-0010)', () => {
     expect(viewers[0]?.options.vncPort).toBe(5900);
     expect(viewers[0]?.options.password).toBe('human-secret');
     expect(viewers[0]?.options.vncPassword).toBe(vncPassword);
-    expect(orch.getInstance().state).toBe('RUNNING');
+    // The vnc Instance loads PAUSED by default like any other (issue #10).
+    expect(orch.getInstance().state).toBe('PAUSED');
 
     await orch.destroyInstance();
     // The Viewer's lifetime equals the Instance's: destroy stops it.
@@ -322,7 +329,7 @@ describe('Orchestrator control commands (fake driver)', () => {
   /** Create an Instance and hand back the orchestrator + its fake process. */
   async function running(options: Partial<OrchestratorOptions> = {}, driverOptions = {}) {
     const driver = new FakeQemuDriver(driverOptions);
-    const orch = makeOrchestrator(driver, options);
+    const orch = makeOrchestrator(driver, { autoStart: true, ...options });
     await orch.createInstance({});
     // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
     const process = driver.lastProcess!;
@@ -479,7 +486,7 @@ describe('Orchestrator generic execute (Command Policy, fake driver)', () => {
   /** Create an Instance and hand back the orchestrator + its fake process. */
   async function running(options: Partial<OrchestratorOptions> = {}, driverOptions = {}) {
     const driver = new FakeQemuDriver(driverOptions);
-    const orch = makeOrchestrator(driver, options);
+    const orch = makeOrchestrator(driver, { autoStart: true, ...options });
     await orch.createInstance({});
     // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
     const process = driver.lastProcess!;
@@ -564,7 +571,7 @@ describe('Orchestrator Event Buffer (fake driver)', () => {
   /** Create an Instance and hand back the orchestrator + its fake process. */
   async function running(options: Partial<OrchestratorOptions> = {}) {
     const driver = new FakeQemuDriver();
-    const orch = makeOrchestrator(driver, options);
+    const orch = makeOrchestrator(driver, { autoStart: true, ...options });
     await orch.createInstance({});
     // biome-ignore lint/style/noNonNullAssertion: a process exists right after create.
     const process = driver.lastProcess!;
