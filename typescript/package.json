@@ -1,6 +1,6 @@
 {
   "name": "qmp-mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Secure MCP server that builds, launches, drives, and tears down a single QEMU VM via QMP.",
   "type": "module",
   "bin": {
