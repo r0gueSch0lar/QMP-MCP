@@ -29,6 +29,7 @@ const DEFAULTS: Config = {
   maxVcpus: 2,
   hostfwdPortRange: { low: 1024, high: 65535 },
   allowHostNet: false,
+  autoStart: false,
   eventBufferSize: 256,
   allowRawArgs: false,
   viewerPassword: undefined,
@@ -55,6 +56,11 @@ describe('loadConfig', () => {
 
   it('treats an empty string as unset and uses the default', () => {
     expect(loadConfig({ QMP_MCP_TRANSPORT: '' })).toEqual(DEFAULTS);
+  });
+
+  it('reads QMP_MCP_AUTO_START (default false, opt-in true) — issue #8', () => {
+    expect(loadConfig({}).autoStart).toBe(false);
+    expect(loadConfig({ QMP_MCP_AUTO_START: 'true' }).autoStart).toBe(true);
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

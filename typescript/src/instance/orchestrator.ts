@@ -22,6 +22,7 @@ import {
   type PortRange,
   resolveAllowHostNet,
   resolveAllowRawArgs,
+  resolveAutoStart,
   resolveEventBufferSize,
   resolveHostfwdPortRange,
   resolveImageDir,
@@ -136,6 +137,12 @@ export interface OrchestratorOptions {
    * Optional: defaults to false (host networking refused) when omitted.
    */
   allowHostNet?: boolean;
+  /**
+   * Whether `create_instance` auto-starts the Guest by issuing QMP `cont` right
+   * after launch (`QMP_MCP_AUTO_START`, issue #8). Optional: defaults to false —
+   * the Guest stays frozen at the `-S` startup pause until `resume_instance`.
+   */
+  autoStart?: boolean;
   /**
    * Hard cap, in MiB, on the spec's `memoryMb` (`QMP_MCP_MAX_MEMORY_MB`, issue
    * #9). An over-cap spec is rejected before qemu is spawned. Optional: omitted
@@ -390,6 +397,16 @@ export class Orchestrator {
       this.#unsubscribeEvents = process.onEvent((event) => this.#eventBuffer.append(event));
       // If the process exits on its own, reflect that the Instance is gone.
       void process.exited.then(() => this.#onProcessExit());
+
+      // Auto-start (issue #8): by default the Guest stays frozen at the `-S`
+      // startup pause (deterministic pre-run inspection) and only runs on an
+      // explicit resume_instance. When QMP_MCP_AUTO_START is on, issue `cont` here
+      // so the reported RUNNING is truthful and the Guest begins executing at once.
+      // Done AFTER event capture is wired so the boot's QMP events are recorded.
+      if (this.#options.autoStart === true) {
+        await process.execute('cont');
+        logger.info('Instance auto-started (QMP_MCP_AUTO_START; QMP cont)');
+      }
 
       logger.info(`Instance RUNNING (${resolution.reason})`);
       return {
@@ -709,6 +726,7 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),
+  autoStart: resolveAutoStart(process.env),
   // Enforce the env-configurable memory/vCPU caps before launch (issue #9).
   maxMemoryMb: resolveMaxMemoryMb(process.env),
   maxVcpus: resolveMaxVcpus(process.env),
