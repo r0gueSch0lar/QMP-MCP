@@ -674,6 +674,7 @@ mod tests {
             iso_dir: None,
             hostfwd_port_range: None,
             allow_host_net: false,
+            auto_start: false,
             max_memory_mb: None,
             max_vcpus: None,
             allow_raw_args: false,

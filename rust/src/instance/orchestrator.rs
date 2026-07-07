@@ -136,6 +136,10 @@ pub struct OrchestratorOptions {
     pub hostfwd_port_range: Option<PortRange>,
     /// Whether host-level (`tap`/`bridge`) networking is permitted (ADR-0009).
     pub allow_host_net: bool,
+    /// Whether `create_instance` auto-starts the Guest by issuing QMP `cont` right
+    /// after launch (`QMP_MCP_AUTO_START`, issue #8). Default false: the Guest stays
+    /// frozen at the `-S` startup pause until `resume_instance`.
+    pub auto_start: bool,
     /// Hard cap, in MiB, on the spec's `memoryMb` (issue #9); `None` skips it.
     pub max_memory_mb: Option<u32>,
     /// Hard cap on the spec's `vcpus` (issue #9); `None` skips it.
@@ -383,6 +387,20 @@ impl Orchestrator {
                 let generation = self.generation;
                 self.state = InstanceState::Running;
                 self.spawn_exit_watcher(generation, exited);
+                // Auto-start (issue #8): by default the Guest stays frozen at the
+                // `-S` startup pause (deterministic pre-run inspection) and only runs
+                // on an explicit resume_instance. When QMP_MCP_AUTO_START is on, issue
+                // `cont` here so the reported RUNNING is truthful. Event capture is
+                // already wired above, so the boot's QMP events are recorded.
+                if self.options.auto_start {
+                    self.handle
+                        .as_ref()
+                        .expect("handle present after publish")
+                        .execute("cont", None)
+                        .await
+                        .map_err(|e| LifecycleError(e.0))?;
+                    tracing::info!("Instance auto-started (QMP_MCP_AUTO_START; QMP cont)");
+                }
                 tracing::info!("Instance RUNNING ({})", resolution.reason);
                 Ok(CreateInstanceResult {
                     state: InstanceState::Running,
@@ -963,6 +981,7 @@ mod tests {
             iso_dir: None,
             hostfwd_port_range: None,
             allow_host_net: false,
+            auto_start: false,
             max_memory_mb: None,
             max_vcpus: None,
             allow_raw_args: false,
@@ -978,6 +997,30 @@ mod tests {
 
     fn orchestrator_with(driver: FakeQemuDriver) -> Orchestrator {
         Orchestrator::new(Box::new(driver), test_options())
+    }
+
+    #[tokio::test]
+    async fn create_does_not_cont_by_default_guest_stays_paused() {
+        // issue #8: without auto-start, create must NOT issue `cont` — the Guest
+        // stays frozen at the `-S` startup pause until resume_instance.
+        let driver = FakeQemuDriver::new();
+        let commands = driver.commands();
+        let mut orch = orchestrator_with(driver);
+        orch.create_instance(json!({})).await.expect("create");
+        assert!(!commands.lock().unwrap().iter().any(|c| c == "cont"));
+    }
+
+    #[tokio::test]
+    async fn create_auto_starts_with_cont_when_enabled() {
+        // issue #8: with QMP_MCP_AUTO_START, create issues `cont` after launch.
+        let driver = FakeQemuDriver::new();
+        let commands = driver.commands();
+        let mut options = test_options();
+        options.auto_start = true;
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        let result = orch.create_instance(json!({})).await.expect("create");
+        assert_eq!(result.state, InstanceState::Running);
+        assert!(commands.lock().unwrap().iter().any(|c| c == "cont"));
     }
 
     use crate::viewer::ViewerError;

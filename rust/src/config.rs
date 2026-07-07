@@ -182,6 +182,10 @@ pub struct Config {
     pub hostfwd_port_range: PortRange,
     /// When true, host-level guest networking (`tap`/`bridge`) is permitted.
     pub allow_host_net: bool,
+    /// When true, `create_instance` auto-starts the Guest by issuing QMP `cont`
+    /// right after launch (`QMP_MCP_AUTO_START`, issue #8). Default false: the Guest
+    /// loads paused at the `-S` startup pause and only runs on `resume_instance`.
+    pub auto_start: bool,
     /// Capacity of the Event Buffer (issue #12).
     pub event_buffer_size: u32,
     /// When true, a Hardware Spec's `extraArgs` are appended to the argv (ADR-0002).
@@ -575,6 +579,7 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_ALLOW_HOST_NET"),
             false,
         )?,
+        auto_start: parse_boolean("QMP_MCP_AUTO_START", get(env, "QMP_MCP_AUTO_START"), false)?,
         event_buffer_size: parse_positive_int(
             "QMP_MCP_EVENT_BUFFER_SIZE",
             get(env, "QMP_MCP_EVENT_BUFFER_SIZE"),
@@ -635,6 +640,7 @@ mod tests {
                 high: 65535,
             },
             allow_host_net: false,
+            auto_start: false,
             event_buffer_size: 256,
             allow_raw_args: false,
             viewer_password: None,
@@ -1119,6 +1125,17 @@ mod tests {
             .unwrap_err()
             .0
             .contains("QMP_MCP_ALLOW_HOST_NET must be \"true\" or \"false\""));
+    }
+
+    #[test]
+    fn auto_start_defaults_false_and_reads_true() {
+        // issue #8: create_instance leaves the Guest paused unless QMP_MCP_AUTO_START.
+        assert!(!load_config(&env(&[])).unwrap().auto_start);
+        assert!(
+            load_config(&env(&[("QMP_MCP_AUTO_START", "true")]))
+                .unwrap()
+                .auto_start
+        );
     }
 
     #[test]

@@ -127,6 +127,14 @@ export interface Config {
    */
   allowHostNet: boolean;
   /**
+   * When true, `create_instance` auto-starts the Guest: it issues QMP `cont`
+   * immediately after launch (`QMP_MCP_AUTO_START`), so the Instance begins
+   * executing rather than staying frozen at the `-S` startup pause. Default false —
+   * the Guest loads paused for deterministic inspection and only runs on an explicit
+   * `resume_instance` (issue #8).
+   */
+  autoStart: boolean;
+  /**
    * Capacity of the Event Buffer — the bounded ring of recent QMP async events
    * the agent reads via `get_events`/`wait_for_event` (`QMP_MCP_EVENT_BUFFER_SIZE`,
    * default {@link DEFAULT_EVENT_BUFFER_SIZE}). Once full, the oldest event is
@@ -385,6 +393,15 @@ export function resolveAllowHostNet(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve whether `create_instance` auto-starts the Guest (`QMP_MCP_AUTO_START`,
+ * default false). Exported so the Orchestrator singleton and {@link loadConfig}
+ * share one source of truth (issue #8).
+ */
+export function resolveAutoStart(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_AUTO_START', env.QMP_MCP_AUTO_START, false);
+}
+
+/**
  * Resolve the Event Buffer capacity (`QMP_MCP_EVENT_BUFFER_SIZE`, default
  * {@link DEFAULT_EVENT_BUFFER_SIZE}). Positive-integer, fail-closed on garbage.
  * Exported so the Orchestrator singleton and {@link loadConfig} share one source
@@ -521,6 +538,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     maxVcpus: resolveMaxVcpus(env),
     hostfwdPortRange: resolveHostfwdPortRange(env),
     allowHostNet: resolveAllowHostNet(env),
+    autoStart: resolveAutoStart(env),
     eventBufferSize: resolveEventBufferSize(env),
     allowRawArgs: resolveAllowRawArgs(env),
     viewerPassword: resolveViewerPassword(env),
