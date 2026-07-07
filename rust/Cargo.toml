@@ -1,6 +1,6 @@
 [package]
 name = "qmp-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "QEMU MCP server (Rust variant) — build, launch, drive, and tear down a single QEMU Instance over MCP. Second implementation of the shared qmp-mcp bounded context (see ../CONTEXT.md, ADR-0011)."
