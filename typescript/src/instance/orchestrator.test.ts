@@ -50,6 +50,21 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(driver.launches[0]?.argv).toContain('-qmp');
   });
 
+  it('does NOT issue cont on create by default — the Guest stays paused (issue #8)', async () => {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver);
+    await orch.createInstance({});
+    expect(driver.lastProcess?.executed.some((e) => e.command === 'cont')).toBe(false);
+  });
+
+  it('auto-starts the Guest with a QMP cont on create when autoStart is set (issue #8)', async () => {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver, { autoStart: true });
+    const result = await orch.createInstance({});
+    expect(result.state).toBe('RUNNING');
+    expect(driver.lastProcess?.executed.some((e) => e.command === 'cont')).toBe(true);
+  });
+
   it('reports the chosen accelerator (auto -> tcg when no KVM)', async () => {
     const orch = makeOrchestrator(new FakeQemuDriver(), { kvmAvailable: () => false });
     const result = await orch.createInstance({});

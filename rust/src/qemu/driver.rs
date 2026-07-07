@@ -128,6 +128,11 @@ pub(crate) struct FakeQemuDriver {
     /// (crash/SIGKILL) on the current Instance via [`exit_slot`](FakeQemuDriver::exit_slot)
     /// — the fake equivalent of the TS fake process's `simulateExit` (issue #28).
     last_exit: Arc<Mutex<Option<Arc<watch::Sender<bool>>>>>,
+    /// The QMP command names the MOST-RECENTLY launched Instance's handle has been
+    /// asked to `execute`, in order. Cleared on each launch and shared with the
+    /// handle, so a test can assert what the Orchestrator issued (the equivalent of
+    /// the TS fake process's `executed`) — e.g. that create auto-starts with `cont`.
+    last_commands: Arc<Mutex<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -138,6 +143,7 @@ impl Default for FakeQemuDriver {
             launches: Arc::new(Mutex::new(Vec::new())),
             last_events: Arc::new(Mutex::new(None)),
             last_exit: Arc::new(Mutex::new(None)),
+            last_commands: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -181,6 +187,13 @@ impl FakeQemuDriver {
     pub(crate) fn exit_slot(&self) -> Arc<Mutex<Option<Arc<watch::Sender<bool>>>>> {
         Arc::clone(&self.last_exit)
     }
+
+    /// A handle onto the current Instance's executed-command log, readable after a
+    /// launch so a test can assert which QMP commands the Orchestrator issued (e.g.
+    /// that create auto-started with `cont`). Each launch clears it.
+    pub(crate) fn commands(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.last_commands)
+    }
 }
 
 #[cfg(test)]
@@ -203,7 +216,16 @@ impl QemuDriver for FakeQemuDriver {
         // it via the recorded slot to simulate an unexpected qemu exit).
         let exit_tx = Arc::new(watch::channel(false).0);
         *self.last_exit.lock().expect("fake exit slot mutex") = Some(Arc::clone(&exit_tx));
-        Ok(Box::new(FakeInstanceHandle::new(events_tx, exit_tx)))
+        // Fresh per-Instance command log: clear it and share it with the handle so a
+        // test reads only the current Instance's executed QMP commands.
+        self.last_commands
+            .lock()
+            .expect("fake commands mutex")
+            .clear();
+        let commands = Arc::clone(&self.last_commands);
+        Ok(Box::new(FakeInstanceHandle::new(
+            events_tx, exit_tx, commands,
+        )))
     }
 }
 
@@ -229,11 +251,17 @@ struct FakeInstanceHandle {
     /// test-driven simulated unexpected exit (crash/SIGKILL) via the driver's exit slot.
     /// `exited` resolves once it is set, mirroring the real QMP-session close (issue #28).
     exit_tx: Arc<watch::Sender<bool>>,
+    /// Shared log of QMP command names this handle has executed (for test assertions).
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 #[cfg(test)]
 impl FakeInstanceHandle {
-    fn new(events_tx: broadcast::Sender<QmpEvent>, exit_tx: Arc<watch::Sender<bool>>) -> Self {
+    fn new(
+        events_tx: broadcast::Sender<QmpEvent>,
+        exit_tx: Arc<watch::Sender<bool>>,
+        commands: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         Self {
             state: Mutex::new(FakeHandleState {
                 running: true,
@@ -241,6 +269,7 @@ impl FakeInstanceHandle {
             }),
             events_tx,
             exit_tx,
+            commands,
         }
     }
 }
@@ -253,6 +282,11 @@ impl InstanceHandle for FakeInstanceHandle {
         command: &str,
         args: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, DriverError> {
+        // Record the command for test assertions (e.g. create auto-start issues cont).
+        self.commands
+            .lock()
+            .expect("fake commands mutex")
+            .push(command.to_string());
         // No `.await` is held across this guard, so it never blocks the runtime.
         let mut state = self.state.lock().expect("fake handle mutex");
         if state.closed {

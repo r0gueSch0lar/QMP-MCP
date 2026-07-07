@@ -13,7 +13,9 @@ export default class CreateInstanceTool extends MCPTool {
   name = 'create_instance';
   description =
     'Build and launch the single QEMU Instance from a Hardware Spec, negotiate its QMP session, and ' +
-    'bring it to RUNNING. Reports the chosen accelerator (KVM or TCG). Fails if an Instance already exists.';
+    'bring it to RUNNING. Reports the chosen accelerator (KVM or TCG). Fails if an Instance already ' +
+    'exists. Note: the Guest loads PAUSED (CPUs frozen for inspection) — call resume_instance to ' +
+    'start it, unless the server runs with QMP_MCP_AUTO_START=true (then it auto-starts).';
   schema = hardwareSpecSchema;
   annotations = {
     title: 'Create Instance',
