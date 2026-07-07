@@ -223,6 +223,7 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         iso_dir: Some(config.iso_dir.clone()),
         hostfwd_port_range: Some(config.hostfwd_port_range),
         allow_host_net: config.allow_host_net,
+        auto_start: config.auto_start,
         max_memory_mb: Some(config.max_memory_mb),
         max_vcpus: Some(config.max_vcpus),
         allow_raw_args: config.allow_raw_args,
