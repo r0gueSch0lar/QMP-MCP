@@ -28,6 +28,8 @@ describe('parseHardwareSpec', () => {
       accel: 'auto',
       // The Display defaults to none — a fully headless Instance (ADR-0010).
       display: 'none',
+      // No display adapter by default (issue #15).
+      displayDevice: 'none',
       disks: [],
       // Networking defaults to user-mode (SLiRP) with an allowlisted NIC and no
       // port-forwards (ADR-0009).
@@ -958,5 +960,86 @@ describe('buildArgv raspi / direct-kernel boot (issue #4)', () => {
   it('accepts sd as a disk interface', () => {
     const parsed = parseHardwareSpec({ disks: [{ image: 'dietpi.img', interface: 'sd' }] });
     expect(parsed.disks[0]?.interface).toBe('sd');
+  });
+});
+
+describe('buildArgv display adapter + initrd (issue #15)', () => {
+  let store: string;
+
+  beforeAll(async () => {
+    store = await mkdtemp(join(tmpdir(), 'hw-disp-'));
+    await writeFile(join(store, 'vmlinuz'), '');
+    await writeFile(join(store, 'initrd.img'), '');
+    await writeFile(join(store, 'rootfs.img'), '');
+  });
+
+  afterAll(async () => {
+    await rm(store, { recursive: true, force: true });
+  });
+
+  it('displayDevice virtio-gpu emits -device virtio-gpu-pci (so virt/q35 render over VNC)', () => {
+    const argv = buildArgv(spec({ machine: 'virt', display: 'vnc', displayDevice: 'virtio-gpu' }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(argv[argv.indexOf('-device') + 1]).toBe('virtio-gpu-pci');
+    // The adapter sits after the -vnc block.
+    expect(argv.indexOf('-vnc')).toBeLessThan(argv.indexOf('virtio-gpu-pci'));
+  });
+
+  it('maps vga -> VGA and ramfb -> ramfb', () => {
+    const vga = buildArgv(spec({ machine: 'q35', displayDevice: 'vga' }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(vga).toContain('VGA');
+    const ramfb = buildArgv(spec({ machine: 'virt', displayDevice: 'ramfb' }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    expect(ramfb).toContain('ramfb');
+  });
+
+  it('emits no display -device by default (displayDevice none)', () => {
+    const argv = buildArgv(spec({ machine: 'q35', display: 'vnc' }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+    });
+    // Only the NIC -device is present; no display adapter.
+    expect(argv.filter((a) => a === '-device')).toHaveLength(1);
+    expect(argv[argv.indexOf('-device') + 1]).toBe('virtio-net-pci,netdev=net0');
+  });
+
+  it('refuses a displayDevice on a raspi board (built-in framebuffer, no PCI)', () => {
+    expect(() =>
+      buildArgv(
+        spec({ machine: 'raspi3b', displayDevice: 'virtio-gpu', network: { mode: 'none' } }),
+        {
+          accel: 'tcg',
+          qmpSocketPath: SOCK,
+        },
+      ),
+    ).toThrowError(/raspi.*built-in framebuffer|displayDevice.*raspi/s);
+  });
+
+  it('emits -initrd (resolved by name in the Image Store) right after -kernel', () => {
+    const argv = buildArgv(
+      spec({ machine: 'virt', cpu: 'cortex-a72', kernel: 'vmlinuz', initrd: 'initrd.img' }),
+      { accel: 'tcg', qmpSocketPath: SOCK, imageDir: store },
+    );
+    expect(argv[argv.indexOf('-initrd') + 1]).toBe(join(store, 'initrd.img'));
+    expect(argv.indexOf('-kernel')).toBeLessThan(argv.indexOf('-initrd'));
+  });
+
+  it('rejects initrd without kernel', () => {
+    expect(() => parseHardwareSpec({ initrd: 'initrd.img' })).toThrowError(
+      /initrd requires kernel/,
+    );
+  });
+
+  it('accepts the display-device enum values', () => {
+    for (const d of ['none', 'virtio-gpu', 'vga', 'ramfb'] as const) {
+      expect(parseHardwareSpec({ displayDevice: d }).displayDevice).toBe(d);
+    }
   });
 });

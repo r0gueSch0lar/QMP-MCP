@@ -80,6 +80,51 @@ pub enum DisplayMode {
     Vnc,
 }
 
+/// The Guest's display adapter — the device producing the framebuffer the VNC
+/// Display shows (issue #15). `-nodefaults` strips a machine's default adapter, and
+/// machines like `virt`/`q35` have none, so WITHOUT one the VNC surface is blank.
+/// `virtio-gpu` exposes a DRM device (Wayland/X desktops render); `vga` is legacy;
+/// `ramfb` is a firmware framebuffer for boards without PCI. `none` (default) is
+/// headless. The `raspi*` boards have a built-in framebuffer and must stay `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+pub enum DisplayDevice {
+    /// No display adapter (default).
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// DRM/Wayland-capable virtio GPU (`-device virtio-gpu-pci`); needs a PCI bus.
+    #[serde(rename = "virtio-gpu")]
+    VirtioGpu,
+    /// Legacy VGA adapter (`-device VGA`); needs a PCI bus.
+    #[serde(rename = "vga")]
+    Vga,
+    /// Simple firmware framebuffer (`-device ramfb`); works without PCI.
+    #[serde(rename = "ramfb")]
+    Ramfb,
+}
+
+impl DisplayDevice {
+    /// The QEMU `-device` model this adapter emits, or `None` for `none`.
+    pub fn qemu_device(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::VirtioGpu => Some("virtio-gpu-pci"),
+            Self::Vga => Some("VGA"),
+            Self::Ramfb => Some("ramfb"),
+        }
+    }
+
+    /// Canonical spelling (the spec enum value), for error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::VirtioGpu => "virtio-gpu",
+            Self::Vga => "vga",
+            Self::Ramfb => "ramfb",
+        }
+    }
+}
+
 /// Guest-visible disk controller a disk attaches through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -402,6 +447,10 @@ pub struct HardwareSpecParams {
     /// Guest Display mode.
     #[serde(default)]
     pub display: DisplayMode,
+    /// Guest display adapter (issue #15): `none` (default), `virtio-gpu`, `vga`, or
+    /// `ramfb`. virt/q35 need one for display:vnc to show anything; raspi* stay none.
+    #[serde(default)]
+    pub display_device: DisplayDevice,
     /// Guest disks, each referencing an image by name in the Image Store.
     #[serde(default)]
     pub disks: Vec<DiskParams>,
@@ -416,6 +465,10 @@ pub struct HardwareSpecParams {
     /// direct-kernel boot (e.g. the `virt` machine).
     #[serde(default)]
     pub kernel: Option<String>,
+    /// Optional initramfs, by NAME in the Image Store (emitted as `-initrd`). Requires
+    /// `kernel`. Needed to direct-kernel-boot most distros (kernel + initrd + rootfs).
+    #[serde(default)]
+    pub initrd: Option<String>,
     /// Optional device tree blob, by NAME in the Image Store (emitted as `-dtb`).
     /// Requires `kernel`.
     #[serde(default)]
@@ -509,6 +562,8 @@ pub struct HardwareSpec {
     pub accel: AccelMode,
     /// Guest Display mode.
     pub display: DisplayMode,
+    /// Guest display adapter (issue #15); `none` unless the machine needs one.
+    pub display_device: DisplayDevice,
     /// Guest disks.
     pub disks: Vec<Disk>,
     /// Optional CD-ROM.
@@ -517,6 +572,8 @@ pub struct HardwareSpec {
     pub boot: Option<BootOrder>,
     /// Optional external kernel image (by name in the Image Store) to direct-boot.
     pub kernel: Option<String>,
+    /// Optional initramfs (by name in the Image Store). Only set with `kernel`.
+    pub initrd: Option<String>,
     /// Optional device tree blob (by name in the Image Store). Only set with `kernel`.
     pub dtb: Option<String>,
     /// Optional kernel command line (emitted as one `-append` token). Only set with `kernel`.
@@ -620,10 +677,18 @@ pub fn parse_hardware_spec(
     // time (like disks), so here we only reject an empty name and enforce the
     // cross-field rule that -dtb/-append are meaningless without a -kernel.
     let kernel = validate_optional_name("kernel", params.kernel)?;
+    let initrd = validate_optional_name("initrd", params.initrd)?;
     let dtb = validate_optional_name("dtb", params.dtb)?;
     let append_cmdline = params.append_cmdline;
     if let Some(cmdline) = &append_cmdline {
         validate_append_cmdline(cmdline)?;
+    }
+    if initrd.is_some() && kernel.is_none() {
+        return Err(HardwareSpecError(
+            "Invalid Hardware Spec — initrd: initrd requires kernel (an initramfs is only passed \
+             to a direct-booted kernel). Set kernel, or remove initrd."
+                .to_string(),
+        ));
     }
     if dtb.is_some() && kernel.is_none() {
         return Err(HardwareSpecError(
@@ -647,10 +712,12 @@ pub fn parse_hardware_spec(
         memory_mb,
         accel: params.accel,
         display: params.display,
+        display_device: params.display_device,
         disks,
         cdrom,
         boot,
         kernel,
+        initrd,
         dtb,
         append_cmdline,
         network,
@@ -1067,6 +1134,14 @@ pub fn build_argv(
             "kernel",
         )?);
     }
+    if let Some(initrd) = &spec.initrd {
+        argv.push("-initrd".to_string());
+        argv.push(resolve_boot_artifact(
+            initrd,
+            options.image_dir.as_deref(),
+            "initrd",
+        )?);
+    }
     if let Some(dtb) = &spec.dtb {
         argv.push("-dtb".to_string());
         argv.push(resolve_boot_artifact(
@@ -1091,6 +1166,24 @@ pub fn build_argv(
         argv.push(format!(
             "{VNC_LOOPBACK_HOST}:{VNC_DISPLAY_NUMBER},password=on"
         ));
+    }
+
+    // Display adapter (issue #15). `-nodefaults` strips a machine's default adapter,
+    // and machines like virt/q35 have none, so a VNC Display needs an explicit device
+    // to show anything. The raspi* boards have a built-in framebuffer (and no PCI bus
+    // for a PCI adapter), so they must stay displayDevice:none and render directly.
+    if let Some(device) = spec.display_device.qemu_device() {
+        if raspi {
+            return Err(HardwareSpecError(format!(
+                "displayDevice \"{}\" cannot be attached to the raspi* board \"{}\": these boards \
+                 render over their built-in framebuffer, so displayDevice must be \"none\" \
+                 (display:vnc shows that framebuffer directly).",
+                spec.display_device.as_str(),
+                spec.machine.as_str()
+            )));
+        }
+        argv.push("-device".to_string());
+        argv.push(device.to_string());
     }
 
     for disk in &spec.disks {
@@ -1811,6 +1904,74 @@ mod tests {
     fn accepts_sd_as_a_disk_interface() {
         let s = spec(json!({ "disks": [{ "image": "dietpi.img", "interface": "sd" }] }));
         assert_eq!(s.disks[0].interface, DiskInterface::Sd);
+    }
+
+    // --- display adapter + initrd (issue #15) -------------------------------
+
+    #[test]
+    fn display_device_maps_to_the_qemu_device_and_defaults_to_none() {
+        let argv = build_argv(
+            &spec(json!({ "machine": "virt", "display": "vnc", "displayDevice": "virtio-gpu" })),
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(value_after(&argv, "-device"), "virtio-gpu-pci");
+        assert!(index_of(&argv, "-vnc") < index_of(&argv, "-device"));
+        // vga / ramfb spellings.
+        let vga = build_argv(
+            &spec(json!({ "machine": "q35", "displayDevice": "vga" })),
+            &opts(),
+        )
+        .unwrap();
+        assert!(vga.iter().any(|s| s == "VGA"));
+        let ramfb = build_argv(
+            &spec(json!({ "machine": "virt", "displayDevice": "ramfb" })),
+            &opts(),
+        )
+        .unwrap();
+        assert!(ramfb.iter().any(|s| s == "ramfb"));
+        // Default none: the only -device is the NIC.
+        let none = build_argv(
+            &spec(json!({ "machine": "q35", "display": "vnc" })),
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(
+            none.iter().filter(|s| *s == "-device").count(),
+            1,
+            "only the NIC device"
+        );
+    }
+
+    #[test]
+    fn display_device_refused_on_raspi() {
+        let e = build_argv(
+            &spec(json!({ "machine": "raspi3b", "displayDevice": "virtio-gpu", "network": { "mode": "none" } })),
+            &opts(),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("built-in framebuffer"));
+        assert!(e.0.contains("virtio-gpu"));
+    }
+
+    #[test]
+    fn emits_initrd_after_kernel_and_requires_kernel() {
+        let store = TempDir::new("hw-initrd");
+        for f in ["vmlinuz", "initrd.img"] {
+            std::fs::write(store.path.join(f), b"").unwrap();
+        }
+        let mut o = opts();
+        o.image_dir = Some(store.path.to_string_lossy().into_owned());
+        let argv = build_argv(
+            &spec(json!({ "machine": "virt", "cpu": "cortex-a72", "kernel": "vmlinuz", "initrd": "initrd.img" })),
+            &o,
+        )
+        .unwrap();
+        assert!(value_after(&argv, "-initrd").ends_with("/initrd.img"));
+        assert!(index_of(&argv, "-kernel") < index_of(&argv, "-initrd"));
+        // initrd without kernel is refused at parse time.
+        let e = parse_hardware_spec(json!({ "initrd": "initrd.img" })).unwrap_err();
+        assert!(e.0.contains("initrd requires kernel"));
     }
 
     /// A best-effort self-cleaning temp directory for the filesystem-touching argv
