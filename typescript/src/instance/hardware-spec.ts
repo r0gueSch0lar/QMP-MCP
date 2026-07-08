@@ -52,6 +52,12 @@ export type DisplayMode = (typeof DISPLAY_MODES)[number];
  * boards without PCI. `none` (default) is headless. The `raspi*` boards have a
  * BUILT-IN framebuffer and must stay `none`. Each value is a CLOSED enum, mapped to
  * a fixed `-device` name — no agent free-text reaches the argv.
+ *
+ * Picking between them: `virtio-gpu` shows nothing until the guest loads its DRM
+ * driver, so it suits a system that boots straight into a DRM/Wayland desktop. `vga`
+ * has a legacy text mode, so it renders the WHOLE path — bootloader, kernel console,
+ * then X — which is what you want for a **live ISO** or anything where the boot menu
+ * or early console must be visible (an ISO's bootloader can't draw on `virtio-gpu`).
  */
 export const DISPLAY_DEVICES = ['none', 'virtio-gpu', 'vga', 'ramfb'] as const;
 export type DisplayDevice = (typeof DISPLAY_DEVICES)[number];
