@@ -17,8 +17,9 @@ does in a container.
 ## Requirements
 
 - **Rust 1.96+** (edition 2021) to build.
-- **QEMU** on your `PATH` at runtime — `qemu-system-x86_64` (or another `qemu-system-*`;
-  see `QMP_MCP_QEMU_BINARY`) and `qemu-img`.
+- **QEMU** on your `PATH` at runtime — the emulator is picked from the spec's `machine`
+  (`qemu-system-x86_64`, `qemu-system-aarch64` for ARM/raspi, …; override with
+  `QMP_MCP_QEMU_BINARY`), plus `qemu-img`.
 - Builds and runs on **Linux** (x86-64, ARM64) and **macOS** (Intel & Apple Silicon) —
   see [Building for other platforms](#building-for-other-platforms).
 
@@ -204,7 +205,7 @@ ones you'll reach for:
 | `QMP_MCP_API_KEYS` | _(unset)_ | comma-separated API keys for the HTTP transport |
 | `QMP_MCP_AUTH` / `QMP_MCP_JWT_SECRET` | `apikey` | switch to `jwt` (HS256 Bearer tokens) instead of API keys |
 | `QMP_MCP_ALLOW_INSECURE` | `false` | run HTTP unauthenticated (local dev only) |
-| `QMP_MCP_QEMU_BINARY` | `qemu-system-x86_64` | which emulator to launch — set `qemu-system-aarch64` for ARM guests, etc. (the spec's `machine`/`cpu` still shape the argv) |
+| `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | override the emulator for every Instance; unset derives it from `machine` (q35→x86_64, virt/raspi*→aarch64, ADR-0013) |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the read-write disk folder / read-only ISO folder |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the noVNC viewer (required to request a `vnc` display) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | let a spec pass raw QEMU flags (the escape hatch) |
