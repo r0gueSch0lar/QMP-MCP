@@ -44,6 +44,26 @@ export const DISPLAY_MODES = ['none', 'vnc'] as const;
 export type DisplayMode = (typeof DISPLAY_MODES)[number];
 
 /**
+ * The Guest's display adapter — the device that produces a framebuffer for the VNC
+ * Display to show. `-nodefaults` strips a machine's default adapter, and machines
+ * like `virt`/`q35` have none built in, so WITHOUT one of these the VNC surface is
+ * blank. `virtio-gpu` exposes a DRM device (`/dev/dri`) so Wayland/X desktops
+ * render; `vga` is the legacy adapter; `ramfb` is a simple firmware framebuffer for
+ * boards without PCI. `none` (default) is headless. The `raspi*` boards have a
+ * BUILT-IN framebuffer and must stay `none`. Each value is a CLOSED enum, mapped to
+ * a fixed `-device` name — no agent free-text reaches the argv.
+ */
+export const DISPLAY_DEVICES = ['none', 'virtio-gpu', 'vga', 'ramfb'] as const;
+export type DisplayDevice = (typeof DISPLAY_DEVICES)[number];
+
+/** Map a {@link DisplayDevice} to the QEMU `-device` model it emits (`none` → none). */
+const DISPLAY_DEVICE_QEMU: Record<Exclude<DisplayDevice, 'none'>, string> = {
+  'virtio-gpu': 'virtio-gpu-pci',
+  vga: 'VGA',
+  ramfb: 'ramfb',
+};
+
+/**
  * The single Instance's loopback VNC Display endpoint (ADR-0010). It is fixed
  * because exactly one Instance runs at a time: VNC display number N maps to TCP
  * port 5900+N, so the server both emits `-vnc 127.0.0.1:N` and points the Viewer's
@@ -299,6 +319,15 @@ export const hardwareSpecSchema = z
         "Guest Display: 'none' (default, fully headless) or 'vnc' (a loopback-only VNC " +
           'Display the optional noVNC Viewer bridges over — requires QMP_MCP_VIEWER_PASSWORD).',
       ),
+    displayDevice: z
+      .enum(DISPLAY_DEVICES)
+      .default('none')
+      .describe(
+        "Guest display adapter that produces the framebuffer the VNC Display shows: 'none' " +
+          "(default, headless), 'virtio-gpu' (DRM/Wayland-capable, for desktops), 'vga', or " +
+          "'ramfb'. Machines like virt/q35 have no built-in adapter, so display:vnc needs one of " +
+          'these to show anything; the raspi* boards have a built-in framebuffer and must stay none.',
+      ),
     disks: z
       .array(diskSchema)
       .default([])
@@ -321,6 +350,14 @@ export const hardwareSpecSchema = z
         'Optional external kernel image to direct-boot, by NAME in the Image Store (emitted as ' +
           '-kernel). REQUIRED for the raspi* boards, which do not read a bootloader from the SD ' +
           'card; also usable for any direct-kernel boot (e.g. the "virt" machine).',
+      ),
+    initrd: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'Optional initramfs to pass the kernel, by NAME in the Image Store (emitted as -initrd). ' +
+          'Requires kernel. Needed to direct-kernel-boot most distros (kernel + initrd + rootfs).',
       ),
     dtb: z
       .string()
@@ -391,6 +428,12 @@ export function parseHardwareSpec(candidate: unknown): HardwareSpec {
       throw new HardwareSpecError(
         'Invalid Hardware Spec — appendCmdline: appendCmdline requires kernel (a command line is ' +
           'only passed to a direct-booted kernel). Set kernel, or remove appendCmdline.',
+      );
+    }
+    if (spec.initrd !== undefined && spec.kernel === undefined) {
+      throw new HardwareSpecError(
+        'Invalid Hardware Spec — initrd: initrd requires kernel (an initramfs is only passed to a ' +
+          'direct-booted kernel). Set kernel, or remove initrd.',
       );
     }
     return spec;
@@ -626,7 +669,7 @@ function buildCdromArgs(cdrom: Cdrom, isoDir: string | undefined): [string, stri
 function resolveBootArtifact(
   name: string,
   imageDir: string | undefined,
-  kind: 'kernel' | 'dtb',
+  kind: 'kernel' | 'dtb' | 'initrd',
 ): string {
   if (imageDir === undefined || imageDir.trim() === '') {
     throw new HardwareSpecError(
@@ -803,6 +846,9 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   if (spec.kernel !== undefined) {
     argv.push('-kernel', resolveBootArtifact(spec.kernel, options.imageDir, 'kernel'));
   }
+  if (spec.initrd !== undefined) {
+    argv.push('-initrd', resolveBootArtifact(spec.initrd, options.imageDir, 'initrd'));
+  }
   if (spec.dtb !== undefined) {
     argv.push('-dtb', resolveBootArtifact(spec.dtb, options.imageDir, 'dtb'));
   }
@@ -817,6 +863,21 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
     // pinned to 127.0.0.1 so the raw VNC port is unreachable off-host — the Viewer
     // is its sole client. The display number is fixed (single Instance).
     argv.push('-vnc', `${VNC_LOOPBACK_HOST}:${VNC_DISPLAY_NUMBER},password=on`);
+  }
+  // Display adapter (issue #15). `-nodefaults` strips a machine's default adapter, and
+  // machines like virt/q35 have none, so a VNC Display needs an explicit device to
+  // show anything. The raspi* boards have a built-in framebuffer (and no PCI bus for a
+  // PCI adapter), so they must stay displayDevice:none and render directly.
+  if (spec.displayDevice !== 'none') {
+    if (raspi) {
+      throw new HardwareSpecError(
+        `displayDevice "${spec.displayDevice}" cannot be attached to the raspi* board "${spec.machine}": ` +
+          'these boards render over their built-in framebuffer, so displayDevice must be "none" ' +
+          '(display:vnc shows that framebuffer directly).',
+      );
+    }
+    // model is a closed enum mapped to a fixed device name; no agent free-text here.
+    argv.push('-device', DISPLAY_DEVICE_QEMU[spec.displayDevice]);
   }
   for (const disk of spec.disks) {
     argv.push(...buildDriveArgs(disk, options.imageDir));
