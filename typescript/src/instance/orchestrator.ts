@@ -60,9 +60,9 @@ import {
   buildArgv,
   type HardwareSpec,
   hostQemuArch,
-  machineArch,
   parseHardwareSpec,
   probeKvm,
+  qemuArchOfBinary,
   qemuBinaryForMachine,
   resolveAccel,
   VNC_LOOPBACK_HOST,
@@ -344,16 +344,18 @@ export class Orchestrator {
       // which cannot serve without QMP_MCP_VIEWER_PASSWORD. Refuse BEFORE spawning
       // qemu, so nothing is launched when the Viewer could never front it.
       if (spec.display === 'vnc') this.#assertViewerConfigured();
-      // The machine picks the arch: derive the emulator + the KVM-eligibility arch
-      // from spec.machine, unless QMP_MCP_QEMU_BINARY forces a specific binary (#18).
+      // The machine picks the emulator, unless QMP_MCP_QEMU_BINARY forces one (#18).
+      const binary = this.#options.qemuBinaryOverride ?? qemuBinaryForMachine(spec.machine);
+      // accel=auto's KVM eligibility keys off the LAUNCHED binary's arch (an override may
+      // differ from the machine's arch) and the machine (raspi boards can't use KVM).
       const hostArch = this.#options.hostArch ?? hostQemuArch();
       const resolution = resolveAccel(
         spec.accel,
-        machineArch(spec.machine),
+        qemuArchOfBinary(binary),
         hostArch,
+        spec.machine,
         this.#options.kvmAvailable,
       );
-      const binary = this.#options.qemuBinaryOverride ?? qemuBinaryForMachine(spec.machine);
 
       const { qmpSocketPath } = this.#options;
       if (await this.#options.socketOccupied(qmpSocketPath)) {

@@ -287,14 +287,18 @@ live, interactive screen at `http://<host>:6080/`.
 ### 5. Emulate a different architecture
 
 Pick an ARM machine and CPU — the `qemu-system-aarch64` emulator is chosen automatically
-from the `machine` (no `QMP_MCP_QEMU_BINARY` needed), and `accel: auto` falls back to TCG
-on an x86 host, so you can even omit `accel`.
+from the `machine` (no `QMP_MCP_QEMU_BINARY` needed).
 
 > *"Bring up an ARM64 virtual machine."*
 
 ```json
-{ "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 2048 }
+{ "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 2048, "accel": "tcg" }
 ```
+
+On an x86 host `accel: auto` already resolves to TCG (an aarch64 guest can't use x86
+KVM). On an ARM host it would use KVM, which only accepts a `host`/`max` CPU — so a named
+model like `cortex-a72` there needs `accel: tcg` (as above), and the `raspi*` boards
+always run under TCG (their baked CPU can't be virtualized).
 
 (If you also need to *build* the Rust binary for a non-x86 host, see its
 [cross-compilation guide](rust/README.md#building-for-other-platforms).)

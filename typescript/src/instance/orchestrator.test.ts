@@ -120,6 +120,18 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(result.accelReason).toMatch(/does not match host arch/);
   });
 
+  it('accel=auto keys off the OVERRIDE binary arch, not the machine (issue #18)', async () => {
+    // machine q35 -> machineArch x86_64 (== host), but the operator overrode the binary
+    // to an aarch64 emulator: KVM must NOT be chosen (the launched binary is aarch64).
+    const orch = makeOrchestrator(new FakeQemuDriver(), {
+      qemuBinaryOverride: 'qemu-system-aarch64',
+      kvmAvailable: () => true,
+    });
+    const result = await orch.createInstance({ machine: 'q35' });
+    expect(result.accel).toBe('tcg');
+    expect(result.accelReason).toMatch(/guest arch aarch64 does not match host arch x86_64/);
+  });
+
   it('rejects create while an Instance already exists, actionably', async () => {
     const orch = makeOrchestrator(new FakeQemuDriver());
     await orch.createInstance({});

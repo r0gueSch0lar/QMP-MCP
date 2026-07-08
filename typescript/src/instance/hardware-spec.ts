@@ -329,6 +329,21 @@ export function hostQemuArch(arch: string = process.arch): string {
 }
 
 /**
+ * The guest architecture a `qemu-system-*` binary emulates, for the `accel: auto`
+ * guest/host match (issue #18). Parses the `qemu-system-<arch>` suffix after stripping
+ * any absolute-path directory — so it reflects the ACTUAL binary being launched, not the
+ * machine (a `QMP_MCP_QEMU_BINARY` override can differ from the machine's arch). A name
+ * that doesn't fit that shape returns its basename, which won't equal any host arch, so
+ * `accel: auto` safely falls back to TCG for an unrecognized override. Mirrors the Rust
+ * `qemu_arch_of_binary`.
+ */
+export function qemuArchOfBinary(binary: string): string {
+  const base = binary.slice(binary.lastIndexOf('/') + 1);
+  const prefix = 'qemu-system-';
+  return base.startsWith(prefix) ? base.slice(prefix.length) : base;
+}
+
+/**
  * The kernel command line (`-append`) is emitted as a SINGLE argv token, so
  * spaces/`=`/`,` are safe (they cannot split off another argv element or inject a
  * QemuOpts property). The one thing we forbid is control characters (newlines,
@@ -543,14 +558,16 @@ export function probeKvm(): boolean {
  *
  * - `tcg`  → always TCG.
  * - `kvm`  → KVM, or {@link AccelError} when `/dev/kvm` is inaccessible.
- * - `auto` → KVM only when the guest arch (from `machine`) matches the host arch AND
- *   `/dev/kvm` is available; otherwise TCG. KVM cannot cross architectures, so an
- *   aarch64 guest on an x86_64 host (or vice-versa) always resolves to TCG (issue #18).
+ * - `auto` → KVM only when it is actually viable: the guest arch (of the launched
+ *   binary) matches the host arch, the machine is not a fixed-CPU `raspi*` board, and
+ *   `/dev/kvm` is available; otherwise TCG. KVM cannot cross architectures and cannot
+ *   virtualize the raspi boards' baked CPU, so those resolve to TCG (issue #18).
  */
 export function resolveAccel(
   requested: AccelMode,
   guestArch: string,
   hostArch: string,
+  machine: string,
   kvmAvailable: () => boolean = probeKvm,
 ): AccelResolution {
   switch (requested) {
@@ -570,14 +587,24 @@ export function resolveAccel(
       return { accel: 'kvm', requested, reason: 'accel=kvm requested; /dev/kvm is accessible.' };
     default:
       // accel=auto: KVM cannot cross architectures, so it is only viable when the
-      // guest arch (derived from the machine) matches the host. Otherwise — e.g. an
-      // aarch64 `virt` guest on an x86_64 host — qemu rejects KVM ("invalid
-      // accelerator kvm"), so fall back to TCG before probing /dev/kvm (issue #18).
+      // launched binary's arch matches the host. Otherwise — e.g. an aarch64 `virt`
+      // guest on an x86_64 host — qemu rejects KVM ("invalid accelerator kvm"), so fall
+      // back to TCG before probing /dev/kvm (issue #18).
       if (guestArch !== hostArch) {
         return {
           accel: 'tcg',
           requested,
           reason: `accel=auto: guest arch ${guestArch} does not match host arch ${hostArch}; KVM cannot cross architectures, so using TCG.`,
+        };
+      }
+      // The raspi boards bake a fixed CPU (arm1176/cortex-a7/a53/a72) that KVM can't
+      // virtualize (KVM only runs the host CPU), so even on a matching aarch64 host they
+      // must use TCG. Set accel=kvm explicitly to override (it will then hard-fail).
+      if (isRaspiMachine(machine)) {
+        return {
+          accel: 'tcg',
+          requested,
+          reason: `accel=auto: the ${machine} board has a fixed CPU that KVM cannot virtualize; using TCG.`,
         };
       }
       return kvmAvailable()

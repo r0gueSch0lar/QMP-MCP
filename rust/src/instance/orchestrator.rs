@@ -32,8 +32,9 @@ use super::event_buffer::{
     EventBuffer, ReadResult, WaitForEventOptions, WaitFuture, DEFAULT_EVENT_BUFFER_SIZE,
 };
 use super::hardware_spec::{
-    build_argv, machine_arch, parse_hardware_spec, qemu_binary_for_machine, resolve_accel, Accel,
-    AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
+    build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
+    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST,
+    VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -457,20 +458,22 @@ impl Orchestrator {
         if spec.display == DisplayMode::Vnc {
             self.assert_viewer_configured()?;
         }
-        // The machine picks the arch: derive the emulator + the KVM-eligibility arch
-        // from spec.machine, unless QMP_MCP_QEMU_BINARY forces a specific binary (#18).
-        let resolution = resolve_accel(
-            spec.accel,
-            machine_arch(spec.machine.as_str()),
-            &self.options.host_arch,
-            || (self.options.kvm_available)(),
-        )
-        .map_err(|e| LifecycleError(e.0))?;
+        // The machine picks the emulator, unless QMP_MCP_QEMU_BINARY forces one (#18).
         let binary = self
             .options
             .qemu_binary_override
             .clone()
             .unwrap_or_else(|| qemu_binary_for_machine(spec.machine.as_str()));
+        // accel=auto's KVM eligibility keys off the LAUNCHED binary's arch (an override
+        // may differ from the machine's arch) and the machine (raspi can't use KVM).
+        let resolution = resolve_accel(
+            spec.accel,
+            qemu_arch_of_binary(&binary),
+            &self.options.host_arch,
+            spec.machine.as_str(),
+            || (self.options.kvm_available)(),
+        )
+        .map_err(|e| LifecycleError(e.0))?;
         let argv = build_argv(&spec, &self.argv_options(resolution.accel))
             .map_err(|e| LifecycleError(e.0))?;
         tracing::info!(
@@ -1493,6 +1496,25 @@ mod tests {
             .expect("create ok");
         assert_eq!(result.accel, Accel::Tcg);
         assert!(result.accel_reason.contains("does not match host arch"));
+    }
+
+    #[tokio::test]
+    async fn accel_auto_keys_off_the_override_binary_arch_not_the_machine() {
+        // machine q35 -> x86_64 (== host), but the operator overrode the binary to an
+        // aarch64 emulator: KVM must NOT be chosen — the launched binary is aarch64 (#18).
+        let driver = FakeQemuDriver::new();
+        let mut options = test_options();
+        options.qemu_binary_override = Some("qemu-system-aarch64".to_string());
+        options.kvm_available = Box::new(|| true);
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        let result = orch
+            .create_instance(json!({ "machine": "q35" }))
+            .await
+            .expect("create ok");
+        assert_eq!(result.accel, Accel::Tcg);
+        assert!(result
+            .accel_reason
+            .contains("guest arch aarch64 does not match host arch x86_64"));
     }
 
     #[tokio::test]

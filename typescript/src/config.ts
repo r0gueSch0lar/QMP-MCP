@@ -45,10 +45,11 @@ export interface PortRange {
 export const DEFAULT_HOSTFWD_PORT_RANGE: PortRange = { low: 1024, high: 65535 };
 
 /**
- * Default `qemu-system-*` binary the Orchestrator launches as argv[0] when
- * `QMP_MCP_QEMU_BINARY` is unset. x86_64 is the historical default; selecting a
- * non-x86 emulator (e.g. `qemu-system-aarch64`) chooses the guest architecture.
- * Shared by {@link resolveQemuBinary} and the Orchestrator singleton (issue #15).
+ * Fallback `qemu-system-*` binary: the arch that `machineArch` degrades an unknown (or
+ * x86) `machine` to, i.e. what `qemuBinaryForMachine` returns for anything not mapped to
+ * ARM. The Orchestrator normally DERIVES the binary from the Instance's `machine`
+ * (ADR-0013) and `QMP_MCP_QEMU_BINARY` overrides it; this constant is just the x86_64
+ * historical default the map falls back to.
  */
 export const DEFAULT_QEMU_BINARY = 'qemu-system-x86_64';
 
@@ -345,16 +346,6 @@ export function resolveQemuBinaryOverride(env: NodeJS.ProcessEnv): string | unde
     );
   }
   return value;
-}
-
-/**
- * The `QMP_MCP_QEMU_BINARY` override, or {@link DEFAULT_QEMU_BINARY} when unset. Kept
- * for the {@link Config} snapshot; the live launch path uses
- * {@link resolveQemuBinaryOverride} so an unset value can derive the binary from the
- * Instance's `machine` (issue #18) rather than always defaulting to x86_64.
- */
-export function resolveQemuBinary(env: NodeJS.ProcessEnv): string {
-  return resolveQemuBinaryOverride(env) ?? DEFAULT_QEMU_BINARY;
 }
 
 /** Resolve the maximum disk size cap in GiB (`QMP_MCP_MAX_DISK_GB`, default 64). */

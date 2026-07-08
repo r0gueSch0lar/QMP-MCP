@@ -9,10 +9,15 @@ selector, becomes an optional **override**: when set (to a bare command name or 
 path) it is honored for every Instance — e.g. a custom-built emulator — and when unset the
 binary is derived from `machine`.
 
-`accel: auto` (ADR-0008) additionally requires the guest architecture (derived from the
-same machine map) to match the host architecture before it will choose KVM. KVM cannot
-cross architectures, so an aarch64 `virt` guest on an x86_64 host resolves to TCG rather
-than failing with QEMU's "invalid accelerator kvm". Explicit `kvm`/`tcg` are unchanged.
+`accel: auto` (ADR-0008) now chooses KVM only when it is actually viable: the guest
+architecture — read from the **launched binary** (`qemu-system-<arch>`), so an override of
+a different arch than the machine is respected — must match the host, and the machine must
+not be a fixed-CPU `raspi*` board (KVM can't virtualize their baked CPU). KVM cannot cross
+architectures, so an aarch64 `virt` guest on an x86_64 host, or any raspi board, resolves
+to TCG rather than failing with QEMU's "invalid accelerator kvm". Explicit `kvm`/`tcg` are
+unchanged. One residual case `auto` does not gate: a named CPU (e.g. `cortex-a72`) on a
+*matching* ARM host, where ARM KVM requires `host`/`max` — that surfaces as a QEMU launch
+error, and the fix is an explicit `accel: tcg`.
 
 We record this because the `machine` field already fixes the guest architecture, so a
 separate global binary selector was a latent foot-gun: the two could disagree, and

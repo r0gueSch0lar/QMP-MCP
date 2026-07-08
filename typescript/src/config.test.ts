@@ -1,13 +1,7 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import {
-  type Config,
-  ConfigError,
-  loadConfig,
-  resolveQemuBinary,
-  resolveQemuBinaryOverride,
-} from './config.js';
+import { type Config, ConfigError, loadConfig, resolveQemuBinaryOverride } from './config.js';
 
 /** The host-agnostic default Image Store dir for an empty environment. */
 const DEFAULT_IMAGE_DIR = join(tmpdir(), 'qmp-mcp', 'images');
@@ -310,27 +304,7 @@ describe('loadConfig', () => {
     });
   });
 
-  describe('QEMU binary default resolver (resolveQemuBinary)', () => {
-    it('defaults to qemu-system-x86_64 when unset', () => {
-      expect(resolveQemuBinary({})).toBe('qemu-system-x86_64');
-    });
-
-    it('honors an explicit override, selecting the guest architecture', () => {
-      // A non-x86 emulator selects the guest architecture; a bare name and an
-      // absolute path are both accepted, and the value is trimmed.
-      expect(resolveQemuBinary({ QMP_MCP_QEMU_BINARY: 'qemu-system-aarch64' })).toBe(
-        'qemu-system-aarch64',
-      );
-      expect(resolveQemuBinary({ QMP_MCP_QEMU_BINARY: ' /usr/bin/qemu-system-riscv64 ' })).toBe(
-        '/usr/bin/qemu-system-riscv64',
-      );
-    });
-
-    it('treats blank/whitespace-only as unset (falls back to the default)', () => {
-      expect(resolveQemuBinary({ QMP_MCP_QEMU_BINARY: '' })).toBe('qemu-system-x86_64');
-      expect(resolveQemuBinary({ QMP_MCP_QEMU_BINARY: '   ' })).toBe('qemu-system-x86_64');
-    });
-
+  describe('QEMU binary override fails closed (issue #18)', () => {
     it.each([
       'qemu; rm -rf',
       'qemu-system-x86_64 --enable-kvm',

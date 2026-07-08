@@ -330,6 +330,17 @@ pub fn host_qemu_arch() -> &'static str {
     std::env::consts::ARCH
 }
 
+/// The guest architecture a `qemu-system-*` binary emulates, for the `accel: auto`
+/// guest/host match (issue #18). Parses the `qemu-system-<arch>` suffix after stripping
+/// any absolute-path directory — so it reflects the ACTUAL binary being launched, not
+/// the machine (a `QMP_MCP_QEMU_BINARY` override can differ from the machine's arch). A
+/// name that doesn't fit that shape returns its basename, which won't equal any host
+/// arch, so `accel: auto` safely falls back to TCG. Mirrors the TS `qemuArchOfBinary`.
+pub fn qemu_arch_of_binary(binary: &str) -> &str {
+    let base = binary.rsplit('/').next().unwrap_or(binary);
+    base.strip_prefix("qemu-system-").unwrap_or(base)
+}
+
 const APPEND_CMDLINE_MESSAGE: &str =
     "appendCmdline must be a single line of printable characters (no control characters or \
      newlines). It is emitted as one -append token, so spaces are fine.";
@@ -815,12 +826,14 @@ pub fn probe_kvm() -> bool {
 /// Resolve the requested accelerator mode to a concrete accelerator, reporting which
 /// was chosen and why (ADR-0008). `kvm_available` is injected so this is testable
 /// without a real `/dev/kvm` (pass [`probe_kvm`] in production). For `auto`, KVM is
-/// only viable when the guest arch (derived from the machine) matches the host arch —
-/// KVM cannot cross architectures — otherwise it falls back to TCG (issue #18).
+/// chosen only when it is actually viable: the guest arch (of the launched binary)
+/// matches the host arch, the machine is not a fixed-CPU `raspi*` board, and `/dev/kvm`
+/// is available — otherwise it falls back to TCG (issue #18).
 pub fn resolve_accel(
     requested: AccelMode,
     guest_arch: &str,
     host_arch: &str,
+    machine: &str,
     kvm_available: impl Fn() -> bool,
 ) -> Result<AccelResolution, AccelError> {
     match requested {
@@ -846,9 +859,9 @@ pub fn resolve_accel(
         }
         AccelMode::Auto => {
             // accel=auto: KVM cannot cross architectures, so it is only viable when the
-            // guest arch (derived from the machine) matches the host. Otherwise — e.g.
-            // an aarch64 `virt` guest on an x86_64 host — qemu rejects KVM ("invalid
-            // accelerator kvm"), so fall back to TCG before probing /dev/kvm (issue #18).
+            // launched binary's arch matches the host. Otherwise — e.g. an aarch64
+            // `virt` guest on an x86_64 host — qemu rejects KVM ("invalid accelerator
+            // kvm"), so fall back to TCG before probing /dev/kvm (issue #18).
             if guest_arch != host_arch {
                 return Ok(AccelResolution {
                     accel: Accel::Tcg,
@@ -856,6 +869,19 @@ pub fn resolve_accel(
                     reason: format!(
                         "accel=auto: guest arch {guest_arch} does not match host arch \
                          {host_arch}; KVM cannot cross architectures, so using TCG."
+                    ),
+                });
+            }
+            // The raspi boards bake a fixed CPU (arm1176/cortex-a7/a53/a72) that KVM
+            // can't virtualize (KVM only runs the host CPU), so even on a matching
+            // aarch64 host they must use TCG. accel=kvm overrides (then hard-fails).
+            if is_raspi_machine(machine) {
+                return Ok(AccelResolution {
+                    accel: Accel::Tcg,
+                    requested,
+                    reason: format!(
+                        "accel=auto: the {machine} board has a fixed CPU that KVM cannot \
+                         virtualize; using TCG."
                     ),
                 });
             }
@@ -1798,30 +1824,30 @@ mod tests {
     fn resolve_accel_covers_auto_kvm_tcg() {
         // auto: KVM when the guest arch matches the host and /dev/kvm is available.
         assert_eq!(
-            resolve_accel(AccelMode::Auto, "x86_64", "x86_64", || true)
+            resolve_accel(AccelMode::Auto, "x86_64", "x86_64", "q35", || true)
                 .unwrap()
                 .accel,
             Accel::Kvm
         );
         assert_eq!(
-            resolve_accel(AccelMode::Auto, "x86_64", "x86_64", || false)
+            resolve_accel(AccelMode::Auto, "x86_64", "x86_64", "q35", || false)
                 .unwrap()
                 .accel,
             Accel::Tcg
         );
         assert_eq!(
-            resolve_accel(AccelMode::Tcg, "aarch64", "x86_64", || true)
+            resolve_accel(AccelMode::Tcg, "aarch64", "x86_64", "virt", || true)
                 .unwrap()
                 .accel,
             Accel::Tcg
         );
         assert_eq!(
-            resolve_accel(AccelMode::Kvm, "x86_64", "x86_64", || true)
+            resolve_accel(AccelMode::Kvm, "x86_64", "x86_64", "q35", || true)
                 .unwrap()
                 .accel,
             Accel::Kvm
         );
-        let e = resolve_accel(AccelMode::Kvm, "x86_64", "x86_64", || false).unwrap_err();
+        let e = resolve_accel(AccelMode::Kvm, "x86_64", "x86_64", "q35", || false).unwrap_err();
         assert!(e.0.contains("/dev/kvm"));
     }
 
@@ -1830,12 +1856,39 @@ mod tests {
         // aarch64 guest on an x86_64 host: KVM cannot cross architectures, so even with
         // /dev/kvm available the accelerator resolves to TCG (issue #18). The reason is
         // asserted in full to keep it byte-for-byte with the TypeScript resolveAccel.
-        let r = resolve_accel(AccelMode::Auto, "aarch64", "x86_64", || true).unwrap();
+        let r = resolve_accel(AccelMode::Auto, "aarch64", "x86_64", "virt", || true).unwrap();
         assert_eq!(r.accel, Accel::Tcg);
         assert_eq!(
             r.reason,
             "accel=auto: guest arch aarch64 does not match host arch x86_64; \
              KVM cannot cross architectures, so using TCG."
+        );
+    }
+
+    #[test]
+    fn resolve_accel_auto_falls_back_to_tcg_for_raspi_on_matching_host() {
+        // raspi boards bake a fixed CPU KVM can't virtualize, so aarch64-on-aarch64 with
+        // /dev/kvm still resolves to TCG (issue #18).
+        let r = resolve_accel(AccelMode::Auto, "aarch64", "aarch64", "raspi3b", || true).unwrap();
+        assert_eq!(r.accel, Accel::Tcg);
+        assert_eq!(
+            r.reason,
+            "accel=auto: the raspi3b board has a fixed CPU that KVM cannot \
+             virtualize; using TCG."
+        );
+    }
+
+    #[test]
+    fn qemu_arch_of_binary_reads_the_suffix() {
+        assert_eq!(qemu_arch_of_binary("qemu-system-aarch64"), "aarch64");
+        assert_eq!(
+            qemu_arch_of_binary("/usr/bin/qemu-system-riscv64"),
+            "riscv64"
+        );
+        // A non-standard override name won't match any host arch, so accel: auto -> TCG.
+        assert_eq!(
+            qemu_arch_of_binary("/opt/my-custom-emulator"),
+            "my-custom-emulator"
         );
     }
 

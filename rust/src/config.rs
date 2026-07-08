@@ -27,11 +27,11 @@ pub type EnvMap = HashMap<String, String>;
 /// server (issue #12).
 pub const DEFAULT_EVENT_BUFFER_SIZE: u32 = 256;
 
-/// Default `qemu-system-*` binary the Orchestrator launches
-/// (`QMP_MCP_QEMU_BINARY`). x86_64 is the historical default; selecting a
-/// different emulator (e.g. `qemu-system-aarch64`) switches the guest
-/// architecture, with the Hardware Spec's `machine`/`cpu` shaping the rest of the
-/// argv (issue #15).
+/// Fallback `qemu-system-*` binary: the arch that `machine_arch` degrades an unknown
+/// (or x86) `machine` to, i.e. what `qemu_binary_for_machine` returns for anything not
+/// mapped to ARM. The Orchestrator normally DERIVES the binary from the Instance's
+/// `machine` (ADR-0013) and `QMP_MCP_QEMU_BINARY` overrides it; this is just the x86_64
+/// historical default the map falls back to.
 pub const DEFAULT_QEMU_BINARY: &str = "qemu-system-x86_64";
 
 /// Which transport(s) the server exposes.
@@ -464,14 +464,6 @@ pub fn qemu_binary_override(env: &EnvMap) -> Result<Option<String>, ConfigError>
         )));
     }
     Ok(Some(value.to_string()))
-}
-
-/// The `QMP_MCP_QEMU_BINARY` override, or [`DEFAULT_QEMU_BINARY`] when unset. Kept for
-/// the [`Config`] snapshot; the live launch path uses [`qemu_binary_override`] so an
-/// unset value can derive the binary from the Instance's `machine` (issue #18) rather
-/// than always defaulting to x86_64.
-pub fn resolve_qemu_binary(env: &EnvMap) -> Result<String, ConfigError> {
-    Ok(qemu_binary_override(env)?.unwrap_or_else(|| DEFAULT_QEMU_BINARY.to_string()))
 }
 
 /// An original (untrimmed) env value that is present and not whitespace-only, or
@@ -996,13 +988,8 @@ mod tests {
 
     #[test]
     fn qemu_binary_override_is_none_when_unset_or_blank() {
-        // No override -> the binary is derived from the machine at launch (issue #18);
-        // resolve_qemu_binary still reports the x86_64 default for the Config snapshot.
+        // No override -> the binary is derived from the machine at launch (issue #18).
         assert_eq!(load_config(&env(&[])).unwrap().qemu_binary_override, None);
-        assert_eq!(
-            resolve_qemu_binary(&env(&[])).unwrap(),
-            "qemu-system-x86_64"
-        );
         assert_eq!(
             load_config(&env(&[("QMP_MCP_QEMU_BINARY", "")]))
                 .unwrap()
