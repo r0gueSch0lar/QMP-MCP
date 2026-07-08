@@ -86,6 +86,11 @@ pub enum DisplayMode {
 /// `virtio-gpu` exposes a DRM device (Wayland/X desktops render); `vga` is legacy;
 /// `ramfb` is a firmware framebuffer for boards without PCI. `none` (default) is
 /// headless. The `raspi*` boards have a built-in framebuffer and must stay `none`.
+/// Picking: `virtio-gpu` shows nothing until the guest loads its DRM driver (good for
+/// a system that boots straight into a DRM/Wayland desktop); `vga` has a legacy text
+/// mode and renders the WHOLE path (bootloader -> console -> X), so use it for a live
+/// ISO or anything where the boot menu / early console must be visible (an ISO's
+/// bootloader can't draw on `virtio-gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 pub enum DisplayDevice {
     /// No display adapter (default).
