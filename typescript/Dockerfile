@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # Purpose-built qmp-mcp image (ADR-0007): a Node build stage compiles the server,
-# and a slim Debian+Node runtime stage ships qemu-system-x86 + qemu-img alongside
-# the production-only dependencies and the compiled dist, running our server as a
+# and a slim Debian+Node runtime stage ships qemu-system (all architectures) +
+# qemu-img alongside the production deps and the compiled dist, running our server as a
 # NON-ROOT user (ADR-0008). The image never needs --privileged; /dev/kvm is an
 # OPTIONAL performance upgrade (pass `--device /dev/kvm` and the kvm group), and it
 # falls back to TCG software emulation otherwise.
@@ -28,12 +28,14 @@ RUN npm run build
 # ── Runtime stage: QEMU + Node, production deps only, non-root ───────────────────
 FROM node:20-bookworm-slim AS runtime
 
-# QEMU x86 system emulator + qemu-img, from Debian. There is no official QEMU image
-# (ADR-0007), so we install exactly what the server launches and probes. Clean the
-# apt lists in the same layer to keep the image lean.
+# QEMU full-system emulators (all architectures) + qemu-img, from Debian. The
+# `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,
+# sparc, riscv/s390x, ...) so QMP_MCP_QEMU_BINARY can select any guest architecture
+# the Hardware Spec supports — e.g. `qemu-system-aarch64` for the raspi* boards.
+# There is no official QEMU image (ADR-0007). Clean the apt lists in the same layer.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       qemu-system-x86 \
+       qemu-system \
        qemu-utils \
   && rm -rf /var/lib/apt/lists/*
 
