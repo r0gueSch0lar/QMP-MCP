@@ -7,7 +7,11 @@ import {
   buildArgv,
   type HardwareSpec,
   HardwareSpecError,
+  hostQemuArch,
+  machineArch,
   parseHardwareSpec,
+  qemuArchOfBinary,
+  qemuBinaryForMachine,
   resolveAccel,
 } from './hardware-spec.js';
 
@@ -790,29 +794,75 @@ describe('buildArgv network', () => {
 });
 
 describe('resolveAccel', () => {
-  it('auto chooses KVM when /dev/kvm is available and reports it', () => {
-    const r = resolveAccel('auto', () => true);
+  it('auto chooses KVM when the guest arch matches the host and /dev/kvm is available', () => {
+    const r = resolveAccel('auto', 'x86_64', 'x86_64', 'q35', () => true);
     expect(r.accel).toBe('kvm');
     expect(r.reason).toMatch(/KVM/);
   });
 
   it('auto falls back to TCG when /dev/kvm is unavailable and reports it', () => {
-    const r = resolveAccel('auto', () => false);
+    const r = resolveAccel('auto', 'x86_64', 'x86_64', 'q35', () => false);
     expect(r.accel).toBe('tcg');
     expect(r.reason).toMatch(/TCG/);
   });
 
-  it('tcg is always TCG, regardless of the probe', () => {
-    expect(resolveAccel('tcg', () => true).accel).toBe('tcg');
+  it('auto falls back to TCG when the guest arch does not match the host, even with KVM (issue #18)', () => {
+    // aarch64 guest on an x86_64 host: KVM cannot cross architectures.
+    const r = resolveAccel('auto', 'aarch64', 'x86_64', 'virt', () => true);
+    expect(r.accel).toBe('tcg');
+    expect(r.reason).toMatch(/guest arch aarch64 does not match host arch x86_64/);
+  });
+
+  it('auto falls back to TCG for a raspi board even on a matching host with KVM (issue #18)', () => {
+    // raspi boards bake a fixed CPU KVM can't virtualize, so aarch64-on-aarch64 is TCG.
+    const r = resolveAccel('auto', 'aarch64', 'aarch64', 'raspi3b', () => true);
+    expect(r.accel).toBe('tcg');
+    expect(r.reason).toMatch(/raspi3b board has a fixed CPU that KVM cannot virtualize/);
+  });
+
+  it('tcg is always TCG, regardless of the probe or arch', () => {
+    expect(resolveAccel('tcg', 'aarch64', 'x86_64', 'virt', () => true).accel).toBe('tcg');
   });
 
   it('kvm hard-fails with an actionable error when /dev/kvm is inaccessible', () => {
-    expect(() => resolveAccel('kvm', () => false)).toThrow(AccelError);
-    expect(() => resolveAccel('kvm', () => false)).toThrowError(/dev\/kvm/);
+    expect(() => resolveAccel('kvm', 'x86_64', 'x86_64', 'q35', () => false)).toThrow(AccelError);
+    expect(() => resolveAccel('kvm', 'x86_64', 'x86_64', 'q35', () => false)).toThrowError(
+      /dev\/kvm/,
+    );
   });
 
   it('kvm succeeds when /dev/kvm is accessible', () => {
-    expect(resolveAccel('kvm', () => true).accel).toBe('kvm');
+    expect(resolveAccel('kvm', 'x86_64', 'x86_64', 'q35', () => true).accel).toBe('kvm');
+  });
+});
+
+describe('machine → arch/binary derivation (issue #18)', () => {
+  it('maps x86 machines (and unknown names) to qemu-system-x86_64', () => {
+    for (const m of ['q35', 'pc', 'microvm', 'some-future-x86-board']) {
+      expect(machineArch(m)).toBe('x86_64');
+      expect(qemuBinaryForMachine(m)).toBe('qemu-system-x86_64');
+    }
+  });
+
+  it('maps virt/sbsa-ref and every raspi* board to qemu-system-aarch64', () => {
+    // qemu-system-aarch64 is a superset emulator that hosts the 32-bit raspi boards too.
+    for (const m of ['virt', 'sbsa-ref', 'raspi0', 'raspi1ap', 'raspi2b', 'raspi3b', 'raspi4b']) {
+      expect(machineArch(m)).toBe('aarch64');
+      expect(qemuBinaryForMachine(m)).toBe('qemu-system-aarch64');
+    }
+  });
+
+  it('normalizes Node process.arch to the qemu-system suffix, passing unknowns through', () => {
+    expect(hostQemuArch('x64')).toBe('x86_64');
+    expect(hostQemuArch('arm64')).toBe('aarch64');
+    expect(hostQemuArch('riscv64')).toBe('riscv64');
+  });
+
+  it('reads the guest arch from the actual binary name, incl. an absolute-path override', () => {
+    expect(qemuArchOfBinary('qemu-system-aarch64')).toBe('aarch64');
+    expect(qemuArchOfBinary('/usr/bin/qemu-system-riscv64')).toBe('riscv64');
+    // A non-standard override name won't match any host arch, so accel: auto -> TCG.
+    expect(qemuArchOfBinary('/opt/my-custom-emulator')).toBe('my-custom-emulator');
   });
 });
 

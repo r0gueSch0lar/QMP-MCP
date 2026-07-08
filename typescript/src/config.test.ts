@@ -1,7 +1,7 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { type Config, ConfigError, loadConfig } from './config.js';
+import { type Config, ConfigError, loadConfig, resolveQemuBinaryOverride } from './config.js';
 
 /** The host-agnostic default Image Store dir for an empty environment. */
 const DEFAULT_IMAGE_DIR = join(tmpdir(), 'qmp-mcp', 'images');
@@ -23,7 +23,7 @@ const DEFAULTS: Config = {
   allowInsecure: false,
   imageDir: DEFAULT_IMAGE_DIR,
   isoDir: DEFAULT_ISO_DIR,
-  qemuBinary: 'qemu-system-x86_64',
+  qemuBinaryOverride: undefined,
   maxDiskGb: 64,
   maxMemoryMb: 4096,
   maxVcpus: 2,
@@ -304,27 +304,7 @@ describe('loadConfig', () => {
     });
   });
 
-  describe('QEMU binary (issue #15)', () => {
-    it('defaults to qemu-system-x86_64 when unset', () => {
-      expect(loadConfig({}).qemuBinary).toBe('qemu-system-x86_64');
-    });
-
-    it('honors an explicit override, selecting the guest architecture', () => {
-      // A non-x86 emulator selects the guest architecture; a bare name and an
-      // absolute path are both accepted, and the value is trimmed.
-      expect(loadConfig({ QMP_MCP_QEMU_BINARY: 'qemu-system-aarch64' }).qemuBinary).toBe(
-        'qemu-system-aarch64',
-      );
-      expect(loadConfig({ QMP_MCP_QEMU_BINARY: ' /usr/bin/qemu-system-riscv64 ' }).qemuBinary).toBe(
-        '/usr/bin/qemu-system-riscv64',
-      );
-    });
-
-    it('treats blank/whitespace-only as unset (falls back to the default)', () => {
-      expect(loadConfig({ QMP_MCP_QEMU_BINARY: '' }).qemuBinary).toBe('qemu-system-x86_64');
-      expect(loadConfig({ QMP_MCP_QEMU_BINARY: '   ' }).qemuBinary).toBe('qemu-system-x86_64');
-    });
-
+  describe('QEMU binary override fails closed (issue #18)', () => {
     it.each([
       'qemu; rm -rf',
       'qemu-system-x86_64 --enable-kvm',
@@ -343,6 +323,32 @@ describe('loadConfig', () => {
       }
       expect(thrown).toBeInstanceOf(ConfigError);
       expect((thrown as Error).message).toContain('QMP_MCP_QEMU_BINARY');
+    });
+  });
+
+  describe('QEMU binary override (issue #18)', () => {
+    it('is undefined when unset or blank, so the binary is derived from the machine', () => {
+      expect(resolveQemuBinaryOverride({})).toBeUndefined();
+      expect(resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: '' })).toBeUndefined();
+      expect(resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: '   ' })).toBeUndefined();
+    });
+
+    it('returns the trimmed, validated value when explicitly set', () => {
+      expect(resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: 'qemu-system-aarch64' })).toBe(
+        'qemu-system-aarch64',
+      );
+      expect(
+        resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: ' /usr/bin/qemu-system-riscv64 ' }),
+      ).toBe('/usr/bin/qemu-system-riscv64');
+    });
+
+    it('fails closed on an unsafe value, naming the variable', () => {
+      expect(() => resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: 'qemu; rm -rf' })).toThrow(
+        ConfigError,
+      );
+      expect(() => resolveQemuBinaryOverride({ QMP_MCP_QEMU_BINARY: './qemu' })).toThrowError(
+        /QMP_MCP_QEMU_BINARY/,
+      );
     });
   });
 

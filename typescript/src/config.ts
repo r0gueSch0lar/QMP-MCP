@@ -45,10 +45,11 @@ export interface PortRange {
 export const DEFAULT_HOSTFWD_PORT_RANGE: PortRange = { low: 1024, high: 65535 };
 
 /**
- * Default `qemu-system-*` binary the Orchestrator launches as argv[0] when
- * `QMP_MCP_QEMU_BINARY` is unset. x86_64 is the historical default; selecting a
- * non-x86 emulator (e.g. `qemu-system-aarch64`) chooses the guest architecture.
- * Shared by {@link resolveQemuBinary} and the Orchestrator singleton (issue #15).
+ * Fallback `qemu-system-*` binary: the arch that `machineArch` degrades an unknown (or
+ * x86) `machine` to, i.e. what `qemuBinaryForMachine` returns for anything not mapped to
+ * ARM. The Orchestrator normally DERIVES the binary from the Instance's `machine`
+ * (ADR-0013) and `QMP_MCP_QEMU_BINARY` overrides it; this constant is just the x86_64
+ * historical default the map falls back to.
  */
 export const DEFAULT_QEMU_BINARY = 'qemu-system-x86_64';
 
@@ -90,12 +91,12 @@ export interface Config {
    */
   isoDir: string;
   /**
-   * The `qemu-system-*` binary the Orchestrator launches as argv[0]
-   * (`QMP_MCP_QEMU_BINARY`, default {@link DEFAULT_QEMU_BINARY}). Selects the guest
-   * architecture — e.g. `qemu-system-aarch64` builds an ARM guest — while the
-   * Hardware Spec's `machine`/`cpu` still shape the rest of the argv (issue #15).
+   * Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`), or `undefined`
+   * when unset — in which case the Orchestrator DERIVES the binary from each Instance's
+   * `machine` (q35/pc → x86_64, virt/raspi* → aarch64; ADR-0013). Set it only to force a
+   * specific emulator for every Instance.
    */
-  qemuBinary: string;
+  qemuBinaryOverride: string | undefined;
   /**
    * Hard cap, in GiB, on the virtual size of a disk image {@link createImage}
    * may allocate. A larger request is rejected naming this cap.
@@ -310,26 +311,26 @@ export function resolveIsoDir(env: NodeJS.ProcessEnv): string {
 }
 
 /**
- * Resolve and validate the `qemu-system-*` binary the Orchestrator launches as
- * argv[0] (`QMP_MCP_QEMU_BINARY`, default {@link DEFAULT_QEMU_BINARY}). Undefined
- * or blank/whitespace-only reads as the default (mirroring the other string
- * resolvers); an explicit value is trimmed and must be a **bare command name**
- * (resolved via `PATH`) or an **absolute path**, over the safe charset
- * `[A-Za-z0-9._/+-]`.
+ * Resolve and validate an EXPLICIT `qemu-system-*` binary override
+ * (`QMP_MCP_QEMU_BINARY`), or `undefined` when unset or blank/whitespace-only. An
+ * explicit value is trimmed and must be a **bare command name** (resolved via `PATH`)
+ * or an **absolute path**, over the safe charset `[A-Za-z0-9._/+-]`.
  *
- * The value is spawned as argv[0] with NO shell (execFile), but we still fail
- * closed on whitespace, shell metacharacters, and control characters — and on a
- * relative path (`./qemu`, `build/qemu`, `../bin/qemu`) — so a foot-gun never
- * reaches the spawn. The Hardware Spec's `machine`/`cpu` still shape the rest of
- * the argv, so an aarch64 binary plus `machine: 'virt'` / `cpu: 'cortex-a72'`
- * builds an ARM guest. Exported so the Orchestrator singleton and
- * {@link loadConfig} share one source of truth (issue #15).
+ * `undefined` means "no override" — the Orchestrator then DERIVES the binary from the
+ * per-instance `machine` (`qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for
+ * virt/raspi*; see `qemuBinaryForMachine`, issue #18), so switching guest
+ * architectures no longer needs an env flip + restart. An explicit value overrides
+ * that derivation for every Instance (e.g. a custom-built emulator).
+ *
+ * The value is spawned as argv[0] with NO shell (execFile), but we still fail closed
+ * on whitespace, shell metacharacters, and control characters — and on a relative path
+ * (`./qemu`, `build/qemu`, `../bin/qemu`) — so a foot-gun never reaches the spawn.
  */
-export function resolveQemuBinary(env: NodeJS.ProcessEnv): string {
+export function resolveQemuBinaryOverride(env: NodeJS.ProcessEnv): string | undefined {
   const raw = env.QMP_MCP_QEMU_BINARY;
-  if (raw === undefined) return DEFAULT_QEMU_BINARY;
+  if (raw === undefined) return undefined;
   const value = raw.trim();
-  if (value === '') return DEFAULT_QEMU_BINARY;
+  if (value === '') return undefined;
   // Safe charset: ASCII letters/digits plus the path and version punctuation that
   // legitimate binary names and absolute paths use (`^[A-Za-z0-9._/+-]+$`). A '/'
   // is only allowed when the value is an absolute path; a bare command name carries
@@ -532,7 +533,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     allowInsecure,
     imageDir: resolveImageDir(env),
     isoDir: resolveIsoDir(env),
-    qemuBinary: resolveQemuBinary(env),
+    qemuBinaryOverride: resolveQemuBinaryOverride(env),
     maxDiskGb: resolveMaxDiskGb(env),
     maxMemoryMb: resolveMaxMemoryMb(env),
     maxVcpus: resolveMaxVcpus(env),

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::http;
-use qmp_mcp::instance::hardware_spec::probe_kvm;
+use qmp_mcp::instance::hardware_spec::{host_qemu_arch, probe_kvm};
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
 use qmp_mcp::instance::orchestrator::{InstanceState, Orchestrator, OrchestratorOptions};
@@ -214,10 +214,12 @@ async fn serve_both(
 /// server owns it; ADR-0004).
 fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> OrchestratorOptions {
     OrchestratorOptions {
-        // argv[0] for the launched guest; `QMP_MCP_QEMU_BINARY` selects the
-        // architecture (e.g. `qemu-system-aarch64`), with the Hardware Spec's
-        // `machine`/`cpu` shaping the rest of the argv (issue #15).
-        binary: config.qemu_binary.clone(),
+        // argv[0] for the launched guest. When QMP_MCP_QEMU_BINARY is unset the binary
+        // is derived per-instance from the spec's machine (q35 -> x86_64, virt/raspi*
+        // -> aarch64, issue #18); an explicit value overrides that for every Instance.
+        qemu_binary_override: config.qemu_binary_override.clone(),
+        // This host's arch for the accel=auto guest/host match (issue #18).
+        host_arch: host_qemu_arch().to_string(),
         qmp_socket_path: default_qmp_socket_path(),
         image_dir: Some(config.image_dir.clone()),
         iso_dir: Some(config.iso_dir.clone()),
