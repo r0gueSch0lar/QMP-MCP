@@ -371,7 +371,7 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | --- | --- | --- |
 | `QMP_MCP_TRANSPORT` | `stdio` | `stdio`, `http`, or `both` |
 | `QMP_MCP_API_KEYS` | _(unset)_ | API keys for the HTTP transport (required unless insecure) |
-| `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | override the emulator for every Instance; unset derives it (q35→x86_64, virt/raspi*→aarch64, ADR-0013) |
+| `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | usually unset — the emulator is derived from the `machine` (q35→x86_64, virt/raspi*→aarch64, ADR-0013); set it to force one emulator for every Instance |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |
