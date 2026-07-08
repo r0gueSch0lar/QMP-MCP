@@ -32,7 +32,7 @@ describe.skipIf(!qemuOnPath())('real QEMU lifecycle (TCG)', () => {
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), 'qmp-mcp-it-'));
     orchestrator = new Orchestrator(new RealQemuDriver(), {
-      binary: QEMU_BINARY,
+      qemuBinaryOverride: QEMU_BINARY,
       qmpSocketPath: join(dir, 'qmp.sock'),
       // Force TCG so the test is deterministic regardless of host KVM.
       kvmAvailable: () => false,
@@ -48,17 +48,23 @@ describe.skipIf(!qemuOnPath())('real QEMU lifecycle (TCG)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('create -> RUNNING under TCG, round-trips query-status, then destroy -> NONE', async () => {
+  it('create -> PAUSED under TCG, resume -> RUNNING, round-trips query-status, then destroy -> NONE', async () => {
     const created = await orchestrator.createInstance({ accel: 'tcg', memoryMb: 128, vcpus: 1 });
-    expect(created.state).toBe('RUNNING');
+    // Issue #10: create loads the Guest frozen at the -S startup pause, so it lands
+    // PAUSED (not RUNNING) until resume_instance issues QMP cont.
+    expect(created.state).toBe('PAUSED');
     expect(created.accel).toBe('tcg');
-    expect(orchestrator.getInstance().state).toBe('RUNNING');
+    expect(orchestrator.getInstance().state).toBe('PAUSED');
 
-    // The real QMP handshake completed; query-status round-trips. Launched with
-    // -S, so the Guest CPUs are frozen at "prelaunch".
+    // The real QMP handshake completed; query-status round-trips with the CPUs still
+    // frozen at "prelaunch".
     const status = (await orchestrator.getStatus()) as { status?: string; running?: boolean };
     expect(status).toMatchObject({ running: false });
     expect(typeof status.status).toBe('string');
+
+    // resume issues QMP cont against the real Guest: it starts executing (issue #10).
+    await orchestrator.resumeInstance();
+    expect(orchestrator.getInstance().state).toBe('RUNNING');
 
     await orchestrator.destroyInstance();
     expect(orchestrator.getInstance().state).toBe('NONE');
