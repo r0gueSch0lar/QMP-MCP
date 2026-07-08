@@ -1,0 +1,34 @@
+{
+  "description": "A non-raspi machine (virt) rendering through the noVNC Viewer (issue #15): displayDevice virtio-gpu emits -device virtio-gpu-pci (a DRM/Wayland-capable adapter — virt/q35 have no built-in framebuffer, so display:vnc needs one), and initrd emits -initrd for a direct-kernel distro boot (kernel + initrd + rootfs).",
+  "spec": {
+    "machine": "virt",
+    "cpu": "cortex-a72",
+    "vcpus": 2,
+    "memoryMb": 2048,
+    "kernel": "vmlinuz",
+    "initrd": "initrd.img",
+    "appendCmdline": "console=tty0 root=/dev/vda2 rw",
+    "displayDevice": "virtio-gpu",
+    "display": "vnc",
+    "disks": [{ "image": "rootfs.img", "interface": "virtio", "format": "raw" }]
+  },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "virt,accel=tcg",
+    "-cpu", "cortex-a72",
+    "-smp", "2",
+    "-m", "2048",
+    "-kernel", "{{IMAGE_DIR}}/vmlinuz",
+    "-initrd", "{{IMAGE_DIR}}/initrd.img",
+    "-append", "console=tty0 root=/dev/vda2 rw",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-device", "virtio-gpu-pci",
+    "-drive", "file={{IMAGE_DIR}}/rootfs.img,format=raw,if=virtio,media=disk",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
