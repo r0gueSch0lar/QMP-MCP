@@ -2,8 +2,8 @@
 #
 # Purpose-built qmp-mcp Rust image (ADR-0007/0011): a cargo-chef multi-stage build
 # compiles the `qmp-mcp` binary, and a slim Debian runtime stage ships
-# qemu-system-x86 + qemu-img alongside the statically-embedded server, running as a
-# NON-ROOT user (ADR-0008). The image never needs --privileged; /dev/kvm is an
+# qemu-system (all architectures) + qemu-img alongside the statically-embedded
+# server, running as a NON-ROOT user (ADR-0008). The image never needs --privileged; /dev/kvm is an
 # OPTIONAL performance upgrade (pass `--device /dev/kvm` and the kvm group), and it
 # falls back to TCG software emulation otherwise.
 #
@@ -12,7 +12,7 @@
 # the binary — and needs no asset directory.
 #
 # This mirrors the security posture of the production TypeScript image (../Dockerfile):
-# a non-root system user, a minimal runtime with only qemu-system-x86 + qemu-utils,
+# a non-root system user, a minimal runtime with qemu-system (all archs) + qemu-utils,
 # container-specific Store paths supplied via env, and the HTTP transport failing
 # closed until an operator supplies auth. The Rust image is tagged DISTINCTLY from
 # the TS image (e.g. `qmp-mcp:rust` / `qmp-mcp-rs`) so the two never collide.
@@ -55,13 +55,15 @@ RUN cargo build --release --bin qmp-mcp
 # ── Runtime: slim Debian + QEMU, non-root ────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# QEMU x86 system emulator + qemu-img, from Debian. There is no official QEMU image
-# (ADR-0007), so we install exactly what the server launches and probes. Clean the
-# apt lists in the same layer to keep the image lean. ca-certificates covers any
-# outbound TLS the runtime might need.
+# QEMU full-system emulators (all architectures) + qemu-img, from Debian. The
+# `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,
+# sparc, riscv/s390x, ...) so QMP_MCP_QEMU_BINARY can select any guest architecture
+# the Hardware Spec supports — e.g. `qemu-system-aarch64` for the raspi* boards.
+# There is no official QEMU image (ADR-0007). Clean the apt lists in the same layer
+# to keep the image lean; ca-certificates covers any outbound TLS the runtime needs.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       qemu-system-x86 \
+       qemu-system \
        qemu-utils \
        ca-certificates \
   && rm -rf /var/lib/apt/lists/*
