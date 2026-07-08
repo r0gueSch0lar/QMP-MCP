@@ -1012,10 +1012,13 @@ describe('buildArgv display adapter + initrd (issue #15)', () => {
 
   it('refuses a displayDevice on a raspi board (built-in framebuffer, no PCI)', () => {
     expect(() =>
-      buildArgv(spec({ machine: 'raspi3b', displayDevice: 'virtio-gpu', network: { mode: 'none' } }), {
-        accel: 'tcg',
-        qmpSocketPath: SOCK,
-      }),
+      buildArgv(
+        spec({ machine: 'raspi3b', displayDevice: 'virtio-gpu', network: { mode: 'none' } }),
+        {
+          accel: 'tcg',
+          qmpSocketPath: SOCK,
+        },
+      ),
     ).toThrowError(/raspi.*built-in framebuffer|displayDevice.*raspi/s);
   });
 
@@ -1029,7 +1032,9 @@ describe('buildArgv display adapter + initrd (issue #15)', () => {
   });
 
   it('rejects initrd without kernel', () => {
-    expect(() => parseHardwareSpec({ initrd: 'initrd.img' })).toThrowError(/initrd requires kernel/);
+    expect(() => parseHardwareSpec({ initrd: 'initrd.img' })).toThrowError(
+      /initrd requires kernel/,
+    );
   });
 
   it('accepts the display-device enum values', () => {
