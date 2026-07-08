@@ -29,7 +29,7 @@ import {
   resolveIsoDir,
   resolveMaxMemoryMb,
   resolveMaxVcpus,
-  resolveQemuBinary,
+  resolveQemuBinaryOverride,
   resolveViewerHost,
   resolveViewerPassword,
   resolveViewerPort,
@@ -59,8 +59,11 @@ import {
   type Accel,
   buildArgv,
   type HardwareSpec,
+  hostQemuArch,
+  machineArch,
   parseHardwareSpec,
   probeKvm,
+  qemuBinaryForMachine,
   resolveAccel,
   VNC_LOOPBACK_HOST,
   VNC_LOOPBACK_PORT,
@@ -115,8 +118,19 @@ export interface ScreendumpResult {
 
 /** Knobs the Orchestrator needs that are not part of the Hardware Spec. */
 export interface OrchestratorOptions {
-  /** The `qemu-system-*` binary to launch. */
-  binary: string;
+  /**
+   * Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`). When omitted,
+   * the binary is DERIVED per-instance from the spec's `machine` (issue #18):
+   * `qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for virt/raspi*. Set it
+   * only to force a specific emulator (e.g. a custom build) for every Instance.
+   */
+  qemuBinaryOverride?: string;
+  /**
+   * This host's QEMU architecture (`x86_64`/`aarch64`) for the `accel: auto`
+   * guest/host match (issue #18). Injected for testability; the singleton omits it
+   * and {@link createInstance} defaults to the real host via `hostQemuArch()`.
+   */
+  hostArch?: string;
   /** Server-managed path of the QMP UNIX socket. */
   qmpSocketPath: string;
   /**
@@ -330,9 +344,18 @@ export class Orchestrator {
       // which cannot serve without QMP_MCP_VIEWER_PASSWORD. Refuse BEFORE spawning
       // qemu, so nothing is launched when the Viewer could never front it.
       if (spec.display === 'vnc') this.#assertViewerConfigured();
-      const resolution = resolveAccel(spec.accel, this.#options.kvmAvailable);
+      // The machine picks the arch: derive the emulator + the KVM-eligibility arch
+      // from spec.machine, unless QMP_MCP_QEMU_BINARY forces a specific binary (#18).
+      const hostArch = this.#options.hostArch ?? hostQemuArch();
+      const resolution = resolveAccel(
+        spec.accel,
+        machineArch(spec.machine),
+        hostArch,
+        this.#options.kvmAvailable,
+      );
+      const binary = this.#options.qemuBinaryOverride ?? qemuBinaryForMachine(spec.machine);
 
-      const { qmpSocketPath, binary } = this.#options;
+      const { qmpSocketPath } = this.#options;
       if (await this.#options.socketOccupied(qmpSocketPath)) {
         throw new LifecycleError(
           `The QMP socket path ${qmpSocketPath} is already occupied — refusing to start rather than ` +
@@ -726,10 +749,11 @@ function generateVncPassword(): string {
 
 /** The process-global Orchestrator singleton, wired to the real QEMU driver. */
 export const orchestrator = new Orchestrator(new RealQemuDriver(), {
-  // argv[0] for the launched guest; QMP_MCP_QEMU_BINARY selects the guest
-  // architecture (e.g. qemu-system-aarch64), while the spec's machine/cpu still
-  // shape the rest of the argv (issue #15).
-  binary: resolveQemuBinary(process.env),
+  // argv[0] for the launched guest. When QMP_MCP_QEMU_BINARY is unset the binary is
+  // derived per-instance from the spec's machine (q35 -> x86_64, virt/raspi* ->
+  // aarch64, issue #18); an explicit value overrides that for every Instance. hostArch
+  // is omitted so createInstance defaults to the real host for the accel=auto match.
+  qemuBinaryOverride: resolveQemuBinaryOverride(process.env),
   qmpSocketPath: defaultQmpSocketPath(),
   // Resolve disk names against the configured Image Store (ADR-0006).
   imageDir: resolveImageDir(process.env),

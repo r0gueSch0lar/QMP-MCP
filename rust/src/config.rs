@@ -167,11 +167,12 @@ pub struct Config {
     pub image_dir: String,
     /// Absolute path of the read-only ISO Store directory (ADR-0006).
     pub iso_dir: String,
-    /// The `qemu-system-*` binary the Orchestrator launches as argv[0]. Selecting
-    /// a non-x86 emulator (e.g. `qemu-system-aarch64`) switches the guest
-    /// architecture; the Hardware Spec's `machine`/`cpu` still shape the rest of
-    /// the argv (issue #15).
-    pub qemu_binary: String,
+    /// Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`), or `None` when
+    /// unset — in which case the binary is DERIVED per-instance from the spec's
+    /// `machine` (`qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for
+    /// virt/raspi*; issue #18). Set it only to force a specific emulator for every
+    /// Instance (e.g. a custom build).
+    pub qemu_binary_override: Option<String>,
     /// Hard cap, in GiB, on the virtual size of a created disk image.
     pub max_disk_gb: u32,
     /// Hard cap, in MiB, on a Hardware Spec's `memoryMb` (issue #9).
@@ -427,20 +428,23 @@ pub fn resolve_iso_dir(env: &EnvMap) -> String {
     join(&tmp_dir(env), &["qmp-mcp", "isos"])
 }
 
-/// Resolve and validate the `qemu-system-*` binary the Orchestrator launches as
-/// argv[0] (`QMP_MCP_QEMU_BINARY`). Undefined or blank/whitespace-only reads as
-/// the default [`DEFAULT_QEMU_BINARY`]; an explicit value is trimmed and must be a
-/// **bare command name** (resolved via `PATH`) or an **absolute path**, over the
-/// safe charset `[A-Za-z0-9._/+-]`.
+/// Resolve and validate an EXPLICIT `qemu-system-*` binary override
+/// (`QMP_MCP_QEMU_BINARY`), or `None` when unset or blank/whitespace-only. An explicit
+/// value is trimmed and must be a **bare command name** (resolved via `PATH`) or an
+/// **absolute path**, over the safe charset `[A-Za-z0-9._/+-]`.
+///
+/// `None` means "no override" — the Orchestrator then DERIVES the binary from the
+/// per-instance `machine` (`qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for
+/// virt/raspi*; see [`crate::instance::hardware_spec::qemu_binary_for_machine`], issue
+/// #18), so switching guest architectures no longer needs an env flip + restart. An
+/// explicit value overrides that derivation for every Instance (e.g. a custom build).
 ///
 /// The value is exec'd as argv[0] with **no shell**, but we still fail closed on
-/// whitespace, shell metacharacters, and control characters — and on a relative
-/// path (`./qemu`, `build/qemu`) — so a foot-gun never reaches `exec`. The
-/// Hardware Spec's `machine`/`cpu` shape the rest of the argv, so an aarch64
-/// binary plus `machine: virt` / `cpu: cortex-a72` builds an ARM guest (issue #15).
-pub fn resolve_qemu_binary(env: &EnvMap) -> Result<String, ConfigError> {
+/// whitespace, shell metacharacters, and control characters — and on a relative path
+/// (`./qemu`, `build/qemu`) — so a foot-gun never reaches `exec`.
+pub fn qemu_binary_override(env: &EnvMap) -> Result<Option<String>, ConfigError> {
     let value = match trimmed_non_empty(env, "QMP_MCP_QEMU_BINARY") {
-        None => return Ok(DEFAULT_QEMU_BINARY.to_string()),
+        None => return Ok(None),
         Some(v) => v,
     };
     // Safe charset: ASCII letters/digits plus the path and version punctuation that
@@ -459,7 +463,15 @@ pub fn resolve_qemu_binary(env: &EnvMap) -> Result<String, ConfigError> {
              characters) (got \"{value}\")."
         )));
     }
-    Ok(value.to_string())
+    Ok(Some(value.to_string()))
+}
+
+/// The `QMP_MCP_QEMU_BINARY` override, or [`DEFAULT_QEMU_BINARY`] when unset. Kept for
+/// the [`Config`] snapshot; the live launch path uses [`qemu_binary_override`] so an
+/// unset value can derive the binary from the Instance's `machine` (issue #18) rather
+/// than always defaulting to x86_64.
+pub fn resolve_qemu_binary(env: &EnvMap) -> Result<String, ConfigError> {
+    Ok(qemu_binary_override(env)?.unwrap_or_else(|| DEFAULT_QEMU_BINARY.to_string()))
 }
 
 /// An original (untrimmed) env value that is present and not whitespace-only, or
@@ -557,7 +569,7 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         allow_insecure,
         image_dir: resolve_image_dir(env),
         iso_dir: resolve_iso_dir(env),
-        qemu_binary: resolve_qemu_binary(env)?,
+        qemu_binary_override: qemu_binary_override(env)?,
         max_disk_gb: parse_positive_int(
             "QMP_MCP_MAX_DISK_GB",
             get(env, "QMP_MCP_MAX_DISK_GB"),
@@ -631,7 +643,7 @@ mod tests {
             allow_insecure: false,
             image_dir: DEFAULT_IMAGE_DIR.into(),
             iso_dir: DEFAULT_ISO_DIR.into(),
-            qemu_binary: "qemu-system-x86_64".into(),
+            qemu_binary_override: None,
             max_disk_gb: 64,
             max_memory_mb: 4096,
             max_vcpus: 2,
@@ -983,26 +995,37 @@ mod tests {
     }
 
     #[test]
-    fn qemu_binary_defaults_to_x86_64_when_unset() {
-        assert_eq!(
-            load_config(&env(&[])).unwrap().qemu_binary,
-            "qemu-system-x86_64"
-        );
+    fn qemu_binary_override_is_none_when_unset_or_blank() {
+        // No override -> the binary is derived from the machine at launch (issue #18);
+        // resolve_qemu_binary still reports the x86_64 default for the Config snapshot.
+        assert_eq!(load_config(&env(&[])).unwrap().qemu_binary_override, None);
         assert_eq!(
             resolve_qemu_binary(&env(&[])).unwrap(),
             "qemu-system-x86_64"
+        );
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "")]))
+                .unwrap()
+                .qemu_binary_override,
+            None
+        );
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "   ")]))
+                .unwrap()
+                .qemu_binary_override,
+            None
         );
     }
 
     #[test]
     fn qemu_binary_explicit_override_is_honored() {
-        // A non-x86 emulator selects the guest architecture; a bare name and an
-        // absolute path are both accepted.
+        // An explicit value overrides machine derivation for every Instance; a bare
+        // name and an absolute path are both accepted and trimmed.
         assert_eq!(
             load_config(&env(&[("QMP_MCP_QEMU_BINARY", "qemu-system-aarch64")]))
                 .unwrap()
-                .qemu_binary,
-            "qemu-system-aarch64"
+                .qemu_binary_override,
+            Some("qemu-system-aarch64".to_string())
         );
         assert_eq!(
             load_config(&env(&[(
@@ -1010,24 +1033,8 @@ mod tests {
                 " /usr/bin/qemu-system-riscv64 "
             )]))
             .unwrap()
-            .qemu_binary,
-            "/usr/bin/qemu-system-riscv64"
-        );
-    }
-
-    #[test]
-    fn qemu_binary_blank_or_whitespace_reads_as_default() {
-        assert_eq!(
-            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "")]))
-                .unwrap()
-                .qemu_binary,
-            "qemu-system-x86_64"
-        );
-        assert_eq!(
-            load_config(&env(&[("QMP_MCP_QEMU_BINARY", "   ")]))
-                .unwrap()
-                .qemu_binary,
-            "qemu-system-x86_64"
+            .qemu_binary_override,
+            Some("/usr/bin/qemu-system-riscv64".to_string())
         );
     }
 

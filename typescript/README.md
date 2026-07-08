@@ -9,8 +9,9 @@ TypeScript variant.
 ## Requirements
 
 - **Node 20+**
-- **QEMU** on your `PATH` at runtime — `qemu-system-x86_64` (or another `qemu-system-*`;
-  see `QMP_MCP_QEMU_BINARY`) and `qemu-img`.
+- **QEMU** on your `PATH` at runtime — the emulator is picked from the spec's `machine`
+  (`qemu-system-x86_64`, `qemu-system-aarch64` for ARM/raspi, …; override with
+  `QMP_MCP_QEMU_BINARY`), plus `qemu-img`.
 
 ## Run it
 
@@ -101,7 +102,7 @@ Everything is `QMP_MCP_*` environment variables — the same names and defaults 
 Rust variant. The full, commented list is in [`../.env.example`](../.env.example) (and
 the command-policy file format in [`../policy.example.yaml`](../policy.example.yaml)).
 The ones you'll reach for: `QMP_MCP_TRANSPORT`, `QMP_MCP_API_KEYS`, `QMP_MCP_QEMU_BINARY`
-(set `qemu-system-aarch64` for ARM guests), `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR`,
+(usually unset — the emulator is derived from `machine`; ADR-0013), `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR`,
 `QMP_MCP_VIEWER_PASSWORD`, plus caps on disk/memory/vCPUs and the command-policy
 allow/deny lists.
 

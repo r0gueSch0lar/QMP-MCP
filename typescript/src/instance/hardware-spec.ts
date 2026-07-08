@@ -280,6 +280,55 @@ export function isRaspiMachine(machine: string): boolean {
 }
 
 /**
+ * QEMU guest architecture we can auto-select a `qemu-system-*` binary for; the value
+ * is the binary suffix (`qemu-system-<arch>`). Every ARM machine — the raspi* boards
+ * (even the 32-bit `raspi0`/`raspi1ap`/`raspi2b`) and `virt`/`sbsa-ref` — maps to
+ * `aarch64`, because `qemu-system-aarch64` is a superset emulator that hosts them all.
+ */
+export type QemuArch = 'x86_64' | 'aarch64';
+
+/**
+ * Non-raspi machines that imply an aarch64 guest. The raspi* boards are covered by
+ * {@link isRaspiMachine}; `q35`/`pc` and any unrecognized machine fall through to x86_64.
+ */
+const AARCH64_MACHINES = new Set(['virt', 'sbsa-ref']);
+
+/**
+ * Guest architecture implied by a `machine` (issue #18). raspi* and `virt`/`sbsa-ref`
+ * are aarch64; every other machine — `q35`/`pc`/`microvm` and any unrecognized name —
+ * is x86_64, the architecture of {@link DEFAULT_QEMU_BINARY}. Mapping unknown machines
+ * to x86_64 makes binary derivation degrade to the historical default, so an exotic
+ * machine still works once the operator points `QMP_MCP_QEMU_BINARY` at its emulator.
+ * Mirrors the Rust `machine_arch`.
+ */
+export function machineArch(machine: string): QemuArch {
+  return isRaspiMachine(machine) || AARCH64_MACHINES.has(machine) ? 'aarch64' : 'x86_64';
+}
+
+/**
+ * The `qemu-system-*` binary implied by a `machine` (issue #18): `q35` → x86_64,
+ * `virt`/raspi* → aarch64. This lets the per-instance `machine` pick the emulator, so
+ * no `QMP_MCP_QEMU_BINARY` flip + container recreate is needed to switch guest
+ * architectures. An explicitly-set `QMP_MCP_QEMU_BINARY` still overrides it.
+ */
+export function qemuBinaryForMachine(machine: string): string {
+  return `qemu-system-${machineArch(machine)}`;
+}
+
+/**
+ * This host's QEMU architecture, for the `accel: auto` guest/host match. Node's
+ * `process.arch` uses `x64`/`arm64`; normalize to the `qemu-system-*` suffix
+ * (`x86_64`/`aarch64`). An unrecognized host arch is returned verbatim — it cannot
+ * equal any guest arch, so `accel: auto` safely falls back to TCG. Mirrors the Rust
+ * `host_qemu_arch` (which reads `std::env::consts::ARCH`, already in this form).
+ */
+export function hostQemuArch(arch: string = process.arch): string {
+  if (arch === 'x64') return 'x86_64';
+  if (arch === 'arm64') return 'aarch64';
+  return arch;
+}
+
+/**
  * The kernel command line (`-append`) is emitted as a SINGLE argv token, so
  * spaces/`=`/`,` are safe (they cannot split off another argv element or inject a
  * QemuOpts property). The one thing we forbid is control characters (newlines,
@@ -494,10 +543,14 @@ export function probeKvm(): boolean {
  *
  * - `tcg`  → always TCG.
  * - `kvm`  → KVM, or {@link AccelError} when `/dev/kvm` is inaccessible.
- * - `auto` → KVM when available, otherwise TCG.
+ * - `auto` → KVM only when the guest arch (from `machine`) matches the host arch AND
+ *   `/dev/kvm` is available; otherwise TCG. KVM cannot cross architectures, so an
+ *   aarch64 guest on an x86_64 host (or vice-versa) always resolves to TCG (issue #18).
  */
 export function resolveAccel(
   requested: AccelMode,
+  guestArch: string,
+  hostArch: string,
   kvmAvailable: () => boolean = probeKvm,
 ): AccelResolution {
   switch (requested) {
@@ -516,6 +569,17 @@ export function resolveAccel(
       }
       return { accel: 'kvm', requested, reason: 'accel=kvm requested; /dev/kvm is accessible.' };
     default:
+      // accel=auto: KVM cannot cross architectures, so it is only viable when the
+      // guest arch (derived from the machine) matches the host. Otherwise — e.g. an
+      // aarch64 `virt` guest on an x86_64 host — qemu rejects KVM ("invalid
+      // accelerator kvm"), so fall back to TCG before probing /dev/kvm (issue #18).
+      if (guestArch !== hostArch) {
+        return {
+          accel: 'tcg',
+          requested,
+          reason: `accel=auto: guest arch ${guestArch} does not match host arch ${hostArch}; KVM cannot cross architectures, so using TCG.`,
+        };
+      }
       return kvmAvailable()
         ? { accel: 'kvm', requested, reason: 'accel=auto: /dev/kvm is accessible, using KVM.' }
         : {

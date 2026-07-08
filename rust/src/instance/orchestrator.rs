@@ -32,8 +32,8 @@ use super::event_buffer::{
     EventBuffer, ReadResult, WaitForEventOptions, WaitFuture, DEFAULT_EVENT_BUFFER_SIZE,
 };
 use super::hardware_spec::{
-    build_argv, parse_hardware_spec, resolve_accel, Accel, AccelResolution, ArgvOptions,
-    DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
+    build_argv, machine_arch, parse_hardware_spec, qemu_binary_for_machine, resolve_accel, Accel,
+    AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -125,8 +125,15 @@ pub struct ScreendumpResult {
 /// singleton injects the env-resolved values (mirrors the TS `OrchestratorOptions`,
 /// trimmed to what this slice's `build_argv` + accel resolution consume).
 pub struct OrchestratorOptions {
-    /// The `qemu-system-*` binary to launch.
-    pub binary: String,
+    /// Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`). When `None`,
+    /// the binary is DERIVED per-instance from the spec's `machine` (issue #18):
+    /// `qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for virt/raspi*. Set it
+    /// only to force a specific emulator (e.g. a custom build) for every Instance.
+    pub qemu_binary_override: Option<String>,
+    /// This host's QEMU architecture (`x86_64`/`aarch64`) for the `accel: auto`
+    /// guest/host match (issue #18). The singleton wires the real host via
+    /// `host_qemu_arch()`; tests set it deterministically.
+    pub host_arch: String,
     /// Server-managed path of the QMP UNIX socket.
     pub qmp_socket_path: String,
     /// Absolute path of the Image Store directory (ADR-0006); required by a spec
@@ -450,8 +457,20 @@ impl Orchestrator {
         if spec.display == DisplayMode::Vnc {
             self.assert_viewer_configured()?;
         }
-        let resolution = resolve_accel(spec.accel, || (self.options.kvm_available)())
-            .map_err(|e| LifecycleError(e.0))?;
+        // The machine picks the arch: derive the emulator + the KVM-eligibility arch
+        // from spec.machine, unless QMP_MCP_QEMU_BINARY forces a specific binary (#18).
+        let resolution = resolve_accel(
+            spec.accel,
+            machine_arch(spec.machine.as_str()),
+            &self.options.host_arch,
+            || (self.options.kvm_available)(),
+        )
+        .map_err(|e| LifecycleError(e.0))?;
+        let binary = self
+            .options
+            .qemu_binary_override
+            .clone()
+            .unwrap_or_else(|| qemu_binary_for_machine(spec.machine.as_str()));
         let argv = build_argv(&spec, &self.argv_options(resolution.accel))
             .map_err(|e| LifecycleError(e.0))?;
         tracing::info!(
@@ -462,7 +481,7 @@ impl Orchestrator {
         let handle = self
             .driver
             .launch(LaunchRequest {
-                binary: self.options.binary.clone(),
+                binary,
                 argv,
                 qmp_socket_path: self.options.qmp_socket_path.clone(),
             })
@@ -992,7 +1011,10 @@ mod tests {
     /// cleanly against these.
     fn test_options() -> OrchestratorOptions {
         OrchestratorOptions {
-            binary: "qemu-system-x86_64".to_string(),
+            qemu_binary_override: Some("qemu-system-x86_64".to_string()),
+            // Pin the host arch so the accel=auto guest/host match is deterministic
+            // across CI runners (issue #18); the default q35 machine is x86_64.
+            host_arch: "x86_64".to_string(),
             qmp_socket_path: "/run/qmp-mcp/qmp.sock".to_string(),
             image_dir: None,
             iso_dir: None,
@@ -1425,6 +1447,52 @@ mod tests {
         assert!(argv.iter().any(|a| a == "-qmp"));
         assert!(argv.iter().any(|a| a == "-S"));
         assert_eq!(launches[0].binary, "qemu-system-x86_64");
+    }
+
+    #[tokio::test]
+    async fn derives_qemu_binary_from_machine_when_no_override() {
+        // issue #18: with no QMP_MCP_QEMU_BINARY override, a virt machine picks the
+        // aarch64 emulator without any env flip.
+        let driver = FakeQemuDriver::new();
+        let launches = driver.launches();
+        let mut options = test_options();
+        options.qemu_binary_override = None;
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        orch.create_instance(json!({ "machine": "virt", "accel": "tcg" }))
+            .await
+            .expect("create ok");
+        assert_eq!(launches.lock().unwrap()[0].binary, "qemu-system-aarch64");
+    }
+
+    #[tokio::test]
+    async fn explicit_binary_override_wins_over_machine_derivation() {
+        // test_options sets the override to x86_64; a virt (aarch64) machine must NOT
+        // flip the binary — the operator's explicit choice is honored (issue #18).
+        let driver = FakeQemuDriver::new();
+        let launches = driver.launches();
+        let mut orch = orchestrator_with(driver);
+        orch.create_instance(json!({ "machine": "virt", "accel": "tcg" }))
+            .await
+            .expect("create ok");
+        assert_eq!(launches.lock().unwrap()[0].binary, "qemu-system-x86_64");
+    }
+
+    #[tokio::test]
+    async fn accel_auto_falls_back_to_tcg_on_arch_mismatch() {
+        // aarch64 `virt` guest on an x86_64 host (test_options host_arch): even with
+        // /dev/kvm available, KVM cannot cross architectures, so accel resolves to TCG
+        // (issue #18) rather than the qemu "invalid accelerator kvm" failure.
+        let driver = FakeQemuDriver::new();
+        let mut options = test_options();
+        options.qemu_binary_override = None;
+        options.kvm_available = Box::new(|| true);
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        let result = orch
+            .create_instance(json!({ "machine": "virt" }))
+            .await
+            .expect("create ok");
+        assert_eq!(result.accel, Accel::Tcg);
+        assert!(result.accel_reason.contains("does not match host arch"));
     }
 
     #[tokio::test]

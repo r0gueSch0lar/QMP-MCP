@@ -671,7 +671,8 @@ mod tests {
         let driver = FakeQemuDriver::new();
         let events = driver.events_slot();
         let options = OrchestratorOptions {
-            binary: "qemu-system-x86_64".to_string(),
+            qemu_binary_override: Some("qemu-system-x86_64".to_string()),
+            host_arch: "x86_64".to_string(),
             qmp_socket_path: "/run/qmp-mcp/qmp.sock".to_string(),
             image_dir: None,
             iso_dir: None,

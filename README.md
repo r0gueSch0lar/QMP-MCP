@@ -84,10 +84,12 @@ There is an escape hatch — **extraArgs**, which appends raw QEMU flags to the 
 command line — but it's off unless you explicitly enable it. It's meant for trusted,
 single-tenant setups where you've decided the agent can be handed the keys.
 
-Which architecture you emulate is part of this too: by default the server launches
-`qemu-system-x86_64`, but point `QMP_MCP_QEMU_BINARY` at `qemu-system-aarch64` (or
-`riscv64`, …) and the same kind of spec builds a guest of that architecture, with the
-`machine` and `cpu` fields shaping the rest.
+Which architecture you emulate falls out of the `machine`: the server picks the emulator
+for you — `q35`/`pc` launch `qemu-system-x86_64`, while `virt` and the `raspi*` boards
+launch `qemu-system-aarch64` — so switching architectures is just a different `machine`,
+no restart. `QMP_MCP_QEMU_BINARY` overrides that choice for every Instance (e.g. a custom
+build or `qemu-system-riscv64`), and `accel: auto` only uses KVM when the guest arch
+matches the host, falling back to TCG across architectures (ADR-0013).
 
 Some machines don't boot from a disk at all. QEMU's Raspberry Pi boards (`raspi3b` and
 friends) have fixed hardware — a set CPU, core count, and RAM — and they expect the kernel
@@ -284,14 +286,14 @@ live, interactive screen at `http://<host>:6080/`.
 
 ### 5. Emulate a different architecture
 
-Point the server at another emulator and pick a matching machine and CPU.
+Pick an ARM machine and CPU — the `qemu-system-aarch64` emulator is chosen automatically
+from the `machine` (no `QMP_MCP_QEMU_BINARY` needed), and `accel: auto` falls back to TCG
+on an x86 host, so you can even omit `accel`.
 
 > *"Bring up an ARM64 virtual machine."*
 
-Start the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, then:
-
 ```json
-{ "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 2048, "accel": "tcg" }
+{ "machine": "virt", "cpu": "cortex-a72", "vcpus": 2, "memoryMb": 2048 }
 ```
 
 (If you also need to *build* the Rust binary for a non-x86 host, see its
@@ -300,8 +302,8 @@ Start the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, then:
 ### 6. Emulate a Raspberry Pi board
 
 QEMU's Raspberry Pi machines boot a kernel directly and render a framebuffer you can watch
-in the browser Viewer. Put the extracted kernel and device tree in the Image Store, start
-the server with `QMP_MCP_QEMU_BINARY=qemu-system-aarch64`, and:
+in the browser Viewer. Put the extracted kernel and device tree in the Image Store (the
+`raspi*` machines select `qemu-system-aarch64` for you), and:
 
 > *"Boot a Raspberry Pi 3 and show me the console."*
 
@@ -365,7 +367,7 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | --- | --- | --- |
 | `QMP_MCP_TRANSPORT` | `stdio` | `stdio`, `http`, or `both` |
 | `QMP_MCP_API_KEYS` | _(unset)_ | API keys for the HTTP transport (required unless insecure) |
-| `QMP_MCP_QEMU_BINARY` | `qemu-system-x86_64` | which emulator to launch — i.e. the guest architecture |
+| `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | override the emulator for every Instance; unset derives it (q35→x86_64, virt/raspi*→aarch64, ADR-0013) |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |

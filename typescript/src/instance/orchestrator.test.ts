@@ -22,7 +22,10 @@ function makeOrchestrator(
   options: Partial<OrchestratorOptions> = {},
 ): Orchestrator {
   return new Orchestrator(driver, {
-    binary: 'qemu-system-x86_64',
+    qemuBinaryOverride: 'qemu-system-x86_64',
+    // Pin the host arch so the accel=auto guest/host match is deterministic across
+    // CI runners (issue #18); the default q35 machine is x86_64, so guest == host.
+    hostArch: 'x86_64',
     qmpSocketPath: SOCK,
     kvmAvailable: () => false,
     socketOccupied: async () => false,
@@ -87,6 +90,34 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(driver.launches[0]?.argv[driver.launches[0].argv.indexOf('-machine') + 1]).toMatch(
       /accel=kvm/,
     );
+  });
+
+  it('derives the qemu binary from the machine when no override is set (issue #18)', async () => {
+    const driver = new FakeQemuDriver();
+    const orch = makeOrchestrator(driver, { qemuBinaryOverride: undefined });
+    await orch.createInstance({ machine: 'virt', accel: 'tcg' });
+    expect(driver.launches[0]?.binary).toBe('qemu-system-aarch64');
+  });
+
+  it('an explicit binary override wins over machine derivation (issue #18)', async () => {
+    const driver = new FakeQemuDriver();
+    // Override set to x86_64 by makeOrchestrator; a virt (aarch64) machine must NOT
+    // flip the binary — the operator's explicit choice is honored for every Instance.
+    const orch = makeOrchestrator(driver);
+    await orch.createInstance({ machine: 'virt', accel: 'tcg' });
+    expect(driver.launches[0]?.binary).toBe('qemu-system-x86_64');
+  });
+
+  it('accel=auto falls back to TCG when the guest arch does not match the host (issue #18)', async () => {
+    // aarch64 `virt` guest on an x86_64 host: KVM cannot cross architectures, so even
+    // with /dev/kvm available the accelerator must resolve to TCG (not "invalid kvm").
+    const orch = makeOrchestrator(new FakeQemuDriver(), {
+      qemuBinaryOverride: undefined,
+      kvmAvailable: () => true,
+    });
+    const result = await orch.createInstance({ machine: 'virt' });
+    expect(result.accel).toBe('tcg');
+    expect(result.accelReason).toMatch(/does not match host arch/);
   });
 
   it('rejects create while an Instance already exists, actionably', async () => {
