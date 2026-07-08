@@ -179,9 +179,11 @@ Two ways to see what the VM is doing:
   It's ideal for babysitting an OS installer, or just seeing what the agent sees. Most
   machines (`virt`, `q35`, …) have no built-in display, so pair `display: vnc` with a
   **`displayDevice`** — `virtio-gpu` (a real GPU with DRM, so Wayland/X desktops render),
-  `vga`, or `ramfb`. The `raspi*` boards render over their built-in framebuffer, so they
-  stay `displayDevice: none`. (Booting a distro that way also takes `initrd` alongside
-  `kernel` — the usual kernel + initramfs + rootfs.)
+  `vga`, or `ramfb`. Use `vga` for a **live ISO** or any boot where the boot menu / early
+  console must be visible: `virtio-gpu` shows nothing until the guest loads its DRM
+  driver, so an ISO's bootloader can't draw on it. The `raspi*` boards render over their
+  built-in framebuffer, so they stay `displayDevice: none`. (Booting a distro this way
+  also takes `initrd` alongside `kernel` — the usual kernel + initramfs + rootfs.)
 
 ### Talking to the server: transports and authentication
 
