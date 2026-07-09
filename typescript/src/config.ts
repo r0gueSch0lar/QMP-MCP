@@ -128,6 +128,23 @@ export interface Config {
    */
   allowHostNet: boolean;
   /**
+   * Host directory shared into the guest via virtio-9p when a spec sets `share: true`
+   * (`QMP_MCP_HOST_SHARE_DIR`, ADR-0014), or undefined when sharing is disabled. An
+   * operator path, never agent-supplied.
+   */
+  hostShareDir: string | undefined;
+  /**
+   * The INTENDED guest mountpoint for the shared folder (`QMP_MCP_GUEST_SHARE_DIR`),
+   * or undefined. Advisory only (QEMU can't mount inside the guest) — reported by
+   * `get_share` and used to build the guest's `mount -t 9p` command.
+   */
+  guestShareDir: string | undefined;
+  /**
+   * Whether the shared folder is read-WRITE (`QMP_MCP_ALLOW_SHARE_WRITE`, default
+   * false ⇒ read-only). The agent can never escalate to writable.
+   */
+  allowShareWrite: boolean;
+  /**
    * When true, `create_instance` auto-starts the Guest: it issues QMP `cont`
    * immediately after launch (`QMP_MCP_AUTO_START`), so the Instance begins
    * executing rather than staying frozen at the `-S` startup pause. Default false —
@@ -435,6 +452,49 @@ export function resolveAllowRawArgs(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve the host directory shared into the guest via virtio-9p when a spec opts in
+ * with `share: true` (ADR-0014 folder sharing), or undefined when unset (sharing
+ * disabled). This is an OPERATOR path, never agent-supplied — the agent only toggles
+ * `share`, mirroring how disks/ISOs live in operator-configured Stores. It must be an
+ * ABSOLUTE path (a relative one resolves against the process CWD); a blank value reads
+ * as unset. Exported so the Orchestrator singleton and {@link loadConfig} share one
+ * source of truth.
+ */
+export function resolveHostShareDir(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_HOST_SHARE_DIR;
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '') return undefined;
+  if (!value.startsWith('/')) {
+    throw new ConfigError(
+      `QMP_MCP_HOST_SHARE_DIR must be an absolute path (got "${value}"). It is the host directory ` +
+        'shared into the guest; a relative path resolves against an ambient CWD.',
+    );
+  }
+  return value;
+}
+
+/**
+ * Resolve the INTENDED guest mountpoint for the shared folder (`QMP_MCP_GUEST_SHARE_DIR`),
+ * or undefined when unset. QEMU cannot mount inside the guest — this is advisory: it is
+ * reported by the `get_share` tool and used to build the exact `mount -t 9p` command the
+ * guest runs. The 9p mount tag is always the fixed constant `share`.
+ */
+export function resolveGuestShareDir(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_GUEST_SHARE_DIR;
+  return raw !== undefined && raw.trim() !== '' ? raw.trim() : undefined;
+}
+
+/**
+ * Whether the shared folder is mounted read-WRITE (`QMP_MCP_ALLOW_SHARE_WRITE`, default
+ * false). Fail-closed: the share is read-only unless the operator explicitly enables
+ * writes — the agent can never escalate to writable (mirrors `QMP_MCP_ALLOW_HOST_NET`).
+ */
+export function resolveAllowShareWrite(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_ALLOW_SHARE_WRITE', env.QMP_MCP_ALLOW_SHARE_WRITE, false);
+}
+
+/**
  * Resolve the noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010), or
  * undefined when unset. A whitespace-only value is treated as unset (mirroring
  * `QMP_MCP_JWT_SECRET`) so the Viewer stays fail-closed rather than serving behind
@@ -559,6 +619,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     maxVcpus: resolveMaxVcpus(env),
     hostfwdPortRange: resolveHostfwdPortRange(env),
     allowHostNet: resolveAllowHostNet(env),
+    hostShareDir: resolveHostShareDir(env),
+    guestShareDir: resolveGuestShareDir(env),
+    allowShareWrite: resolveAllowShareWrite(env),
     autoStart: resolveAutoStart(env),
     eventBufferSize: resolveEventBufferSize(env),
     allowRawArgs: resolveAllowRawArgs(env),

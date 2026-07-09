@@ -509,6 +509,11 @@ pub struct HardwareSpecParams {
     /// Optional CD-ROM drive backed by an ISO from the read-only ISO Store.
     #[serde(default)]
     pub cdrom: Option<CdromParams>,
+    /// Share the operator-configured host folder (`QMP_MCP_HOST_SHARE_DIR`) into the
+    /// guest via virtio-9p (ADR-0014). Boolean opt-in only — the host path is never
+    /// agent-supplied. Not supported on raspi* boards (no PCI bus).
+    #[serde(default)]
+    pub share: bool,
     /// Optional boot order as QEMU drive letters, e.g. `d` or `dc`.
     #[serde(default)]
     pub boot: Option<String>,
@@ -620,6 +625,8 @@ pub struct HardwareSpec {
     pub disks: Vec<Disk>,
     /// Optional CD-ROM.
     pub cdrom: Option<Cdrom>,
+    /// Share the operator's host folder into the guest via virtio-9p (ADR-0014).
+    pub share: bool,
     /// Optional validated boot order.
     pub boot: Option<BootOrder>,
     /// Optional external kernel image (by name in the Image Store) to direct-boot.
@@ -767,6 +774,7 @@ pub fn parse_hardware_spec(
         display_device: params.display_device,
         disks,
         cdrom,
+        share: params.share,
         boot,
         kernel,
         initrd,
@@ -933,6 +941,13 @@ pub struct ArgvOptions {
     pub image_dir: Option<String>,
     /// Absolute path of the read-only ISO Store; required when the spec has a cdrom.
     pub iso_dir: Option<String>,
+    /// Host directory shared into the guest via virtio-9p (`QMP_MCP_HOST_SHARE_DIR`,
+    /// ADR-0014); required when the spec sets `share: true`.
+    pub host_share_dir: Option<String>,
+    /// Whether the shared folder is read-only. Fail-closed: `None`/`Some(true)` ⇒
+    /// `readonly=on`; only `Some(false)` (operator set `QMP_MCP_ALLOW_SHARE_WRITE`)
+    /// mounts it read-write.
+    pub share_readonly: Option<bool>,
     /// Inclusive host-port range a forward's `hostPort` must fall within; defaults
     /// to [`DEFAULT_HOSTFWD_PORT_RANGE`] when `None`.
     pub hostfwd_port_range: Option<PortRange>,
@@ -990,6 +1005,58 @@ fn build_drive_args(
 /// Resolve a CD-ROM's ISO name to a safe in-Store path and render a read-only
 /// `-drive ...,media=cdrom,readonly=on,format=raw` argument pair against the
 /// SEPARATE read-only ISO Store. Any escaping reference is rejected here.
+/// The fixed virtio-9p mount tag for the shared host folder (ADR-0014). A server-owned
+/// CONSTANT — never operator- or agent-supplied — so it can never inject an extra
+/// `-device` property. Mirrors the TS `SHARE_MOUNT_TAG`.
+pub const SHARE_MOUNT_TAG: &str = "share";
+
+/// Render the virtio-9p folder-share argument pair for a spec that opted in with
+/// `share: true` (ADR-0014). The host directory is the OPERATOR's `QMP_MCP_HOST_SHARE_DIR`
+/// (never agent-supplied) and is comma-escaped so a comma in the path can never split
+/// off an extra `-fsdev` property. `security_model=mapped-xattr` stores guest uid/gid/mode
+/// in host xattrs, so the guest cannot create host setuid or device nodes and symlinks
+/// stay inside the shared tree. Read-only unless the operator enabled writes
+/// (`share_readonly == Some(false)`). virtio-9p is a PCI device, so it is refused
+/// fail-closed on the raspi* boards (no PCI bus); a `share` with no host dir configured
+/// fails closed naming `QMP_MCP_HOST_SHARE_DIR`. Mirrors the TS `buildShareArgs`.
+fn build_share_args(
+    options: &ArgvOptions,
+    raspi: bool,
+    machine: &str,
+) -> Result<Vec<String>, HardwareSpecError> {
+    let host_dir = match options.host_share_dir.as_deref() {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => {
+            return Err(HardwareSpecError(
+                "Folder sharing (share: true) was requested but no host share directory is \
+                 configured. Set QMP_MCP_HOST_SHARE_DIR to the host directory to share into \
+                 the guest."
+                    .to_string(),
+            ));
+        }
+    };
+    if raspi {
+        return Err(HardwareSpecError(format!(
+            "Folder sharing cannot be attached to the raspi* board \"{machine}\": virtio-9p needs \
+             a PCI bus, which these boards do not have. Use a q35/pc/virt machine to share a folder."
+        )));
+    }
+    let mut fsdev = format!(
+        "local,id=fsdev0,path={},security_model=mapped-xattr",
+        escape_qemu_opts_value(host_dir)
+    );
+    // Fail-closed: read-only unless the operator explicitly enabled writes.
+    if options.share_readonly != Some(false) {
+        fsdev.push_str(",readonly=on");
+    }
+    Ok(vec![
+        "-fsdev".to_string(),
+        fsdev,
+        "-device".to_string(),
+        format!("virtio-9p-pci,fsdev=fsdev0,mount_tag={SHARE_MOUNT_TAG}"),
+    ])
+}
+
 fn build_cdrom_args(
     cdrom: &Cdrom,
     iso_dir: Option<&str>,
@@ -1277,6 +1344,11 @@ pub fn build_argv(
     if let Some(cdrom) = &spec.cdrom {
         argv.extend(build_cdrom_args(cdrom, options.iso_dir.as_deref())?);
     }
+    // Guest folder sharing (virtio-9p, ADR-0014): boolean opt-in; host dir is
+    // operator-configured, read-only unless enabled, refused on raspi (no PCI bus).
+    if spec.share {
+        argv.extend(build_share_args(options, raspi, spec.machine.as_str())?);
+    }
     if let Some(boot) = &spec.boot {
         // boot is allowlisted to [a-dnp]+ already; emit the single order= form (and
         // comma-escape as defense-in-depth).
@@ -1341,6 +1413,8 @@ mod tests {
             qmp_socket_path: SOCK.to_string(),
             image_dir: None,
             iso_dir: None,
+            host_share_dir: None,
+            share_readonly: None,
             hostfwd_port_range: None,
             allow_host_net: false,
             max_memory_mb: None,
@@ -1718,6 +1792,48 @@ mod tests {
         assert_eq!(value_after(&argv, "-boot"), "order=dc");
         let argv = build_argv(&spec(json!({})), &opts()).unwrap();
         assert!(!argv.iter().any(|s| s == "-boot"));
+    }
+
+    #[test]
+    fn emits_virtio_9p_share_read_only_and_refuses_on_raspi() {
+        // share:true with no shareReadonly override => read-only (fail-closed).
+        let mut o = opts();
+        o.host_share_dir = Some("/srv/host-share".to_string());
+        let argv = build_argv(&spec(json!({ "share": true })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-fsdev"),
+            "local,id=fsdev0,path=/srv/host-share,security_model=mapped-xattr,readonly=on"
+        );
+        assert!(argv
+            .iter()
+            .any(|a| a == "virtio-9p-pci,fsdev=fsdev0,mount_tag=share"));
+
+        // Writable only when the operator enabled it (share_readonly Some(false)).
+        let mut rw = opts();
+        rw.host_share_dir = Some("/srv/host-share".to_string());
+        rw.share_readonly = Some(false);
+        let argv = build_argv(&spec(json!({ "share": true })), &rw).unwrap();
+        assert!(!value_after(&argv, "-fsdev").contains("readonly"));
+
+        // share:false emits nothing.
+        let argv = build_argv(&spec(json!({ "share": false })), &o).unwrap();
+        assert!(!argv.iter().any(|a| a == "-fsdev"));
+
+        // No host dir configured => fail closed naming the env var.
+        let e = build_argv(&spec(json!({ "share": true })), &opts()).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_HOST_SHARE_DIR"));
+
+        // raspi has no PCI bus => refused.
+        let mut r = opts();
+        r.host_share_dir = Some("/srv/host-share".to_string());
+        let e = build_argv(&spec(json!({ "machine": "raspi3b", "share": true })), &r).unwrap_err();
+        assert!(e.0.contains("virtio-9p needs a PCI bus"), "got: {}", e.0);
+
+        // A comma in the host path is escaped so it can't inject an -fsdev property.
+        let mut c = opts();
+        c.host_share_dir = Some("/srv/a,b".to_string());
+        let argv = build_argv(&spec(json!({ "share": true })), &c).unwrap();
+        assert!(value_after(&argv, "-fsdev").contains("path=/srv/a,,b"));
     }
 
     // --- network argv -------------------------------------------------------

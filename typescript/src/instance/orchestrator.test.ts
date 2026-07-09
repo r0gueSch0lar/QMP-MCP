@@ -38,6 +38,37 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(makeOrchestrator(new FakeQemuDriver()).getInstance().state).toBe('NONE');
   });
 
+  it('describeShare reports the fixed tag + mount command when a host share is configured (ADR-0014)', () => {
+    const orch = makeOrchestrator(new FakeQemuDriver(), {
+      hostShareDir: '/srv/share',
+      guestShareDir: '/mnt/share',
+      shareReadonly: true,
+    });
+    const s = orch.describeShare();
+    expect(s).toMatchObject({
+      available: true,
+      mountTag: 'share',
+      guestMountpoint: '/mnt/share',
+      readOnly: true,
+    });
+    expect(s.mountCommand).toBe('mount -t 9p -o trans=virtio,version=9p2000.L,ro share /mnt/share');
+  });
+
+  it('describeShare is unavailable with no host share, and drops ,ro when writable', () => {
+    expect(makeOrchestrator(new FakeQemuDriver()).describeShare()).toMatchObject({
+      available: false,
+      mountCommand: undefined,
+    });
+    const rw = makeOrchestrator(new FakeQemuDriver(), {
+      hostShareDir: '/srv/s',
+      shareReadonly: false,
+    });
+    const s = rw.describeShare();
+    expect(s.readOnly).toBe(false);
+    expect(s.mountCommand).toContain('version=9p2000.L share');
+    expect(s.mountCommand).not.toContain(',ro');
+  });
+
   it('create loads the Instance PAUSED by default (frozen at -S) and launches via the driver port (issue #10)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver);

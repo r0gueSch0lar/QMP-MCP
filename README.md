@@ -150,8 +150,11 @@ resolve inside two folders you designate:
   Keeping it distinct means install media can never be written to.
 
 Both are enforced with real-path containment: a name that tries to climb out — `../`, an
-absolute path, a symlink pointing elsewhere — is refused. These two folders *are* the
-agent's view of the filesystem; it has no other.
+absolute path, a symlink pointing elsewhere — is refused. These two folders are the
+agent's view of the filesystem — the only exception is an optional virtio-9p **folder
+share** the operator can enable (`QMP_MCP_HOST_SHARE_DIR`), which a spec opts into with
+`share: true`; it too is operator-configured (the agent never names the host path) and
+read-only by default (ADR-0014).
 
 ### Sandboxed networking
 
@@ -204,6 +207,7 @@ The agent's vocabulary — the actions it can take:
 | --- | --- |
 | `create_instance` / `destroy_instance` | build & launch the Instance from a Hardware Spec / tear it down |
 | `get_instance` / `get_status` | the current Instance + lifecycle state / the live guest run state |
+| `get_share` | report the host↔guest folder-sharing config + the exact 9p mount command for the guest |
 | `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
 | `reset_instance` / `powerdown_instance` | hard reset / request a graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks & backing media / per-CPU info |
@@ -375,6 +379,9 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced on the Viewer's HTTP Basic auth (default: username ignored, password-only) |
+| `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ sharing off; ADR-0014) |
+| `QMP_MCP_GUEST_SHARE_DIR` | _(unset)_ | intended guest mountpoint (advisory) — `get_share` reports the exact `mount -t 9p` command |
+| `QMP_MCP_ALLOW_SHARE_WRITE` | `false` | mount the share read-write (default read-only; the agent can never escalate) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |
 
 …plus caps on disk/memory/vCPUs, the host-forward port range, the Command Policy allow/deny

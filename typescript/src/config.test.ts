@@ -1,7 +1,15 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { type Config, ConfigError, loadConfig, resolveQemuBinaryOverride } from './config.js';
+import {
+  type Config,
+  ConfigError,
+  loadConfig,
+  resolveAllowShareWrite,
+  resolveGuestShareDir,
+  resolveHostShareDir,
+  resolveQemuBinaryOverride,
+} from './config.js';
 
 /** The host-agnostic default Image Store dir for an empty environment. */
 const DEFAULT_IMAGE_DIR = join(tmpdir(), 'qmp-mcp', 'images');
@@ -29,6 +37,9 @@ const DEFAULTS: Config = {
   maxVcpus: 2,
   hostfwdPortRange: { low: 1024, high: 65535 },
   allowHostNet: false,
+  hostShareDir: undefined,
+  guestShareDir: undefined,
+  allowShareWrite: false,
   autoStart: false,
   eventBufferSize: 256,
   allowRawArgs: false,
@@ -399,6 +410,34 @@ describe('loadConfig', () => {
       expect(() => loadConfig({ QMP_MCP_ALLOW_HOST_NET: 'yes' })).toThrowError(
         /QMP_MCP_ALLOW_HOST_NET must be "true" or "false"/,
       );
+    });
+  });
+
+  describe('guest folder sharing (ADR-0014)', () => {
+    it('defaults: sharing disabled, read-only', () => {
+      const c = loadConfig({});
+      expect(c.hostShareDir).toBeUndefined();
+      expect(c.guestShareDir).toBeUndefined();
+      expect(c.allowShareWrite).toBe(false);
+    });
+
+    it('resolveHostShareDir requires an absolute path; blank reads as unset', () => {
+      expect(resolveHostShareDir({ QMP_MCP_HOST_SHARE_DIR: '/srv/share' })).toBe('/srv/share');
+      expect(resolveHostShareDir({})).toBeUndefined();
+      expect(resolveHostShareDir({ QMP_MCP_HOST_SHARE_DIR: '   ' })).toBeUndefined();
+      expect(() => resolveHostShareDir({ QMP_MCP_HOST_SHARE_DIR: 'rel/share' })).toThrow(
+        ConfigError,
+      );
+      expect(() => resolveHostShareDir({ QMP_MCP_HOST_SHARE_DIR: 'rel/share' })).toThrowError(
+        /QMP_MCP_HOST_SHARE_DIR/,
+      );
+    });
+
+    it('resolveGuestShareDir + resolveAllowShareWrite read env with fail-closed defaults', () => {
+      expect(resolveGuestShareDir({ QMP_MCP_GUEST_SHARE_DIR: '/mnt/share' })).toBe('/mnt/share');
+      expect(resolveGuestShareDir({})).toBeUndefined();
+      expect(resolveAllowShareWrite({})).toBe(false);
+      expect(resolveAllowShareWrite({ QMP_MCP_ALLOW_SHARE_WRITE: 'true' })).toBe(true);
     });
   });
 
