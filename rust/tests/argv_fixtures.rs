@@ -42,6 +42,12 @@ struct FixtureOptions {
     max_vcpus: Option<u32>,
     #[serde(default)]
     allow_raw_args: bool,
+    // Guest folder sharing (ADR-0013). host_share_dir is emitted verbatim (not
+    // resolved through a Store), so fixtures use a literal path — no placeholder.
+    #[serde(default)]
+    host_share_dir: Option<String>,
+    #[serde(default)]
+    share_readonly: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +146,8 @@ fn rust_generator_reproduces_the_shared_argv_corpus() {
             qmp_socket_path: SOCKET.to_string(),
             image_dir: Some(image.path.to_string_lossy().into_owned()),
             iso_dir: Some(iso.path.to_string_lossy().into_owned()),
+            host_share_dir: fixture.options.host_share_dir.clone(),
+            share_readonly: fixture.options.share_readonly,
             hostfwd_port_range: fixture.options.hostfwd_port_range.map(|r| PortRange {
                 low: r.low,
                 high: r.high,

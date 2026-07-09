@@ -1,0 +1,19 @@
+{
+  "description": "Guest folder sharing (ADR-0014): share:true emits a virtio-9p device exposing the operator's QMP_MCP_HOST_SHARE_DIR (verbatim, comma-escaped) under the fixed mount_tag 'share', with security_model=mapped-xattr. Read-only by default (readonly=on, shareReadonly). A PCI device, so q35 hosts it. TCG.",
+  "spec": { "share": true },
+  "options": { "accel": "tcg", "hostShareDir": "/srv/host-share", "shareReadonly": true },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-fsdev", "local,id=fsdev0,path=/srv/host-share,security_model=mapped-xattr,readonly=on",
+    "-device", "virtio-9p-pci,fsdev=fsdev0,mount_tag=share",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
