@@ -33,8 +33,8 @@ use super::event_buffer::{
 };
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
-    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, VNC_LOOPBACK_HOST,
-    VNC_LOOPBACK_PORT,
+    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, SHARE_MOUNT_TAG,
+    VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -94,6 +94,26 @@ pub struct InstanceView {
     pub accel: Option<Accel>,
 }
 
+/// Read-only report of the host↔guest folder-sharing configuration (ADR-0014),
+/// returned by the `get_share` tool. Never includes the host path. Mirrors the shape of
+/// the TS `describeShare` result.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareReport {
+    /// Whether a host folder is shared into guests (`QMP_MCP_HOST_SHARE_DIR` is set).
+    pub available: bool,
+    /// The fixed 9p mount tag the guest mounts.
+    pub mount_tag: String,
+    /// The intended guest mountpoint (`QMP_MCP_GUEST_SHARE_DIR`), if configured.
+    pub guest_mountpoint: Option<String>,
+    /// Whether the share is read-only.
+    pub read_only: bool,
+    /// The exact `mount` command to run inside the guest (`None` when unavailable).
+    pub mount_command: Option<String>,
+    /// A human hint on how to use (or enable) the share.
+    pub hint: String,
+}
+
 /// The result of a successful [`Orchestrator::create_instance`].
 #[derive(Debug, Clone)]
 pub struct CreateInstanceResult {
@@ -143,6 +163,16 @@ pub struct OrchestratorOptions {
     /// Absolute path of the read-only ISO Store directory (ADR-0006); required by a
     /// spec with a cdrom.
     pub iso_dir: Option<String>,
+    /// Host directory shared into the guest via virtio-9p when a spec sets `share: true`
+    /// (`QMP_MCP_HOST_SHARE_DIR`, ADR-0014). Operator-configured, never agent-supplied;
+    /// `None` means sharing is disabled (a `share: true` spec is then refused).
+    pub host_share_dir: Option<String>,
+    /// Intended guest mountpoint for the shared folder (`QMP_MCP_GUEST_SHARE_DIR`).
+    /// Advisory only — reported by `get_share`.
+    pub guest_share_dir: Option<String>,
+    /// Whether the shared folder is read-only (default true; `Some(false)` only when
+    /// the operator set `QMP_MCP_ALLOW_SHARE_WRITE`). Threaded into the argv fail-closed.
+    pub share_readonly: Option<bool>,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -329,6 +359,43 @@ impl Orchestrator {
         self.state
     }
 
+    /// Report the host↔guest folder-sharing configuration (ADR-0014) for `get_share`.
+    /// Never returns the host path; it gives the agent what it needs to USE the share
+    /// from inside the guest (mount tag, guest mountpoint, read-only, and the exact
+    /// `mount` command). The share itself is attached at create time via `share: true`.
+    pub fn describe_share(&self) -> ShareReport {
+        let available = self
+            .options
+            .host_share_dir
+            .as_deref()
+            .is_some_and(|d| !d.trim().is_empty());
+        let read_only = self.options.share_readonly != Some(false);
+        let guest_mountpoint = self.options.guest_share_dir.clone();
+        let mountpoint = guest_mountpoint
+            .clone()
+            .unwrap_or_else(|| "<your-mountpoint>".to_string());
+        let ro = if read_only { ",ro" } else { "" };
+        ShareReport {
+            available,
+            mount_tag: SHARE_MOUNT_TAG.to_string(),
+            guest_mountpoint,
+            read_only,
+            mount_command: available.then(|| {
+                format!(
+                    "mount -t 9p -o trans=virtio,version=9p2000.L{ro} {SHARE_MOUNT_TAG} {mountpoint}"
+                )
+            }),
+            hint: if available {
+                "Set share: true on create_instance to attach the host folder, then run mountCommand \
+                 inside the guest (needs the 9p + 9pnet_virtio kernel modules)."
+                    .to_string()
+            } else {
+                "Folder sharing is not configured on this server (QMP_MCP_HOST_SHARE_DIR is unset)."
+                    .to_string()
+            },
+        }
+    }
+
     /// The current Instance generation — the value a fresh exit watcher captures and
     /// [`reconcile_unexpected_exit`](Self::reconcile_unexpected_exit) guards on. Test-only,
     /// so the generation guard can be asserted deterministically.
@@ -505,6 +572,8 @@ impl Orchestrator {
             qmp_socket_path: self.options.qmp_socket_path.clone(),
             image_dir: self.options.image_dir.clone(),
             iso_dir: self.options.iso_dir.clone(),
+            host_share_dir: self.options.host_share_dir.clone(),
+            share_readonly: self.options.share_readonly,
             hostfwd_port_range: self.options.hostfwd_port_range,
             allow_host_net: self.options.allow_host_net,
             max_memory_mb: self.options.max_memory_mb,
@@ -1027,6 +1096,9 @@ mod tests {
             qmp_socket_path: "/run/qmp-mcp/qmp.sock".to_string(),
             image_dir: None,
             iso_dir: None,
+            host_share_dir: None,
+            guest_share_dir: None,
+            share_readonly: None,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -1046,6 +1118,39 @@ mod tests {
 
     fn orchestrator_with(driver: FakeQemuDriver) -> Orchestrator {
         Orchestrator::new(Box::new(driver), test_options())
+    }
+
+    #[test]
+    fn describe_share_reports_tag_and_mount_command() {
+        let mut opts = test_options();
+        opts.host_share_dir = Some("/srv/share".to_string());
+        opts.guest_share_dir = Some("/mnt/share".to_string());
+        opts.share_readonly = Some(true);
+        let orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), opts);
+        let s = orch.describe_share();
+        assert!(s.available);
+        assert_eq!(s.mount_tag, "share");
+        assert_eq!(s.guest_mountpoint.as_deref(), Some("/mnt/share"));
+        assert!(s.read_only);
+        assert_eq!(
+            s.mount_command.as_deref(),
+            Some("mount -t 9p -o trans=virtio,version=9p2000.L,ro share /mnt/share")
+        );
+
+        // Unavailable with no host share configured.
+        let off = Orchestrator::new(Box::new(FakeQemuDriver::new()), test_options());
+        let s = off.describe_share();
+        assert!(!s.available);
+        assert!(s.mount_command.is_none());
+
+        // Writable share drops the ,ro option.
+        let mut rw = test_options();
+        rw.host_share_dir = Some("/srv/s".to_string());
+        rw.share_readonly = Some(false);
+        let orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), rw);
+        let s = orch.describe_share();
+        assert!(!s.read_only);
+        assert!(!s.mount_command.unwrap().contains(",ro"));
     }
 
     /// An Orchestrator with auto-start on, so `create_instance` lands in RUNNING —

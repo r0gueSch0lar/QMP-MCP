@@ -27,7 +27,7 @@ use crate::instance::image_store::{
     CreateImageRequest, CreateImageResult, ImageFormat, ImageListing, ImageStore,
 };
 use crate::instance::iso_store::{IsoListing, IsoStore};
-use crate::instance::orchestrator::{InstanceState, Orchestrator};
+use crate::instance::orchestrator::{InstanceState, Orchestrator, ShareReport};
 
 /// A compact, JSON-serialisable summary of a validated Hardware Spec, returned by
 /// the lifecycle tools. Deliberately a projection (not the full spec): enough for an
@@ -386,6 +386,21 @@ impl QmpMcpServer {
         Ok(Json(StatusReport { run_state }))
     }
 
+    /// Read-only. Report the host↔guest folder-sharing configuration (ADR-0014):
+    /// whether sharing is available, the fixed 9p mount tag, the intended guest
+    /// mountpoint, read-only vs read-write, and the exact `mount` command to run inside
+    /// the guest. Never returns the host path. Attach the share at boot with
+    /// `create_instance` `share: true`.
+    #[tool(
+        description = "Report the host↔guest folder-sharing configuration: whether sharing is \
+                       available, the 9p mount tag, the intended guest mountpoint, read-only vs \
+                       read-write, and the exact mount command to run inside the guest. Attach the \
+                       share at boot with create_instance share: true. Read-only."
+    )]
+    async fn get_share(&self) -> Json<ShareReport> {
+        Json(self.orchestrator.lock().await.describe_share())
+    }
+
     /// Read-only. Return the running Instance's recently buffered QMP async events
     /// WITHOUT blocking — the pull half of the Event Buffer contract (issue #12).
     /// Cursor-based: the response carries a `cursor` (the latest event sequence
@@ -723,6 +738,9 @@ mod tests {
             qmp_socket_path: "/run/qmp-mcp/qmp.sock".to_string(),
             image_dir: None,
             iso_dir: None,
+            host_share_dir: None,
+            guest_share_dir: None,
+            share_readonly: None,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,

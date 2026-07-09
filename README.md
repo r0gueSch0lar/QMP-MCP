@@ -375,6 +375,9 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced on the Viewer's HTTP Basic auth (default: username ignored, password-only) |
+| `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ sharing off; ADR-0014) |
+| `QMP_MCP_GUEST_SHARE_DIR` | _(unset)_ | intended guest mountpoint (advisory) — `get_share` reports the exact `mount -t 9p` command |
+| `QMP_MCP_ALLOW_SHARE_WRITE` | `false` | mount the share read-write (default read-only; the agent can never escalate) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |
 
 …plus caps on disk/memory/vCPUs, the host-forward port range, the Command Policy allow/deny

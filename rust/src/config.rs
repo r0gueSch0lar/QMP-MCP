@@ -183,6 +183,16 @@ pub struct Config {
     pub hostfwd_port_range: PortRange,
     /// When true, host-level guest networking (`tap`/`bridge`) is permitted.
     pub allow_host_net: bool,
+    /// Host directory shared into the guest via virtio-9p when a spec sets `share: true`
+    /// (`QMP_MCP_HOST_SHARE_DIR`, ADR-0014), or `None` when sharing is disabled. An
+    /// operator path, never agent-supplied.
+    pub host_share_dir: Option<String>,
+    /// Intended guest mountpoint for the shared folder (`QMP_MCP_GUEST_SHARE_DIR`).
+    /// Advisory only (QEMU can't mount inside the guest) — reported by `get_share`.
+    pub guest_share_dir: Option<String>,
+    /// Whether the shared folder is read-WRITE (`QMP_MCP_ALLOW_SHARE_WRITE`, default
+    /// false ⇒ read-only). The agent can never escalate to writable.
+    pub allow_share_write: bool,
     /// When true, `create_instance` auto-starts the Guest by issuing QMP `cont`
     /// right after launch (`QMP_MCP_AUTO_START`, issue #8). Default false: the Guest
     /// loads paused at the `-S` startup pause and only runs on `resume_instance`.
@@ -479,6 +489,25 @@ fn present_non_blank(env: &EnvMap, name: &str) -> Option<String> {
     }
 }
 
+/// Resolve the host directory shared into the guest via virtio-9p when a spec sets
+/// `share: true` (`QMP_MCP_HOST_SHARE_DIR`, ADR-0014), or `None` when unset (sharing
+/// disabled). An OPERATOR path, never agent-supplied. It must be an ABSOLUTE path (a
+/// relative one resolves against the process CWD); a blank value reads as unset. Mirrors
+/// the TS `resolveHostShareDir`.
+pub fn resolve_host_share_dir(env: &EnvMap) -> Result<Option<String>, ConfigError> {
+    let value = match trimmed_non_empty(env, "QMP_MCP_HOST_SHARE_DIR") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if !value.starts_with('/') {
+        return Err(ConfigError(format!(
+            "QMP_MCP_HOST_SHARE_DIR must be an absolute path (got \"{value}\"). It is the host \
+             directory shared into the guest; a relative path resolves against an ambient CWD."
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Build a validated [`Config`] from an environment map. Returns a [`ConfigError`]
 /// on any invalid value, and — per ADR-0005 — when the HTTP transport is selected
 /// without configured auth and without an explicit insecure override.
@@ -586,6 +615,13 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_ALLOW_HOST_NET"),
             false,
         )?,
+        host_share_dir: resolve_host_share_dir(env)?,
+        guest_share_dir: present_non_blank(env, "QMP_MCP_GUEST_SHARE_DIR"),
+        allow_share_write: parse_boolean(
+            "QMP_MCP_ALLOW_SHARE_WRITE",
+            get(env, "QMP_MCP_ALLOW_SHARE_WRITE"),
+            false,
+        )?,
         auto_start: parse_boolean("QMP_MCP_AUTO_START", get(env, "QMP_MCP_AUTO_START"), false)?,
         event_buffer_size: parse_positive_int(
             "QMP_MCP_EVENT_BUFFER_SIZE",
@@ -648,6 +684,9 @@ mod tests {
                 high: 65535,
             },
             allow_host_net: false,
+            host_share_dir: None,
+            guest_share_dir: None,
+            allow_share_write: false,
             auto_start: false,
             event_buffer_size: 256,
             allow_raw_args: false,
@@ -1135,6 +1174,28 @@ mod tests {
                 .unwrap()
                 .auto_start
         );
+    }
+
+    #[test]
+    fn folder_sharing_defaults_and_reads() {
+        let c = load_config(&env(&[])).unwrap();
+        assert_eq!(c.host_share_dir, None);
+        assert_eq!(c.guest_share_dir, None);
+        assert!(!c.allow_share_write);
+
+        let c = load_config(&env(&[
+            ("QMP_MCP_HOST_SHARE_DIR", "/srv/share"),
+            ("QMP_MCP_GUEST_SHARE_DIR", "/mnt/share"),
+            ("QMP_MCP_ALLOW_SHARE_WRITE", "true"),
+        ]))
+        .unwrap();
+        assert_eq!(c.host_share_dir.as_deref(), Some("/srv/share"));
+        assert_eq!(c.guest_share_dir.as_deref(), Some("/mnt/share"));
+        assert!(c.allow_share_write);
+
+        // A relative host share dir fails closed naming the variable.
+        let e = load_config(&env(&[("QMP_MCP_HOST_SHARE_DIR", "rel/share")])).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_HOST_SHARE_DIR"), "got: {}", e.0);
     }
 
     #[test]

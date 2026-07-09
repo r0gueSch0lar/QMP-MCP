@@ -35,6 +35,8 @@ describe('parseHardwareSpec', () => {
       // No display adapter by default (issue #15).
       displayDevice: 'none',
       disks: [],
+      // No folder sharing by default (ADR-0014).
+      share: false,
       // Networking defaults to user-mode (SLiRP) with an allowlisted NIC and no
       // port-forwards (ADR-0009).
       network: { mode: 'user', model: 'virtio-net-pci', hostForwards: [] },
@@ -489,6 +491,71 @@ describe('buildArgv cdrom (read-only ISO Store)', () => {
         isoDir,
       }),
     ).toThrowError(HardwareSpecError);
+  });
+});
+
+describe('buildArgv share (virtio-9p folder sharing, ADR-0014)', () => {
+  const SHARE = '/srv/host-share';
+
+  it('emits a read-only virtio-9p -fsdev/-device pair for share:true (default read-only)', () => {
+    const argv = buildArgv(spec({ share: true }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      hostShareDir: SHARE,
+      // shareReadonly omitted → read-only (fail-closed).
+    });
+    expect(argv[argv.indexOf('-fsdev') + 1]).toBe(
+      `local,id=fsdev0,path=${SHARE},security_model=mapped-xattr,readonly=on`,
+    );
+    expect(argv.find((a) => a.startsWith('virtio-9p-pci'))).toBe(
+      'virtio-9p-pci,fsdev=fsdev0,mount_tag=share',
+    );
+  });
+
+  it('drops readonly=on only when the operator enabled writes (shareReadonly:false)', () => {
+    const argv = buildArgv(spec({ share: true }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      hostShareDir: SHARE,
+      shareReadonly: false,
+    });
+    const fsdev = argv[argv.indexOf('-fsdev') + 1] ?? '';
+    expect(fsdev).toBe(`local,id=fsdev0,path=${SHARE},security_model=mapped-xattr`);
+    expect(fsdev).not.toContain('readonly');
+  });
+
+  it('emits nothing when share is false', () => {
+    const argv = buildArgv(spec({ share: false }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      hostShareDir: SHARE,
+    });
+    expect(argv).not.toContain('-fsdev');
+  });
+
+  it('fails closed naming QMP_MCP_HOST_SHARE_DIR when share:true but no host dir configured', () => {
+    expect(() =>
+      buildArgv(spec({ share: true }), { accel: 'tcg', qmpSocketPath: SOCK }),
+    ).toThrowError(/QMP_MCP_HOST_SHARE_DIR/);
+  });
+
+  it('refuses folder sharing on a raspi board (no PCI bus)', () => {
+    expect(() =>
+      buildArgv(spec({ machine: 'raspi3b', share: true }), {
+        accel: 'tcg',
+        qmpSocketPath: SOCK,
+        hostShareDir: SHARE,
+      }),
+    ).toThrowError(/virtio-9p needs a PCI bus/);
+  });
+
+  it('comma-escapes the host share path so it cannot inject an -fsdev property', () => {
+    const argv = buildArgv(spec({ share: true }), {
+      accel: 'tcg',
+      qmpSocketPath: SOCK,
+      hostShareDir: '/srv/a,b',
+    });
+    expect(argv[argv.indexOf('-fsdev') + 1]).toContain('path=/srv/a,,b');
   });
 });
 
