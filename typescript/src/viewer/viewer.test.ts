@@ -15,7 +15,10 @@ import {
 
 const PASSWORD = 'test-viewer-secret';
 
-/** An HTTP Basic header carrying `password` (the username half is ignored). */
+/**
+ * An HTTP Basic header carrying `user:password`. The username is ignored unless the
+ * Viewer was started with a `user` (QMP_MCP_VIEWER_USER); it defaults to `viewer`.
+ */
 function basicAuth(password: string, user = 'viewer'): string {
   return `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
 }
@@ -128,6 +131,42 @@ describe('Viewer authentication gate (ADR-0010)', () => {
   });
 });
 
+describe('Viewer username enforcement (QMP_MCP_VIEWER_USER, ADR-0010)', () => {
+  it('ignores the username by default — any username with the right password authenticates', async () => {
+    const viewer = await launchViewer(); // no user configured
+    for (const u of ['viewer', 'admin', '']) {
+      const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+        headers: { Authorization: basicAuth(PASSWORD, u) },
+      });
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it('with a configured username, the right username + password authenticates', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'operator') },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('with a configured username, the wrong username (even with the right password) is refused (401)', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'intruder') },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('with a configured username, the right username but wrong password is refused (401)', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth('wrong-password', 'operator') },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
 describe('Viewer static serving is confined to the noVNC assets (ADR-0010)', () => {
   it('serves the noVNC RFB module only with auth', async () => {
     const viewer = await launchViewer();
@@ -223,6 +262,41 @@ describe('Viewer websocket proxy to the loopback VNC port (ADR-0010)', () => {
     expect(outcome).toBeInstanceOf(Error);
     // The upgrade was rejected before any dial to the VNC port.
     expect(mock.connections.length).toBe(0);
+  });
+
+  it('enforces the configured username on the websocket upgrade too, not just the page', async () => {
+    // The ws-upgrade path is a SECOND auth call site (the interactive VNC control
+    // channel); QMP_MCP_VIEWER_USER must gate it exactly like the page.
+    const mock = mockVncServer();
+    await listen(mock.server);
+    mock.greet(Buffer.from([0x42]));
+    const viewer = await launchViewer({ vncPort: mock.port(), user: 'operator' });
+
+    // Wrong username (right password) → upgrade refused, VNC never dialed. Assert the
+    // socket does NOT open (a boolean, so a wrongly-accepted upgrade fails the test —
+    // this is what pins the ws-upgrade call site to options.user).
+    const bad = new WebSocket(`ws://127.0.0.1:${viewer.port}/websockify`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'intruder') },
+    });
+    openClients.push(bad);
+    const badOpened = await new Promise<boolean>((resolve) => {
+      bad.once('open', () => resolve(true));
+      bad.once('error', () => resolve(false));
+      bad.once('unexpected-response', () => resolve(false));
+    });
+    expect(badOpened).toBe(false);
+    expect(mock.connections.length).toBe(0);
+
+    // Right username + password → upgrade succeeds and the mock's greeting relays through.
+    const good = new WebSocket(`ws://127.0.0.1:${viewer.port}/websockify`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'operator') },
+    });
+    openClients.push(good);
+    const message = await new Promise<Buffer>((resolve, reject) => {
+      good.once('message', (data) => resolve(data as Buffer));
+      good.once('error', reject);
+    });
+    expect(Buffer.from(message)).toEqual(Buffer.from([0x42]));
   });
 });
 

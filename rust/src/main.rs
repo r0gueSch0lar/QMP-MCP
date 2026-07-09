@@ -237,6 +237,7 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         // Viewer's own bind address/port. A vnc spec is refused when the password is
         // unset. `start_viewer: None` wires in the real in-process Viewer.
         viewer_password: config.viewer_password.clone(),
+        viewer_user: config.viewer_user.clone(),
         viewer_host: config.viewer_host.clone(),
         viewer_port: config.viewer_port,
         start_viewer: None,
