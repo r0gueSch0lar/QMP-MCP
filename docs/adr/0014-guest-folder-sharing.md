@@ -17,7 +17,9 @@ The mount tag is the fixed server constant `share`. The share is **read-only** u
 operator sets `QMP_MCP_ALLOW_SHARE_WRITE=true` (same fail-closed shape as
 `QMP_MCP_ALLOW_HOST_NET`) — the agent can never escalate to writable. The host path is
 comma-escaped into the argv, and sharing is refused on the `raspi*` boards, which have no
-PCI bus (exactly like a PCI NIC).
+PCI bus (exactly like a PCI NIC). Other PCI-less machines (`microvm`, `isapc`) are likewise
+unsupported for sharing — the same pre-existing bus-model limitation the default PCI NIC
+already has; the common targets (`q35`/`pc`/`virt`) all have PCI.
 
 `QMP_MCP_GUEST_SHARE_DIR` is **advisory**: QEMU physically cannot mount inside the guest —
 9p only carries the tag, and the guest OS runs the mount. So this env var is the *intended*

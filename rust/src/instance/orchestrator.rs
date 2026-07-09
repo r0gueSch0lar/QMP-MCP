@@ -105,10 +105,12 @@ pub struct ShareReport {
     /// The fixed 9p mount tag the guest mounts.
     pub mount_tag: String,
     /// The intended guest mountpoint (`QMP_MCP_GUEST_SHARE_DIR`), if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_mountpoint: Option<String>,
     /// Whether the share is read-only.
     pub read_only: bool,
     /// The exact `mount` command to run inside the guest (`None` when unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_command: Option<String>,
     /// A human hint on how to use (or enable) the share.
     pub hint: String,
@@ -1142,6 +1144,11 @@ mod tests {
         let s = off.describe_share();
         assert!(!s.available);
         assert!(s.mount_command.is_none());
+        // The None fields are OMITTED from the JSON (skip_serializing_if), matching the
+        // TS get_share which drops undefined keys — no `guestMountpoint: null` divergence.
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("guestMountpoint").is_none());
+        assert!(json.get("mountCommand").is_none());
 
         // Writable share drops the ,ro option.
         let mut rw = test_options();

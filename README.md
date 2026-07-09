@@ -150,8 +150,11 @@ resolve inside two folders you designate:
   Keeping it distinct means install media can never be written to.
 
 Both are enforced with real-path containment: a name that tries to climb out — `../`, an
-absolute path, a symlink pointing elsewhere — is refused. These two folders *are* the
-agent's view of the filesystem; it has no other.
+absolute path, a symlink pointing elsewhere — is refused. These two folders are the
+agent's view of the filesystem — the only exception is an optional virtio-9p **folder
+share** the operator can enable (`QMP_MCP_HOST_SHARE_DIR`), which a spec opts into with
+`share: true`; it too is operator-configured (the agent never names the host path) and
+read-only by default (ADR-0014).
 
 ### Sandboxed networking
 
@@ -204,6 +207,7 @@ The agent's vocabulary — the actions it can take:
 | --- | --- |
 | `create_instance` / `destroy_instance` | build & launch the Instance from a Hardware Spec / tear it down |
 | `get_instance` / `get_status` | the current Instance + lifecycle state / the live guest run state |
+| `get_share` | report the host↔guest folder-sharing config + the exact 9p mount command for the guest |
 | `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
 | `reset_instance` / `powerdown_instance` | hard reset / request a graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks & backing media / per-CPU info |

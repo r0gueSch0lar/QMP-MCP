@@ -616,7 +616,9 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             false,
         )?,
         host_share_dir: resolve_host_share_dir(env)?,
-        guest_share_dir: present_non_blank(env, "QMP_MCP_GUEST_SHARE_DIR"),
+        // Trim to match the TS `resolveGuestShareDir` (a padded path would otherwise
+        // produce a broken mount command); `present_non_blank` preserves whitespace.
+        guest_share_dir: trimmed_non_empty(env, "QMP_MCP_GUEST_SHARE_DIR").map(str::to_string),
         allow_share_write: parse_boolean(
             "QMP_MCP_ALLOW_SHARE_WRITE",
             get(env, "QMP_MCP_ALLOW_SHARE_WRITE"),
@@ -1192,6 +1194,11 @@ mod tests {
         assert_eq!(c.host_share_dir.as_deref(), Some("/srv/share"));
         assert_eq!(c.guest_share_dir.as_deref(), Some("/mnt/share"));
         assert!(c.allow_share_write);
+
+        // A padded guest mountpoint is trimmed (parity with the TS resolveGuestShareDir),
+        // so the reported mount command is never broken by stray whitespace.
+        let c = load_config(&env(&[("QMP_MCP_GUEST_SHARE_DIR", "  /mnt/share  ")])).unwrap();
+        assert_eq!(c.guest_share_dir.as_deref(), Some("/mnt/share"));
 
         // A relative host share dir fails closed naming the variable.
         let e = load_config(&env(&[("QMP_MCP_HOST_SHARE_DIR", "rel/share")])).unwrap_err();
