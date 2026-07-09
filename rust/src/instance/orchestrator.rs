@@ -172,6 +172,10 @@ pub struct OrchestratorOptions {
     /// A `display: vnc` spec is REJECTED before qemu is spawned when this is `None` —
     /// the fail-closed coupling between the Display and its browser Viewer.
     pub viewer_password: Option<String>,
+    /// Optional username the Viewer enforces on its HTTP Basic auth alongside the
+    /// password (`QMP_MCP_VIEWER_USER`, ADR-0010). `None` means the username is ignored
+    /// — password-only, the historical default.
+    pub viewer_user: Option<String>,
     /// Address the Viewer's own HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
     /// `127.0.0.1`). Independent of the MCP transport, so the Viewer works under
     /// `TRANSPORT=stdio` (ADR-0010).
@@ -911,6 +915,8 @@ impl Orchestrator {
                 port: self.options.viewer_port,
                 // assert_viewer_configured() guaranteed a non-empty password before launch.
                 password: self.options.viewer_password.clone().unwrap_or_default(),
+                // Optional username enforcement (QMP_MCP_VIEWER_USER); None = password-only.
+                user: self.options.viewer_user.clone(),
                 vnc_host: VNC_LOOPBACK_HOST.to_string(),
                 vnc_port: VNC_LOOPBACK_PORT,
                 vnc_password,
@@ -1030,6 +1036,7 @@ mod tests {
             command_policy: None,
             event_buffer_size: None,
             viewer_password: None,
+            viewer_user: None,
             viewer_host: "127.0.0.1".to_string(),
             viewer_port: 6080,
             start_viewer: None,

@@ -208,6 +208,7 @@ ones you'll reach for:
 | `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | usually unset — the emulator is derived from the `machine` (q35→x86_64, virt/raspi*→aarch64, ADR-0013); set it to force one emulator for every Instance |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the read-write disk folder / read-only ISO folder |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the noVNC viewer (required to request a `vnc` display) |
+| `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced alongside the password on the viewer's HTTP Basic auth (default: username ignored) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | let a spec pass raw QEMU flags (the escape hatch) |
 
 …plus the HTTP host/port/origins, caps on disk/memory/vCPUs, the port-forward range, the

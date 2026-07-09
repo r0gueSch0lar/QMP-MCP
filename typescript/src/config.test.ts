@@ -33,6 +33,7 @@ const DEFAULTS: Config = {
   eventBufferSize: 256,
   allowRawArgs: false,
   viewerPassword: undefined,
+  viewerUser: undefined,
   viewerHost: '127.0.0.1',
   viewerPort: 6080,
 };
@@ -402,11 +403,18 @@ describe('loadConfig', () => {
   });
 
   describe('noVNC Viewer (ADR-0010)', () => {
-    it('defaults the Viewer host/port and leaves the password unset', () => {
+    it('defaults the Viewer host/port and leaves the password + user unset', () => {
       const config = loadConfig({});
       expect(config.viewerHost).toBe('127.0.0.1');
       expect(config.viewerPort).toBe(6080);
       expect(config.viewerPassword).toBeUndefined();
+      expect(config.viewerUser).toBeUndefined();
+    });
+
+    it('reads the optional Viewer username, treating whitespace-only as unset', () => {
+      expect(loadConfig({ QMP_MCP_VIEWER_USER: 'operator' }).viewerUser).toBe('operator');
+      expect(loadConfig({ QMP_MCP_VIEWER_USER: '   ' }).viewerUser).toBeUndefined();
+      expect(loadConfig({}).viewerUser).toBeUndefined();
     });
 
     it('reads the Viewer password, host and port from env', () => {

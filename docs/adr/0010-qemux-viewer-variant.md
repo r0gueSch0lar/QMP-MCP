@@ -27,7 +27,10 @@ never published). The Viewer is **fail-closed**: it refuses to serve unless a de
 `QMP_MCP_VIEWER_PASSWORD` is configured — distinct from the MCP `API_KEYS` because the
 audience is a human in a browser, and noVNC is an interactive keyboard/mouse control
 surface, not a passive screen. `display` defaults to `none`, so the Viewer surface does
-not exist unless explicitly requested and authenticated.
+not exist unless explicitly requested and authenticated. HTTP Basic carries a username
+too, which is ignored by default (the password is the secret); setting the optional
+`QMP_MCP_VIEWER_USER` additionally enforces that username (constant-time compared,
+alongside the password) for operators who want a two-part credential.
 
 **Bare metal stays co-equal** (ADR-0007): the Display is a portable QEMU feature, and
 the Viewer is designed to work off it without importing qemux.
