@@ -263,6 +263,41 @@ describe('Viewer websocket proxy to the loopback VNC port (ADR-0010)', () => {
     // The upgrade was rejected before any dial to the VNC port.
     expect(mock.connections.length).toBe(0);
   });
+
+  it('enforces the configured username on the websocket upgrade too, not just the page', async () => {
+    // The ws-upgrade path is a SECOND auth call site (the interactive VNC control
+    // channel); QMP_MCP_VIEWER_USER must gate it exactly like the page.
+    const mock = mockVncServer();
+    await listen(mock.server);
+    mock.greet(Buffer.from([0x42]));
+    const viewer = await launchViewer({ vncPort: mock.port(), user: 'operator' });
+
+    // Wrong username (right password) → upgrade refused, VNC never dialed. Assert the
+    // socket does NOT open (a boolean, so a wrongly-accepted upgrade fails the test —
+    // this is what pins the ws-upgrade call site to options.user).
+    const bad = new WebSocket(`ws://127.0.0.1:${viewer.port}/websockify`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'intruder') },
+    });
+    openClients.push(bad);
+    const badOpened = await new Promise<boolean>((resolve) => {
+      bad.once('open', () => resolve(true));
+      bad.once('error', () => resolve(false));
+      bad.once('unexpected-response', () => resolve(false));
+    });
+    expect(badOpened).toBe(false);
+    expect(mock.connections.length).toBe(0);
+
+    // Right username + password → upgrade succeeds and the mock's greeting relays through.
+    const good = new WebSocket(`ws://127.0.0.1:${viewer.port}/websockify`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'operator') },
+    });
+    openClients.push(good);
+    const message = await new Promise<Buffer>((resolve, reject) => {
+      good.once('message', (data) => resolve(data as Buffer));
+      good.once('error', reject);
+    });
+    expect(Buffer.from(message)).toEqual(Buffer.from([0x42]));
+  });
 });
 
 describe('Viewer lifecycle (ADR-0010)', () => {
