@@ -123,6 +123,12 @@ export interface ViewerOptions {
    * are refused unless the request authenticates with it via HTTP Basic.
    */
   password: string;
+  /**
+   * Optional username enforced alongside the password (`QMP_MCP_VIEWER_USER`). When
+   * set, the HTTP Basic username must also match (constant-time); when undefined the
+   * username half is ignored — the historical password-only behavior.
+   */
+  user?: string;
   /** Loopback host of the Guest's VNC Display the proxy always dials. */
   vncHost: string;
   /** Loopback TCP port of the Guest's VNC Display the proxy always dials. */
@@ -186,10 +192,11 @@ function passwordMatches(expected: string, provided: string): boolean {
 }
 
 /**
- * Extract the password from an `Authorization: Basic` header, or undefined when it
- * is absent or malformed. The username half is ignored — the password is the secret.
+ * Extract the username and password from an `Authorization: Basic` header, or
+ * undefined when it is absent or malformed. A credential with no colon is tolerated:
+ * the whole value is the password and the username is empty.
  */
-function basicPassword(req: IncomingMessage): string | undefined {
+function basicCredentials(req: IncomingMessage): { user: string; password: string } | undefined {
   const header = req.headers.authorization;
   if (header === undefined) return undefined;
   const [scheme, encoded] = header.split(' ');
@@ -198,13 +205,25 @@ function basicPassword(req: IncomingMessage): string | undefined {
   }
   const decoded = Buffer.from(encoded, 'base64').toString('utf8');
   const colon = decoded.indexOf(':');
-  return colon === -1 ? decoded : decoded.slice(colon + 1);
+  return colon === -1
+    ? { user: '', password: decoded }
+    : { user: decoded.slice(0, colon), password: decoded.slice(colon + 1) };
 }
 
-/** True only when the request presents the correct Viewer password via HTTP Basic. */
-function isAuthenticated(req: IncomingMessage, password: string): boolean {
-  const provided = basicPassword(req);
-  return provided !== undefined && passwordMatches(password, provided);
+/**
+ * True only when the request presents the correct Viewer password via HTTP Basic —
+ * and, when a Viewer username is configured (`QMP_MCP_VIEWER_USER`), the correct
+ * username too. Both halves are compared in constant time; the username check is a
+ * no-op when `user` is undefined, preserving the password-only default. Both
+ * comparisons are always evaluated (no early return) so timing does not reveal which
+ * half was wrong.
+ */
+function isAuthenticated(req: IncomingMessage, password: string, user?: string): boolean {
+  const creds = basicCredentials(req);
+  if (creds === undefined) return false;
+  const passwordOk = passwordMatches(password, creds.password);
+  const userOk = user === undefined || passwordMatches(user, creds.user);
+  return passwordOk && userOk;
 }
 
 /** Build the (post-auth) noVNC page with the server-generated VNC password embedded. */
@@ -339,7 +358,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, options: Viewe
   // Anti-clickjacking on EVERY response (F2), set before routing so it rides along
   // with each writeHead below (including the 401 and error responses).
   setAntiFramingHeaders(res);
-  if (!isAuthenticated(req, options.password)) {
+  if (!isAuthenticated(req, options.password, options.user)) {
     sendUnauthorized(res);
     return;
   }
@@ -436,7 +455,7 @@ export function startViewer(options: ViewerOptions): Promise<Viewer> {
   // auth, the upgrade must also be same-origin (F2), on the expected path (F6), and
   // within the concurrent-connection cap (F5) — else it is refused and the socket closed.
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    if (!isAuthenticated(req, options.password)) {
+    if (!isAuthenticated(req, options.password, options.user)) {
       socket.write(
         `HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\n` +
           'Connection: close\r\n\r\n',

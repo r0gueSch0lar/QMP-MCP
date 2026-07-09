@@ -15,7 +15,10 @@ import {
 
 const PASSWORD = 'test-viewer-secret';
 
-/** An HTTP Basic header carrying `password` (the username half is ignored). */
+/**
+ * An HTTP Basic header carrying `user:password`. The username is ignored unless the
+ * Viewer was started with a `user` (QMP_MCP_VIEWER_USER); it defaults to `viewer`.
+ */
 function basicAuth(password: string, user = 'viewer'): string {
   return `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
 }
@@ -125,6 +128,42 @@ describe('Viewer authentication gate (ADR-0010)', () => {
     expect(body).toContain('/novnc/core/rfb.js');
     // ...and embeds the server-generated VNC password so noVNC auto-authenticates.
     expect(body).toContain('"embedded9"');
+  });
+});
+
+describe('Viewer username enforcement (QMP_MCP_VIEWER_USER, ADR-0010)', () => {
+  it('ignores the username by default — any username with the right password authenticates', async () => {
+    const viewer = await launchViewer(); // no user configured
+    for (const u of ['viewer', 'admin', '']) {
+      const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+        headers: { Authorization: basicAuth(PASSWORD, u) },
+      });
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it('with a configured username, the right username + password authenticates', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'operator') },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('with a configured username, the wrong username (even with the right password) is refused (401)', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth(PASSWORD, 'intruder') },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('with a configured username, the right username but wrong password is refused (401)', async () => {
+    const viewer = await launchViewer({ user: 'operator' });
+    const res = await fetch(`http://127.0.0.1:${viewer.port}/`, {
+      headers: { Authorization: basicAuth('wrong-password', 'operator') },
+    });
+    expect(res.status).toBe(401);
   });
 });
 

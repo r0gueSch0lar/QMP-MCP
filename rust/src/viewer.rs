@@ -133,6 +133,10 @@ pub struct ViewerOptions {
     /// The human-facing gate (`QMP_MCP_VIEWER_PASSWORD`). The page and the websocket
     /// are refused unless the request authenticates with it via HTTP Basic.
     pub password: String,
+    /// Optional username enforced alongside the password (`QMP_MCP_VIEWER_USER`). When
+    /// `Some`, the HTTP Basic username must also match (constant-time); when `None` the
+    /// username half is ignored — the historical password-only behavior.
+    pub user: Option<String>,
     /// Loopback host of the Guest's VNC Display the proxy always dials.
     pub vnc_host: String,
     /// Loopback TCP port of the Guest's VNC Display the proxy always dials.
@@ -354,10 +358,10 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Extract the password from an `Authorization: Basic` header, or `None` when it is
-/// absent or malformed. The username half is ignored — the password is the secret.
-/// Mirrors the TS `basicPassword`.
-fn basic_password(headers: &HeaderMap) -> Option<String> {
+/// Extract the username and password from an `Authorization: Basic` header, or `None`
+/// when it is absent or malformed. A credential with no colon is tolerated: the whole
+/// value is the password and the username is empty. Mirrors the TS `basicCredentials`.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     let header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, encoded) = header.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
@@ -365,18 +369,30 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
     }
     let decoded = String::from_utf8(base64_decode(encoded)?).ok()?;
     Some(match decoded.find(':') {
-        Some(colon) => decoded[colon + 1..].to_string(),
-        None => decoded,
+        Some(colon) => (
+            decoded[..colon].to_string(),
+            decoded[colon + 1..].to_string(),
+        ),
+        None => (String::new(), decoded),
     })
 }
 
-/// True only when the request presents the correct Viewer password via HTTP Basic.
-/// Mirrors the TS `isAuthenticated`.
-fn is_authenticated(headers: &HeaderMap, password: &str) -> bool {
-    match basic_password(headers) {
-        Some(provided) => password_matches(password, &provided),
-        None => false,
-    }
+/// True only when the request presents the correct Viewer password via HTTP Basic —
+/// and, when a Viewer username is configured (`QMP_MCP_VIEWER_USER`), the correct
+/// username too. Both halves are compared in constant time; the username check is a
+/// no-op when `user` is `None`, preserving the password-only default. Both comparisons
+/// are always evaluated so timing does not reveal which half was wrong. Mirrors the TS
+/// `isAuthenticated`.
+fn is_authenticated(headers: &HeaderMap, password: &str, user: Option<&str>) -> bool {
+    let Some((provided_user, provided_password)) = basic_credentials(headers) else {
+        return false;
+    };
+    let password_ok = password_matches(password, &provided_password);
+    let user_ok = match user {
+        Some(u) => password_matches(u, &provided_user),
+        None => true,
+    };
+    password_ok && user_ok
 }
 
 /// The authority (`host[:port]`) of an `Origin`, or `None` for an opaque/`null`/
@@ -430,6 +446,9 @@ fn render_page(vnc_password: &str) -> String {
 struct ViewerState {
     /// The human-facing gate; the page and the websocket are refused without it.
     password: Arc<String>,
+    /// Optional username enforced alongside the password (`QMP_MCP_VIEWER_USER`);
+    /// `None` means the username is ignored (password-only).
+    user: Arc<Option<String>>,
     /// The server-generated VNC password embedded into the post-auth page.
     vnc_password: Arc<String>,
     /// Loopback host the ws relay always dials (server-fixed; never client-supplied).
@@ -448,7 +467,7 @@ async fn require_basic_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    if is_authenticated(request.headers(), &state.password) {
+    if is_authenticated(request.headers(), &state.password, state.user.as_deref()) {
         next.run(request).await
     } else {
         unauthorized()
@@ -684,6 +703,7 @@ pub async fn start_viewer(options: ViewerOptions) -> Result<RunningViewer, Viewe
         host,
         port,
         password,
+        user,
         vnc_host,
         vnc_port,
         vnc_password,
@@ -722,6 +742,7 @@ pub async fn start_viewer(options: ViewerOptions) -> Result<RunningViewer, Viewe
 
     let state = ViewerState {
         password: Arc::new(password),
+        user: Arc::new(user),
         vnc_password: Arc::new(vnc_password),
         vnc_host: Arc::new(vnc_host),
         vnc_port,
@@ -867,21 +888,46 @@ mod tests {
     }
 
     #[test]
-    fn is_authenticated_gates_on_the_password_only() {
-        // Correct password (any username) authenticates.
+    fn is_authenticated_gates_on_the_password_only_when_no_user_configured() {
+        // Correct password with ANY username authenticates (user = None).
         assert!(is_authenticated(
             &headers(&[("authorization", &basic("anyone", "hunter2"))]),
-            "hunter2"
+            "hunter2",
+            None
         ));
         // Wrong password, missing header, and non-Basic scheme all fail closed.
         assert!(!is_authenticated(
             &headers(&[("authorization", &basic("anyone", "nope"))]),
-            "hunter2"
+            "hunter2",
+            None
         ));
-        assert!(!is_authenticated(&headers(&[]), "hunter2"));
+        assert!(!is_authenticated(&headers(&[]), "hunter2", None));
         assert!(!is_authenticated(
             &headers(&[("authorization", "Bearer hunter2")]),
-            "hunter2"
+            "hunter2",
+            None
+        ));
+    }
+
+    #[test]
+    fn is_authenticated_enforces_the_configured_username() {
+        // With a configured username, both halves must match.
+        assert!(is_authenticated(
+            &headers(&[("authorization", &basic("operator", "hunter2"))]),
+            "hunter2",
+            Some("operator")
+        ));
+        // Right password, wrong username -> refused.
+        assert!(!is_authenticated(
+            &headers(&[("authorization", &basic("intruder", "hunter2"))]),
+            "hunter2",
+            Some("operator")
+        ));
+        // Right username, wrong password -> refused.
+        assert!(!is_authenticated(
+            &headers(&[("authorization", &basic("operator", "nope"))]),
+            "hunter2",
+            Some("operator")
         ));
     }
 
@@ -969,6 +1015,12 @@ mod tests {
     /// Start a Viewer with a fake loopback VNC target, returning the viewer, its bound
     /// port, and the fake VNC listener's port.
     async fn start_test_viewer() -> (RunningViewer, u16, u16) {
+        start_test_viewer_with(None).await
+    }
+
+    /// Like [`start_test_viewer`] but with an optional enforced Viewer username
+    /// (`QMP_MCP_VIEWER_USER`).
+    async fn start_test_viewer_with(user: Option<&str>) -> (RunningViewer, u16, u16) {
         // A fake VNC server that accepts and then just holds each connection open, so
         // an upgraded relay keeps its connection-cap permit for the test's duration.
         let vnc = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -984,6 +1036,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             password: "hunter2".to_string(),
+            user: user.map(str::to_string),
             vnc_host: "127.0.0.1".to_string(),
             vnc_port,
             vnc_password: "Ab3Kp9Qz".to_string(),
@@ -995,11 +1048,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enforces_the_configured_viewer_username_over_http() {
+        let (viewer, port, _vnc) = start_test_viewer_with(Some("operator")).await;
+        let req = |auth: &str| {
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n")
+        };
+        // Right username + password → 200.
+        let ok = http_request(port, &req(&basic("operator", "hunter2"))).await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "got: {ok}");
+        // Wrong username (even with the right password) → 401.
+        let bad_user = http_request(port, &req(&basic("intruder", "hunter2"))).await;
+        assert!(bad_user.starts_with("HTTP/1.1 401"), "got: {bad_user}");
+        // Right username, wrong password → 401.
+        let bad_pw = http_request(port, &req(&basic("operator", "nope"))).await;
+        assert!(bad_pw.starts_with("HTTP/1.1 401"), "got: {bad_pw}");
+        viewer.stop().await;
+    }
+
+    #[tokio::test]
     async fn fails_closed_without_a_password() {
         let err = start_viewer(ViewerOptions {
             host: "127.0.0.1".to_string(),
             port: 0,
             password: String::new(),
+            user: None,
             vnc_host: "127.0.0.1".to_string(),
             vnc_port: 5900,
             vnc_password: "Ab3Kp9Qz".to_string(),
