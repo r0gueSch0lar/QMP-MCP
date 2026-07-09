@@ -22,9 +22,12 @@ import {
   type PortRange,
   resolveAllowHostNet,
   resolveAllowRawArgs,
+  resolveAllowShareWrite,
   resolveAutoStart,
   resolveEventBufferSize,
+  resolveGuestShareDir,
   resolveHostfwdPortRange,
+  resolveHostShareDir,
   resolveImageDir,
   resolveIsoDir,
   resolveMaxMemoryMb,
@@ -66,6 +69,7 @@ import {
   qemuArchOfBinary,
   qemuBinaryForMachine,
   resolveAccel,
+  SHARE_MOUNT_TAG,
   VNC_LOOPBACK_HOST,
   VNC_LOOPBACK_PORT,
 } from './hardware-spec.js';
@@ -146,6 +150,22 @@ export interface OrchestratorOptions {
    * spec with no cdrom never needs it.
    */
   isoDir?: string;
+  /**
+   * Host directory shared into the guest via virtio-9p when a spec sets `share: true`
+   * (`QMP_MCP_HOST_SHARE_DIR`, ADR-0014). Operator-configured, never agent-supplied;
+   * omitted means sharing is disabled (a `share: true` spec is then refused).
+   */
+  hostShareDir?: string;
+  /**
+   * Intended guest mountpoint for the shared folder (`QMP_MCP_GUEST_SHARE_DIR`).
+   * Advisory only — reported by `get_share` and used to build the guest mount command.
+   */
+  guestShareDir?: string;
+  /**
+   * Whether the shared folder is read-only (default true; `false` only when the
+   * operator set `QMP_MCP_ALLOW_SHARE_WRITE`). Threaded into the argv fail-closed.
+   */
+  shareReadonly?: boolean;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
@@ -315,6 +335,41 @@ export class Orchestrator {
   }
 
   /**
+   * Report the host↔guest folder-sharing configuration (ADR-0014) for `get_share`.
+   * It never returns the host path (operator config); it gives the agent what it needs
+   * to USE the share from inside the guest: whether sharing is available, the fixed 9p
+   * mount tag, the intended guest mountpoint, read-only vs read-write, and the exact
+   * `mount` command to run in the guest. The share itself is attached at create time
+   * via `share: true` — this is a read-only report, not a state change.
+   */
+  describeShare(): {
+    available: boolean;
+    mountTag: string;
+    guestMountpoint: string | undefined;
+    readOnly: boolean;
+    mountCommand: string | undefined;
+    hint: string;
+  } {
+    const available = (this.#options.hostShareDir ?? '').trim() !== '';
+    const readOnly = this.#options.shareReadonly !== false;
+    const guestMountpoint = this.#options.guestShareDir;
+    const mountpoint = guestMountpoint ?? '<your-mountpoint>';
+    return {
+      available,
+      mountTag: SHARE_MOUNT_TAG,
+      guestMountpoint,
+      readOnly,
+      mountCommand: available
+        ? `mount -t 9p -o trans=virtio,version=9p2000.L${readOnly ? ',ro' : ''} ${SHARE_MOUNT_TAG} ${mountpoint}`
+        : undefined,
+      hint: available
+        ? 'Set share: true on create_instance to attach the host folder, then run mountCommand inside ' +
+          'the guest (needs the 9p + 9pnet_virtio kernel modules).'
+        : 'Folder sharing is not configured on this server (QMP_MCP_HOST_SHARE_DIR is unset).',
+    };
+  }
+
+  /**
    * Build and launch a new Instance from an untrusted candidate Hardware Spec,
    * negotiate its QMP Session, and bring it to `RUNNING`. Rejects when an
    * Instance already exists or the QMP socket path is occupied.
@@ -378,6 +433,8 @@ export class Orchestrator {
         qmpSocketPath,
         imageDir: this.#options.imageDir,
         isoDir: this.#options.isoDir,
+        hostShareDir: this.#options.hostShareDir,
+        shareReadonly: this.#options.shareReadonly,
         hostfwdPortRange: this.#options.hostfwdPortRange,
         allowHostNet: this.#options.allowHostNet,
         maxMemoryMb: this.#options.maxMemoryMb,
@@ -770,6 +827,11 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   imageDir: resolveImageDir(process.env),
   // Resolve cdrom ISO names against the configured read-only ISO Store (ADR-0006).
   isoDir: resolveIsoDir(process.env),
+  // Guest folder sharing (virtio-9p, ADR-0014): operator host dir + intended guest
+  // mountpoint; read-only unless QMP_MCP_ALLOW_SHARE_WRITE is set (fail-closed).
+  hostShareDir: resolveHostShareDir(process.env),
+  guestShareDir: resolveGuestShareDir(process.env),
+  shareReadonly: !resolveAllowShareWrite(process.env),
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),

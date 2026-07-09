@@ -183,6 +183,7 @@ and ARM artifacts with the commands above.
 | --- | --- |
 | `create_instance` / `destroy_instance` | build & launch a VM from a hardware spec / tear it down |
 | `get_instance` / `get_status` | the current VM + lifecycle state / the live guest run state |
+| `get_share` | report the host↔guest folder-sharing config + the exact 9p mount command |
 | `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
 | `reset_instance` / `powerdown_instance` | hard reset / graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks / per-CPU info |
@@ -209,6 +210,9 @@ ones you'll reach for:
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the read-write disk folder / read-only ISO folder |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the noVNC viewer (required to request a `vnc` display) |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced alongside the password on the viewer's HTTP Basic auth (default: username ignored) |
+| `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ off; ADR-0014) |
+| `QMP_MCP_GUEST_SHARE_DIR` | _(unset)_ | intended guest mountpoint (advisory) — `get_share` reports the exact `mount -t 9p` command |
+| `QMP_MCP_ALLOW_SHARE_WRITE` | `false` | mount the share read-write (default read-only) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | let a spec pass raw QEMU flags (the escape hatch) |
 
 …plus the HTTP host/port/origins, caps on disk/memory/vCPUs, the port-forward range, the

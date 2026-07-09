@@ -33,6 +33,10 @@ interface FixtureOptions {
   maxMemoryMb?: number;
   maxVcpus?: number;
   allowRawArgs?: boolean;
+  // Guest folder sharing (ADR-0013). hostShareDir is emitted verbatim (not resolved
+  // through a Store), so fixtures use a literal path — no placeholder needed.
+  hostShareDir?: string;
+  shareReadonly?: boolean;
 }
 
 interface Fixture {
@@ -78,6 +82,8 @@ describe('argv parity fixtures (ADR-0012)', () => {
         qmpSocketPath: SOCKET,
         imageDir,
         isoDir,
+        hostShareDir: fixture.options.hostShareDir,
+        shareReadonly: fixture.options.shareReadonly,
         hostfwdPortRange: fixture.options.hostfwdPortRange,
         allowHostNet: fixture.options.allowHostNet,
         maxMemoryMb: fixture.options.maxMemoryMb,

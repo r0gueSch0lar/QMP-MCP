@@ -130,6 +130,14 @@ export const cdromSchema = z
 export type Cdrom = z.infer<typeof cdromSchema>;
 
 /**
+ * The fixed virtio-9p mount tag for the shared host folder (ADR-0014). It is a
+ * server-owned CONSTANT — never operator- or agent-supplied — so it can never inject
+ * an extra `-device` property. The guest mounts it with
+ * `mount -t 9p -o trans=virtio,version=9p2000.L share <mountpoint>`.
+ */
+export const SHARE_MOUNT_TAG = 'share';
+
+/**
  * Strict allowlist of guest NIC models the agent may pick (ADR-0009). The model
  * is emitted verbatim into `-device <model>,netdev=...`, so it is a CLOSED enum,
  * never a free string: a free string could carry a comma to inject extra
@@ -405,6 +413,15 @@ export const hardwareSpecSchema = z
     cdrom: cdromSchema
       .optional()
       .describe('Optional CD-ROM drive backed by an ISO (by name) from the read-only ISO Store.'),
+    share: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Share the operator-configured host folder (QMP_MCP_HOST_SHARE_DIR) into the guest via ' +
+          'virtio-9p. Boolean opt-in only — the host path is never agent-supplied. Read-only unless ' +
+          'the operator set QMP_MCP_ALLOW_SHARE_WRITE. Mount it in the guest with the command ' +
+          'get_share reports. Not supported on raspi* boards (no PCI bus).',
+      ),
     boot: z
       .string()
       .regex(VALID_BOOT_ORDER, bootOrderMessage)
@@ -636,6 +653,18 @@ export interface ArgvOptions {
    */
   isoDir?: string;
   /**
+   * Host directory shared into the guest via virtio-9p (`QMP_MCP_HOST_SHARE_DIR`,
+   * ADR-0014). Required only when the spec sets `share: true`; a `share` with no host
+   * dir configured fails closed naming `QMP_MCP_HOST_SHARE_DIR`.
+   */
+  hostShareDir?: string;
+  /**
+   * Whether the shared folder is mounted read-only. Fail-closed: omitted or `true`
+   * ⇒ `readonly=on`; only `false` (operator set `QMP_MCP_ALLOW_SHARE_WRITE`) mounts
+   * it read-write. The agent can never make it writable.
+   */
+  shareReadonly?: boolean;
+  /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (`QMP_MCP_HOSTFWD_PORT_RANGE`). A forward outside it is rejected
    * naming the range. Defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE} when omitted
@@ -753,6 +782,47 @@ function buildCdromArgs(cdrom: Cdrom, isoDir: string | undefined): [string, stri
     'format=raw',
   ];
   return ['-drive', parts.join(',')];
+}
+
+/**
+ * Render the virtio-9p folder-share argument pair for a spec that opted in with
+ * `share: true` (ADR-0014). The host directory is the OPERATOR's
+ * `QMP_MCP_HOST_SHARE_DIR` (never agent-supplied) and is comma-escaped so a comma in
+ * the path can never split off an extra `-fsdev` property. `security_model=mapped-xattr`
+ * stores guest uid/gid/mode in host xattrs, so the guest cannot create host setuid or
+ * device nodes and symlinks stay inside the shared tree. Read-only unless the operator
+ * enabled writes (`shareReadonly === false`). virtio-9p is a PCI device, so it is
+ * refused fail-closed on the raspi* boards (no PCI bus), exactly like a PCI NIC; and a
+ * `share` with no host dir configured fails closed naming `QMP_MCP_HOST_SHARE_DIR`.
+ */
+function buildShareArgs(options: ArgvOptions, raspi: boolean, machine: string): string[] {
+  const hostDir = options.hostShareDir;
+  if (hostDir === undefined || hostDir.trim() === '') {
+    throw new HardwareSpecError(
+      'Folder sharing (share: true) was requested but no host share directory is configured. ' +
+        'Set QMP_MCP_HOST_SHARE_DIR to the host directory to share into the guest.',
+    );
+  }
+  if (raspi) {
+    throw new HardwareSpecError(
+      `Folder sharing cannot be attached to the raspi* board "${machine}": virtio-9p needs a PCI bus, ` +
+        'which these boards do not have. Use a q35/pc/virt machine to share a folder.',
+    );
+  }
+  const fsdev = [
+    'local',
+    'id=fsdev0',
+    `path=${escapeQemuOptsValue(hostDir)}`,
+    'security_model=mapped-xattr',
+  ];
+  // Fail-closed: read-only unless the operator explicitly enabled writes.
+  if (options.shareReadonly !== false) fsdev.push('readonly=on');
+  return [
+    '-fsdev',
+    fsdev.join(','),
+    '-device',
+    `virtio-9p-pci,fsdev=fsdev0,mount_tag=${SHARE_MOUNT_TAG}`,
+  ];
 }
 
 /**
@@ -981,6 +1051,11 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   }
   if (spec.cdrom !== undefined) {
     argv.push(...buildCdromArgs(spec.cdrom, options.isoDir));
+  }
+  // Guest folder sharing (virtio-9p, ADR-0014): boolean opt-in; the host dir is
+  // operator-configured, read-only unless enabled, refused on raspi (no PCI bus).
+  if (spec.share) {
+    argv.push(...buildShareArgs(options, raspi, spec.machine));
   }
   if (spec.boot !== undefined) {
     // boot is already allowlisted to [a-dnp]+ by the schema; emit the single

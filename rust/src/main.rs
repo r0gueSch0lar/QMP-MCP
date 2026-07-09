@@ -223,6 +223,11 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         qmp_socket_path: default_qmp_socket_path(),
         image_dir: Some(config.image_dir.clone()),
         iso_dir: Some(config.iso_dir.clone()),
+        // Guest folder sharing (virtio-9p, ADR-0014): operator host dir + intended guest
+        // mountpoint; read-only unless QMP_MCP_ALLOW_SHARE_WRITE is set (fail-closed).
+        host_share_dir: config.host_share_dir.clone(),
+        guest_share_dir: config.guest_share_dir.clone(),
+        share_readonly: Some(!config.allow_share_write),
         hostfwd_port_range: Some(config.hostfwd_port_range),
         allow_host_net: config.allow_host_net,
         auto_start: config.auto_start,
