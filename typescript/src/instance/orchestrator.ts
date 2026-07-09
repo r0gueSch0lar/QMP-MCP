@@ -33,6 +33,7 @@ import {
   resolveViewerHost,
   resolveViewerPassword,
   resolveViewerPort,
+  resolveViewerUser,
 } from '../config.js';
 import { logger } from '../logger.js';
 import {
@@ -203,6 +204,12 @@ export interface OrchestratorOptions {
    * omitted means the Viewer cannot be requested (the singleton injects it).
    */
   viewerPassword?: string;
+  /**
+   * Optional username the Viewer enforces on its HTTP Basic auth alongside the
+   * password (`QMP_MCP_VIEWER_USER`, ADR-0010). Undefined means the username is
+   * ignored — password-only, the historical default (the singleton injects it).
+   */
+  viewerUser?: string;
   /**
    * Address the Viewer's own HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
    * `127.0.0.1`). Independent of the MCP transport, so the Viewer works under
@@ -693,6 +700,8 @@ export class Orchestrator {
         port: this.#options.viewerPort ?? 6080,
         // #assertViewerConfigured() guaranteed a non-empty password before launch.
         password: this.#options.viewerPassword ?? '',
+        // Optional username enforcement (QMP_MCP_VIEWER_USER); undefined = password-only.
+        user: this.#options.viewerUser,
         vncHost: VNC_LOOPBACK_HOST,
         vncPort: VNC_LOOPBACK_PORT,
         vncPassword,
@@ -774,6 +783,7 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   // noVNC Viewer for a vnc Display (ADR-0010): the human-facing gate plus the
   // Viewer's own bind address/port. A vnc spec is refused when the password is unset.
   viewerPassword: resolveViewerPassword(process.env),
+  viewerUser: resolveViewerUser(process.env),
   viewerHost: resolveViewerHost(process.env),
   viewerPort: resolveViewerPort(process.env),
   // Bound the Event Buffer of recent QMP async events (issue #12).

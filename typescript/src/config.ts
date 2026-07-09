@@ -159,6 +159,13 @@ export interface Config {
    */
   viewerPassword: string | undefined;
   /**
+   * Optional username enforced on the noVNC Viewer's HTTP Basic auth
+   * (`QMP_MCP_VIEWER_USER`, ADR-0010), or undefined when unset. When set, the browser
+   * must supply this username alongside {@link Config.viewerPassword}; when unset the
+   * username is ignored (password-only), the historical behavior.
+   */
+  viewerUser: string | undefined;
+  /**
    * Address the noVNC Viewer's HTTP server binds to (`QMP_MCP_VIEWER_HOST`, default
    * `127.0.0.1`; the container image overrides it to `0.0.0.0`). Independent of the
    * MCP transport, so the Viewer works even with `QMP_MCP_TRANSPORT=stdio` (ADR-0010).
@@ -440,6 +447,19 @@ export function resolveViewerPassword(env: NodeJS.ProcessEnv): string | undefine
 }
 
 /**
+ * Resolve the OPTIONAL noVNC Viewer username (`QMP_MCP_VIEWER_USER`, ADR-0010), or
+ * undefined when unset. When set, the Viewer's HTTP Basic auth enforces this username
+ * alongside the password; when unset (or whitespace-only, treated as unset like the
+ * password) the username half is ignored, preserving the password-only default.
+ * Exported so the Orchestrator singleton and {@link loadConfig} share one source of
+ * truth.
+ */
+export function resolveViewerUser(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_VIEWER_USER;
+  return raw !== undefined && raw.trim() !== '' ? raw : undefined;
+}
+
+/**
  * Resolve the noVNC Viewer bind address (`QMP_MCP_VIEWER_HOST`, default
  * `127.0.0.1`; the container image overrides it to `0.0.0.0`). Exported so the
  * Orchestrator singleton and {@link loadConfig} share one source of truth (ADR-0010).
@@ -543,6 +563,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     eventBufferSize: resolveEventBufferSize(env),
     allowRawArgs: resolveAllowRawArgs(env),
     viewerPassword: resolveViewerPassword(env),
+    viewerUser: resolveViewerUser(env),
     viewerHost: resolveViewerHost(env),
     viewerPort: resolveViewerPort(env),
   };

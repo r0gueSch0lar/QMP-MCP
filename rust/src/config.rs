@@ -193,6 +193,9 @@ pub struct Config {
     pub allow_raw_args: bool,
     /// The password gating the noVNC Viewer (ADR-0010), or `None` when unset.
     pub viewer_password: Option<String>,
+    /// Optional username enforced on the Viewer's HTTP Basic auth alongside the
+    /// password (`QMP_MCP_VIEWER_USER`, ADR-0010), or `None` when unset (password-only).
+    pub viewer_user: Option<String>,
     /// Address the noVNC Viewer's HTTP server binds to.
     pub viewer_host: String,
     /// TCP port the noVNC Viewer listens on.
@@ -595,6 +598,7 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             false,
         )?,
         viewer_password: present_non_blank(env, "QMP_MCP_VIEWER_PASSWORD"),
+        viewer_user: present_non_blank(env, "QMP_MCP_VIEWER_USER"),
         viewer_host: parse_string(get(env, "QMP_MCP_VIEWER_HOST"), "127.0.0.1"),
         viewer_port: parse_port("QMP_MCP_VIEWER_PORT", get(env, "QMP_MCP_VIEWER_PORT"), 6080)?,
     })
@@ -648,6 +652,7 @@ mod tests {
             event_buffer_size: 256,
             allow_raw_args: false,
             viewer_password: None,
+            viewer_user: None,
             viewer_host: "127.0.0.1".into(),
             viewer_port: 6080,
         }
@@ -1138,24 +1143,33 @@ mod tests {
         assert_eq!(cfg.viewer_host, "127.0.0.1");
         assert_eq!(cfg.viewer_port, 6080);
         assert_eq!(cfg.viewer_password, None);
+        assert_eq!(cfg.viewer_user, None);
 
         let cfg = load_config(&env(&[
             ("QMP_MCP_VIEWER_PASSWORD", "view-secret"),
+            ("QMP_MCP_VIEWER_USER", "operator"),
             ("QMP_MCP_VIEWER_HOST", "0.0.0.0"),
             ("QMP_MCP_VIEWER_PORT", "7000"),
         ]))
         .unwrap();
         assert_eq!(cfg.viewer_password.as_deref(), Some("view-secret"));
+        assert_eq!(cfg.viewer_user.as_deref(), Some("operator"));
         assert_eq!(cfg.viewer_host, "0.0.0.0");
         assert_eq!(cfg.viewer_port, 7000);
     }
 
     #[test]
-    fn viewer_whitespace_password_is_unset() {
+    fn viewer_whitespace_password_and_user_are_unset() {
         assert_eq!(
             load_config(&env(&[("QMP_MCP_VIEWER_PASSWORD", "   ")]))
                 .unwrap()
                 .viewer_password,
+            None
+        );
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_VIEWER_USER", "   ")]))
+                .unwrap()
+                .viewer_user,
             None
         );
     }
