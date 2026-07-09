@@ -235,6 +235,39 @@ pub struct QmpMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// The non-standard JSON-Schema `format` hints `schemars` tags Rust integer types with
+/// (`u32` -> `uint32`, `i64` -> `int64`, `usize` -> `uint`, …). JSON Schema defines no
+/// integer formats, so strict clients (e.g. Claude Code) log "unknown format … ignored
+/// in schema". The `type: integer` already carries the meaning, so we strip these from
+/// every generated tool schema; standard formats (e.g. `date-time`) are left untouched.
+const SCHEMARS_INT_FORMATS: &[&str] = &[
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "int", "uint",
+];
+
+/// Recursively remove [`SCHEMARS_INT_FORMATS`] `format` hints from a JSON-Schema object
+/// (walking `properties`, `items`, `$defs`, etc.). Only the offending `format` key is
+/// dropped — the surrounding schema (including `type: integer`) is preserved.
+fn strip_int_formats_obj(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let is_int_format = matches!(
+        obj.get("format"),
+        Some(serde_json::Value::String(f)) if SCHEMARS_INT_FORMATS.contains(&f.as_str())
+    );
+    if is_int_format {
+        obj.remove("format");
+    }
+    for value in obj.values_mut() {
+        strip_int_formats_value(value);
+    }
+}
+
+fn strip_int_formats_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => strip_int_formats_obj(map),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_int_formats_value),
+        _ => {}
+    }
+}
+
 #[tool_router]
 impl QmpMcpServer {
     /// Construct the server over the shared `Arc<Mutex<Orchestrator>>` (the same
@@ -245,11 +278,25 @@ impl QmpMcpServer {
         image_store: ImageStore,
         iso_store: IsoStore,
     ) -> Self {
+        // schemars tags integer fields with non-standard JSON-Schema `format` hints
+        // (uint32/int64/…); strip them from every tool schema so strict clients don't
+        // warn ("unknown format … ignored in schema"). The `type: integer` is unaffected.
+        let mut tool_router = Self::tool_router();
+        for route in tool_router.map.values_mut() {
+            let mut input = (*route.attr.input_schema).clone();
+            strip_int_formats_obj(&mut input);
+            route.attr.input_schema = Arc::new(input);
+            if let Some(output) = route.attr.output_schema.take() {
+                let mut out = (*output).clone();
+                strip_int_formats_obj(&mut out);
+                route.attr.output_schema = Some(Arc::new(out));
+            }
+        }
         Self {
             orchestrator,
             image_store,
             iso_store,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -708,6 +755,63 @@ mod tests {
     /// The common case: just the server, discarding the event slot.
     fn test_server() -> QmpMcpServer {
         test_server_with_events().0
+    }
+
+    #[test]
+    fn strip_int_formats_removes_only_schemars_integer_formats() {
+        let mut obj = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer", "format": "uint32" },
+                "s": { "type": "string", "format": "date-time" },
+                "nested": { "type": "array", "items": { "type": "integer", "format": "int64" } }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        strip_int_formats_obj(&mut obj);
+        let v = serde_json::Value::Object(obj);
+        // Non-standard integer formats are gone (top-level and nested)...
+        assert!(v["properties"]["n"].get("format").is_none());
+        assert!(v["properties"]["nested"]["items"].get("format").is_none());
+        // ...but `type` and standard formats are preserved.
+        assert_eq!(v["properties"]["n"]["type"], "integer");
+        assert_eq!(v["properties"]["s"]["format"], "date-time");
+    }
+
+    #[test]
+    fn no_tool_schema_leaks_a_nonstandard_integer_format() {
+        fn collect(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(m) => {
+                    if let Some(serde_json::Value::String(f)) = m.get("format") {
+                        out.push(f.clone());
+                    }
+                    m.values().for_each(|v| collect(v, out));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| collect(v, out)),
+                _ => {}
+            }
+        }
+        let server = test_server();
+        for tool in server.tool_router.list_all() {
+            let mut fmts = Vec::new();
+            collect(
+                &serde_json::Value::Object((*tool.input_schema).clone()),
+                &mut fmts,
+            );
+            if let Some(out) = &tool.output_schema {
+                collect(&serde_json::Value::Object((**out).clone()), &mut fmts);
+            }
+            for f in fmts {
+                assert!(
+                    !SCHEMARS_INT_FORMATS.contains(&f.as_str()),
+                    "tool `{}` leaks non-standard integer format {f:?}",
+                    tool.name,
+                );
+            }
+        }
     }
 
     #[tokio::test]
