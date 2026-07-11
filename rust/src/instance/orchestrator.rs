@@ -26,15 +26,15 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::config::PortRange;
+use crate::config::{PortRange, SerialBackend};
 
 use super::event_buffer::{
     EventBuffer, ReadResult, WaitForEventOptions, WaitFuture, DEFAULT_EVENT_BUFFER_SIZE,
 };
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
-    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, SERIAL_CHARDEV_ID,
-    SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
+    resolve_serial_spool_path, Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec,
+    SERIAL_CHARDEV_ID, SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -133,6 +133,10 @@ pub struct SerialReport {
     pub writable: bool,
     /// Whether the current Instance has a Serial Port attached (`serial: true`).
     pub enabled: bool,
+    /// The spool subdirectory the log is written under, when the spool backend + a `serialSpool`
+    /// are active (advisory — the host path is never revealed). `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_subdir: Option<String>,
     /// Best-effort expected guest console device for the current machine, when known
     /// (`ttyS0` on q35/pc, `ttyAMA0` on virt). Advisory only.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +270,11 @@ pub struct OrchestratorOptions {
     /// Whether writing to the Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`, ADR-0015;
     /// default false). Gates the `write_serial` tool; the agent can never enable it.
     pub allow_serial_write: bool,
+    /// The Serial Port backend (`QMP_MCP_SERIAL_BACKEND`, ADR-0015). Passed to the argv generator
+    /// and drives how `read_serial` behaves (drain vs tail).
+    pub serial_backend: SerialBackend,
+    /// Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or `None`.
+    pub serial_spool_dir: Option<String>,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -642,6 +651,31 @@ impl Orchestrator {
         .map_err(|e| LifecycleError(e.0))?;
         let argv = build_argv(&spec, &self.argv_options(resolution.accel))
             .map_err(|e| LifecycleError(e.0))?;
+        // Serial Port spool backend (ADR-0015): create the log's parent directory before qemu
+        // opens the file; otherwise warn if a `serialSpool` was set where it cannot apply.
+        if spec.serial && self.options.serial_backend.is_spool() {
+            let path = resolve_serial_spool_path(
+                self.options.serial_spool_dir.as_deref(),
+                spec.serial_spool.as_deref(),
+            )
+            .map_err(|e| LifecycleError(e.0))?;
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    LifecycleError(format!(
+                        "Failed to create the Serial Port spool directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        } else if spec.serial_spool.is_some() {
+            tracing::warn!(
+                "serialSpool={:?} ignored: it applies only with QMP_MCP_SERIAL_BACKEND=spool and \
+                 serial: true (backend={}, serial={})",
+                spec.serial_spool,
+                self.options.serial_backend.as_str(),
+                spec.serial
+            );
+        }
         tracing::info!(
             "creating Instance (machine={}, accel={})",
             spec.machine.as_str(),
@@ -670,6 +704,8 @@ impl Orchestrator {
             host_share_dir: self.options.host_share_dir.clone(),
             share_readonly: self.options.share_readonly,
             serial_buffer_bytes: self.options.serial_buffer_bytes,
+            serial_backend: self.options.serial_backend,
+            serial_spool_dir: self.options.serial_spool_dir.clone(),
             hostfwd_port_range: self.options.hostfwd_port_range,
             allow_host_net: self.options.allow_host_net,
             max_memory_mb: self.options.max_memory_mb,
@@ -953,20 +989,41 @@ impl Orchestrator {
         format: SerialFormat,
     ) -> Result<SerialReadResult, LifecycleError> {
         let size = max_bytes.unwrap_or(self.options.serial_buffer_bytes);
-        let value = self
-            .require_handle("read its Serial Port")?
-            .execute(
-                "ringbuf-read",
-                Some(serde_json::json!({
-                    "device": SERIAL_CHARDEV_ID,
-                    "size": size,
-                    "format": format.as_str(),
-                })),
-            )
-            .await
-            .map_err(|e| LifecycleError(e.0))?;
-        // QMP `ringbuf-read` returns the read data as a bare string.
-        let output = value.as_str().unwrap_or_default().to_string();
+        let output = match self.options.serial_backend {
+            SerialBackend::Ringbuf => {
+                // Ringbuf: drain the in-QEMU buffer over QMP (destructive).
+                let value = self
+                    .require_handle("read its Serial Port")?
+                    .execute(
+                        "ringbuf-read",
+                        Some(serde_json::json!({
+                            "device": SERIAL_CHARDEV_ID,
+                            "size": size,
+                            "format": format.as_str(),
+                        })),
+                    )
+                    .await
+                    .map_err(|e| LifecycleError(e.0))?;
+                // QMP `ringbuf-read` returns the read data as a bare string.
+                value.as_str().unwrap_or_default().to_string()
+            }
+            SerialBackend::Spool => {
+                // Spool: tail the persistent log file, non-destructively.
+                self.require_handle("read its Serial Port")?;
+                let path = resolve_serial_spool_path(
+                    self.options.serial_spool_dir.as_deref(),
+                    self.spec.as_ref().and_then(|s| s.serial_spool.as_deref()),
+                )
+                .map_err(|e| LifecycleError(e.0))?;
+                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                let start = bytes.len().saturating_sub(size as usize);
+                let slice = &bytes[start..];
+                match format {
+                    SerialFormat::Utf8 => String::from_utf8_lossy(slice).into_owned(),
+                    SerialFormat::Base64 => base64_encode(slice),
+                }
+            }
+        };
         Ok(SerialReadResult {
             bytes: output.chars().count(),
             format: format.as_str().to_string(),
@@ -983,6 +1040,13 @@ impl Orchestrator {
         data: String,
         format: SerialFormat,
     ) -> Result<SerialWriteResult, LifecycleError> {
+        if self.options.serial_backend.is_spool() {
+            return Err(LifecycleError(
+                "The spool Serial Port backend is output-only; writing needs the ringbuf backend \
+                 (unset QMP_MCP_SERIAL_BACKEND or set it to ringbuf)."
+                    .to_string(),
+            ));
+        }
         if !self.options.allow_serial_write {
             return Err(LifecycleError(
                 "Writing to the Serial Port is disabled. Set QMP_MCP_ALLOW_SERIAL_WRITE=true to \
@@ -1015,17 +1079,26 @@ impl Orchestrator {
             .and_then(|s| guess_console_device(s.machine.as_str()))
             .map(str::to_string);
         let enabled = self.spec.as_ref().is_some_and(|s| s.serial);
+        let backend = self.options.serial_backend;
+        let spool_subdir = if backend.is_spool() {
+            self.spec.as_ref().and_then(|s| s.serial_spool.clone())
+        } else {
+            None
+        };
         SerialReport {
-            backend: "ringbuf".to_string(),
+            backend: backend.as_str().to_string(),
             buffer_bytes: self.options.serial_buffer_bytes,
-            read_semantics: "drain".to_string(),
-            writable: self.options.allow_serial_write,
+            // Ringbuf drains on read; spool tails the persistent file non-destructively.
+            read_semantics: if backend.is_spool() { "tail" } else { "drain" }.to_string(),
+            // Spool is output-only, so it is never writable regardless of the write gate.
+            writable: self.options.allow_serial_write && !backend.is_spool(),
             enabled,
+            spool_subdir,
             console_device,
             hint: "Set serial: true on create_instance to attach the Serial Port, then read its \
-                   output with read_serial (each read drains the ring buffer). The guest must use \
-                   the shown console device in its own console= kernel cmdline for output to appear; \
-                   raspi* boards have two UARTs and may need adjusting."
+                   output with read_serial (ringbuf drains on read; spool tails a persistent file). \
+                   The guest must use the shown console device in its own console= kernel cmdline for \
+                   output to appear; raspi* boards have two UARTs and may need adjusting."
                 .to_string(),
         }
     }
@@ -1284,6 +1357,8 @@ mod tests {
             share_readonly: None,
             serial_buffer_bytes: 1 << 20,
             allow_serial_write: false,
+            serial_backend: SerialBackend::Ringbuf,
+            serial_spool_dir: None,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -1425,6 +1500,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c == "ringbuf-write"));
+    }
+
+    #[test]
+    fn describe_serial_reports_spool_backend_tail_and_not_writable() {
+        // ADR-0015: the spool backend tails a persistent file and is never writable (output-only),
+        // even with the write gate on.
+        let mut options = test_options();
+        options.serial_backend = SerialBackend::Spool;
+        options.serial_spool_dir = Some("/var/log/qmp-serial".to_string());
+        options.allow_serial_write = true;
+        let orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), options);
+        let s = orch.describe_serial();
+        assert_eq!(s.backend, "spool");
+        assert_eq!(s.read_semantics, "tail");
+        assert!(!s.writable);
     }
 
     use crate::viewer::ViewerError;
