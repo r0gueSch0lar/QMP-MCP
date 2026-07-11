@@ -166,7 +166,11 @@ export const DEFAULT_ALLOWLIST: ReadonlySet<string> = new Set([
   'query-version',
   'query-name',
   'query-uuid',
+  // `query-kvm` is deprecated since QEMU 11.0 in favour of `query-accelerators`
+  // (new in 11.0). Both are allowlisted so `qmp_execute` works across the QEMU
+  // version range a mixed bare-metal/container fleet spans (issue #31).
   'query-kvm',
+  'query-accelerators',
   'query-target',
   // CPUs / topology (read-only).
   'query-cpus-fast',
@@ -188,7 +192,8 @@ export const DEFAULT_ALLOWLIST: ReadonlySet<string> = new Set([
   // Machine / capabilities / introspection (read-only).
   'query-machines',
   'query-commands',
-  'query-events',
+  // `query-events` intentionally omitted: QEMU removed it in 6.0 (superseded by
+  // `query-qmp-schema`), so it could never succeed on any supported QEMU (issue #31).
   'query-qmp-schema',
   // Display / input (read-only).
   'query-vnc',
