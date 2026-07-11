@@ -74,6 +74,11 @@ pub const HARD_DENYLIST: &[&str] = &[
     "netdev_add",
     "chardev-add",
     "chardev-change",
+    // Serial Port console input (ADR-0015): `ringbuf-write` types into the guest console —
+    // keyboard-equivalent control, not a report. The ONLY sanctioned console-write path is the
+    // dedicated write_serial tool behind its operator opt-in gate; dedicated tools bypass this
+    // policy, so denying it here never blocks that tool. Keeps console-write a single gate.
+    "ringbuf-write",
     // Arbitrary QOM property writes — can repoint host-backed object properties.
     "qom-set",
     // Passing host file descriptors into QEMU.

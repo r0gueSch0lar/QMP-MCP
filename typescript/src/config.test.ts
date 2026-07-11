@@ -42,6 +42,7 @@ const DEFAULTS: Config = {
   allowShareWrite: false,
   autoStart: true,
   eventBufferSize: 256,
+  serialBufferBytes: 1048576,
   allowRawArgs: false,
   viewerPassword: undefined,
   viewerUser: undefined,
@@ -73,6 +74,14 @@ describe('loadConfig', () => {
   it('reads QMP_MCP_AUTO_START (default true, opt-out false) — issue #8/#10; ADR-0016', () => {
     expect(loadConfig({}).autoStart).toBe(true);
     expect(loadConfig({ QMP_MCP_AUTO_START: 'false' }).autoStart).toBe(false);
+  });
+
+  it('reads QMP_MCP_SERIAL_BUFFER_BYTES (default 1 MiB, power-of-two, fail-closed) — ADR-0015', () => {
+    expect(loadConfig({}).serialBufferBytes).toBe(1 << 20);
+    expect(loadConfig({ QMP_MCP_SERIAL_BUFFER_BYTES: '65536' }).serialBufferBytes).toBe(65536);
+    expect(() => loadConfig({ QMP_MCP_SERIAL_BUFFER_BYTES: '100000' })).toThrowError(
+      /power-of-two/,
+    );
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

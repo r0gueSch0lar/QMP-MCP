@@ -514,6 +514,10 @@ pub struct HardwareSpecParams {
     /// agent-supplied. Not supported on raspi* boards (no PCI bus).
     #[serde(default)]
     pub share: bool,
+    /// Attach the guest's Serial Port and capture its output (ADR-0015). Boolean opt-in
+    /// only; the ring buffer's size is the operator's `QMP_MCP_SERIAL_BUFFER_BYTES`.
+    #[serde(default)]
+    pub serial: bool,
     /// Optional boot order as QEMU drive letters, e.g. `d` or `dc`.
     #[serde(default)]
     pub boot: Option<String>,
@@ -627,6 +631,8 @@ pub struct HardwareSpec {
     pub cdrom: Option<Cdrom>,
     /// Share the operator's host folder into the guest via virtio-9p (ADR-0014).
     pub share: bool,
+    /// Attach the guest's Serial Port and capture its output (ADR-0015; ringbuf backend).
+    pub serial: bool,
     /// Optional validated boot order.
     pub boot: Option<BootOrder>,
     /// Optional external kernel image (by name in the Image Store) to direct-boot.
@@ -775,6 +781,7 @@ pub fn parse_hardware_spec(
         disks,
         cdrom,
         share: params.share,
+        serial: params.serial,
         boot,
         kernel,
         initrd,
@@ -948,6 +955,9 @@ pub struct ArgvOptions {
     /// `readonly=on`; only `Some(false)` (operator set `QMP_MCP_ALLOW_SHARE_WRITE`)
     /// mounts it read-write.
     pub share_readonly: Option<bool>,
+    /// Ring-buffer size (bytes) for the Serial Port's QEMU `ringbuf` chardev when the
+    /// spec sets `serial: true` (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two).
+    pub serial_buffer_bytes: u32,
     /// Inclusive host-port range a forward's `hostPort` must fall within; defaults
     /// to [`DEFAULT_HOSTFWD_PORT_RANGE`] when `None`.
     pub hostfwd_port_range: Option<PortRange>,
@@ -1055,6 +1065,28 @@ fn build_share_args(
         "-device".to_string(),
         format!("virtio-9p-pci,fsdev=fsdev0,mount_tag={SHARE_MOUNT_TAG}"),
     ])
+}
+
+/// The fixed QEMU chardev id for the Serial Port's ring buffer (ADR-0015). A server-owned
+/// CONSTANT — never operator- or agent-supplied — so it can never inject an extra property.
+/// Mirrors the TS `SERIAL_CHARDEV_ID`.
+pub const SERIAL_CHARDEV_ID: &str = "serialbuf";
+
+/// Render the Serial Port argument pair for a spec that opted in with `serial: true`
+/// (ADR-0015, ringbuf backend): a QEMU in-tree `ringbuf` chardev of the operator's
+/// configured size, bound to the machine's first serial port with `-serial chardev:`.
+/// Board-agnostic — no per-UART device name — and the explicit `-serial` redirect wins
+/// over the `-nographic` console mux. Mirrors the TS `buildSerialArgs`.
+fn build_serial_args(options: &ArgvOptions) -> Vec<String> {
+    vec![
+        "-chardev".to_string(),
+        format!(
+            "ringbuf,id={SERIAL_CHARDEV_ID},size={}",
+            options.serial_buffer_bytes
+        ),
+        "-serial".to_string(),
+        format!("chardev:{SERIAL_CHARDEV_ID}"),
+    ]
 }
 
 fn build_cdrom_args(
@@ -1349,6 +1381,11 @@ pub fn build_argv(
     if spec.share {
         argv.extend(build_share_args(options, raspi, spec.machine.as_str())?);
     }
+    // Serial Port capture (ADR-0015). The explicit `-serial chardev:` redirect binds the
+    // machine's first UART and wins over the earlier `-nographic` console mux.
+    if spec.serial {
+        argv.extend(build_serial_args(options));
+    }
     if let Some(boot) = &spec.boot {
         // boot is allowlisted to [a-dnp]+ already; emit the single order= form (and
         // comma-escape as defense-in-depth).
@@ -1415,6 +1452,7 @@ mod tests {
             iso_dir: None,
             host_share_dir: None,
             share_readonly: None,
+            serial_buffer_bytes: 1 << 20,
             hostfwd_port_range: None,
             allow_host_net: false,
             max_memory_mb: None,
@@ -1792,6 +1830,25 @@ mod tests {
         assert_eq!(value_after(&argv, "-boot"), "order=dc");
         let argv = build_argv(&spec(json!({})), &opts()).unwrap();
         assert!(!argv.iter().any(|s| s == "-boot"));
+    }
+
+    #[test]
+    fn emits_serial_ringbuf_chardev_pair_at_the_operator_size() {
+        // ADR-0015: serial:true emits a ringbuf chardev of the operator size + a board-
+        // agnostic `-serial chardev:` that (after -nographic) wins the first UART.
+        let mut o = opts();
+        o.serial_buffer_bytes = 65536;
+        let argv = build_argv(&spec(json!({ "serial": true })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-chardev"),
+            "ringbuf,id=serialbuf,size=65536"
+        );
+        assert_eq!(value_after(&argv, "-serial"), "chardev:serialbuf");
+        assert!(index_of(&argv, "-nographic") < index_of(&argv, "-serial"));
+        // serial:false emits neither the chardev nor the -serial redirect.
+        let argv = build_argv(&spec(json!({})), &opts()).unwrap();
+        assert!(!argv.iter().any(|s| s == "-chardev"));
+        assert!(!argv.iter().any(|s| s == "-serial"));
     }
 
     #[test]

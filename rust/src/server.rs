@@ -27,7 +27,9 @@ use crate::instance::image_store::{
     CreateImageRequest, CreateImageResult, ImageFormat, ImageListing, ImageStore,
 };
 use crate::instance::iso_store::{IsoListing, IsoStore};
-use crate::instance::orchestrator::{InstanceState, Orchestrator, ShareReport};
+use crate::instance::orchestrator::{
+    InstanceState, Orchestrator, SerialFormat, SerialReadResult, SerialReport, ShareReport,
+};
 
 /// A compact, JSON-serialisable summary of a validated Hardware Spec, returned by
 /// the lifecycle tools. Deliberately a projection (not the full spec): enough for an
@@ -166,6 +168,18 @@ pub struct GetEventsParams {
     /// only what is new. Omit to get all currently buffered events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
+}
+
+/// Validated input for `read_serial`: an optional byte cap and output encoding. Mirrors the
+/// TS `read_serial` zod schema.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ReadSerialParams {
+    /// Max bytes to return; omitted reads up to the full ring-buffer size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+    /// Output encoding: `utf8` (default) or `base64` for non-UTF8 bytes.
+    #[serde(default)]
+    pub format: SerialFormat,
 }
 
 /// Validated input for `wait_for_event`: an optional event-name filter, a timeout, and
@@ -399,6 +413,42 @@ impl QmpMcpServer {
     )]
     async fn get_share(&self) -> Json<ShareReport> {
         Json(self.orchestrator.lock().await.describe_share())
+    }
+
+    /// Read-only. Report the Serial Port capture config (ADR-0015): backend, ring-buffer
+    /// size, read semantics, and a best-effort guest console-device guess. Infallible.
+    #[tool(
+        description = "Report the Guest Serial Port capture configuration: the backend, ring-buffer \
+                       size, how read_serial behaves (drain), whether writing is enabled, and a \
+                       best-effort guess of the guest console device (e.g. ttyS0 on q35/pc, ttyAMA0 \
+                       on virt) — which the guest's own console= cmdline ultimately decides. Attach \
+                       the Serial Port at boot with create_instance serial: true. Read-only."
+    )]
+    async fn get_serial(&self) -> Json<SerialReport> {
+        Json(self.orchestrator.lock().await.describe_serial())
+    }
+
+    /// Read-only. Drain the Serial Port's ring buffer (QMP `ringbuf-read`): returns the guest
+    /// serial output produced since the last read and clears it. Rejects when no Instance runs.
+    #[tool(
+        description = "Read the running Guest's Serial Port output. Each call DRAINS the ring \
+                       buffer: it returns the output produced since the last read and clears it \
+                       (poll it like get_events). Requires create_instance serial: true. Optional \
+                       maxBytes caps the return; format is utf8 (default) or base64 for non-UTF8 \
+                       bytes. Fails if no Instance is running."
+    )]
+    async fn read_serial(
+        &self,
+        Parameters(params): Parameters<ReadSerialParams>,
+    ) -> Result<Json<SerialReadResult>, McpError> {
+        let result = self
+            .orchestrator
+            .lock()
+            .await
+            .read_serial(params.max_bytes, params.format)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
     }
 
     /// Read-only. Return the running Instance's recently buffered QMP async events
@@ -741,6 +791,7 @@ mod tests {
             host_share_dir: None,
             guest_share_dir: None,
             share_readonly: None,
+            serial_buffer_bytes: 1 << 20,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -853,6 +904,9 @@ mod tests {
             "query_cpus",
             "screendump",
             "qmp_execute",
+            // Serial Port surface (ADR-0015).
+            "get_serial",
+            "read_serial",
             // Image/ISO stores (this slice).
             "create_image",
             "list_images",

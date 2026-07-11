@@ -68,6 +68,7 @@ async fn real_qemu_boots_under_tcg_and_round_trips_query_status() {
         iso_dir: None,
         host_share_dir: None,
         share_readonly: None,
+        serial_buffer_bytes: 1 << 20,
         hostfwd_port_range: None,
         allow_host_net: false,
         max_memory_mb: None,
