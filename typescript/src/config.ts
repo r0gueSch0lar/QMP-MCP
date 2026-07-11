@@ -145,6 +145,11 @@ export interface Config {
    */
   allowShareWrite: boolean;
   /**
+   * Whether writing to the Guest Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`,
+   * ADR-0015; default false ⇒ read-only). Gates the `write_serial` tool.
+   */
+  allowSerialWrite: boolean;
+  /**
    * When true, `create_instance` auto-starts the Guest: it issues QMP `cont`
    * immediately after launch (`QMP_MCP_AUTO_START`), so the Instance begins
    * executing rather than staying frozen at the `-S` startup pause. Default TRUE
@@ -537,6 +542,15 @@ export function resolveAllowShareWrite(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve whether writing to the Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`, default
+ * false — ADR-0015). Exported so the Orchestrator singleton and {@link loadConfig} share one
+ * source of truth.
+ */
+export function resolveAllowSerialWrite(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_ALLOW_SERIAL_WRITE', env.QMP_MCP_ALLOW_SERIAL_WRITE, false);
+}
+
+/**
  * Resolve the noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010), or
  * undefined when unset. A whitespace-only value is treated as unset (mirroring
  * `QMP_MCP_JWT_SECRET`) so the Viewer stays fail-closed rather than serving behind
@@ -664,6 +678,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     hostShareDir: resolveHostShareDir(env),
     guestShareDir: resolveGuestShareDir(env),
     allowShareWrite: resolveAllowShareWrite(env),
+    allowSerialWrite: resolveAllowSerialWrite(env),
     autoStart: resolveAutoStart(env),
     eventBufferSize: resolveEventBufferSize(env),
     serialBufferBytes: resolveSerialBufferBytes(env),
