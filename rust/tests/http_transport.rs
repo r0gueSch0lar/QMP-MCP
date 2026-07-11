@@ -68,6 +68,8 @@ fn test_server() -> QmpMcpServer {
         share_readonly: None,
         serial_buffer_bytes: 1 << 20,
         allow_serial_write: false,
+        serial_backend: qmp_mcp::config::SerialBackend::Ringbuf,
+        serial_spool_dir: None,
         hostfwd_port_range: None,
         allow_host_net: false,
         auto_start: false,

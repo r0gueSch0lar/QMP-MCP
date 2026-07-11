@@ -17,7 +17,7 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   DEFAULT_SERIAL_BUFFER_BYTES,
   type PortRange,
@@ -35,11 +35,14 @@ import {
   resolveMaxMemoryMb,
   resolveMaxVcpus,
   resolveQemuBinaryOverride,
+  resolveSerialBackend,
   resolveSerialBufferBytes,
+  resolveSerialSpoolDir,
   resolveViewerHost,
   resolveViewerPassword,
   resolveViewerPort,
   resolveViewerUser,
+  type SerialBackend,
 } from '../config.js';
 import { logger } from '../logger.js';
 import {
@@ -72,6 +75,7 @@ import {
   qemuArchOfBinary,
   qemuBinaryForMachine,
   resolveAccel,
+  resolveSerialSpoolPath,
   SERIAL_CHARDEV_ID,
   SHARE_MOUNT_TAG,
   VNC_LOOPBACK_HOST,
@@ -180,6 +184,10 @@ export interface OrchestratorOptions {
    * default false). Gates the `write_serial` tool; the agent can never enable it.
    */
   allowSerialWrite?: boolean;
+  /** The Serial Port backend (`QMP_MCP_SERIAL_BACKEND`, ADR-0015). */
+  serialBackend?: SerialBackend;
+  /** Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or undefined. */
+  serialSpoolDir?: string;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
@@ -394,22 +402,28 @@ export class Orchestrator {
     readSemantics: string;
     writable: boolean;
     enabled: boolean;
+    spoolSubdir: string | undefined;
     consoleDevice: string | undefined;
     hint: string;
   } {
     const machine = this.#spec?.machine;
+    const backend = this.#options.serialBackend ?? 'ringbuf';
+    const isSpool = backend === 'spool';
     return {
-      backend: 'ringbuf',
+      backend,
       bufferBytes: this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
-      readSemantics: 'drain',
-      writable: this.#options.allowSerialWrite === true,
+      // Ringbuf drains on read; spool tails the persistent file non-destructively.
+      readSemantics: isSpool ? 'tail' : 'drain',
+      // Spool is output-only, so it is never writable regardless of the write gate.
+      writable: this.#options.allowSerialWrite === true && !isSpool,
       enabled: this.#spec?.serial === true,
+      spoolSubdir: isSpool ? this.#spec?.serialSpool : undefined,
       consoleDevice: machine ? this.#guessConsoleDevice(machine) : undefined,
       hint:
         'Set serial: true on create_instance to attach the Serial Port, then read its output with ' +
-        'read_serial (each read drains the ring buffer). The guest must use the shown console device ' +
-        'in its own console= kernel cmdline for output to appear; raspi* boards have two UARTs and ' +
-        'may need adjusting.',
+        'read_serial (ringbuf drains on read; spool tails a persistent file). The guest must use the ' +
+        'shown console device in its own console= kernel cmdline for output to appear; raspi* boards ' +
+        'have two UARTs and may need adjusting.',
     };
   }
 
@@ -441,6 +455,14 @@ export class Orchestrator {
   ): Promise<{ output: string; format: string; bytes: number }> {
     const process = this.#requireInstance('read its Serial Port');
     const size = maxBytes ?? this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES;
+    if (this.#options.serialBackend === 'spool') {
+      // Spool: tail the persistent log file, non-destructively.
+      const path = resolveSerialSpoolPath(this.#options.serialSpoolDir, this.#spec?.serialSpool);
+      const buf = await readFile(path).catch(() => Buffer.alloc(0));
+      const slice = buf.subarray(Math.max(0, buf.length - size));
+      const output = format === 'base64' ? slice.toString('base64') : slice.toString('utf8');
+      return { output, format, bytes: output.length };
+    }
     const value = await process.execute('ringbuf-read', {
       device: SERIAL_CHARDEV_ID,
       size,
@@ -458,6 +480,12 @@ export class Orchestrator {
    * Instance is running. Mirrors the Rust `write_serial`.
    */
   async writeSerial(data: string, format: 'utf8' | 'base64'): Promise<{ bytesWritten: number }> {
+    if (this.#options.serialBackend === 'spool') {
+      throw new LifecycleError(
+        'The spool Serial Port backend is output-only; writing needs the ringbuf backend (unset ' +
+          'QMP_MCP_SERIAL_BACKEND or set it to ringbuf).',
+      );
+    }
     if (this.#options.allowSerialWrite !== true) {
       throw new LifecycleError(
         'Writing to the Serial Port is disabled. Set QMP_MCP_ALLOW_SERIAL_WRITE=true to enable ' +
@@ -536,12 +564,27 @@ export class Orchestrator {
         hostShareDir: this.#options.hostShareDir,
         shareReadonly: this.#options.shareReadonly,
         serialBufferBytes: this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
+        serialBackend: this.#options.serialBackend ?? 'ringbuf',
+        serialSpoolDir: this.#options.serialSpoolDir,
         hostfwdPortRange: this.#options.hostfwdPortRange,
         allowHostNet: this.#options.allowHostNet,
         maxMemoryMb: this.#options.maxMemoryMb,
         maxVcpus: this.#options.maxVcpus,
         allowRawArgs: this.#options.allowRawArgs,
       });
+      // Serial Port spool backend (ADR-0015): create the log's parent directory before qemu opens
+      // the file; otherwise warn if a serialSpool was set where it cannot apply.
+      if (spec.serial && this.#options.serialBackend === 'spool') {
+        const path = resolveSerialSpoolPath(this.#options.serialSpoolDir, spec.serialSpool);
+        await mkdir(dirname(path), { recursive: true });
+      } else if (spec.serialSpool !== undefined) {
+        logger.warning(
+          `serialSpool=${JSON.stringify(spec.serialSpool)} ignored: it applies only with ` +
+            `QMP_MCP_SERIAL_BACKEND=spool and serial: true (backend=${
+              this.#options.serialBackend ?? 'ringbuf'
+            }, serial=${spec.serial}).`,
+        );
+      }
       logger.info(`creating Instance (machine=${spec.machine}, accel=${resolution.accel})`);
 
       let process: InstanceProcess;
@@ -935,6 +978,8 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   guestShareDir: resolveGuestShareDir(process.env),
   shareReadonly: !resolveAllowShareWrite(process.env),
   serialBufferBytes: resolveSerialBufferBytes(process.env),
+  serialBackend: resolveSerialBackend(process.env),
+  serialSpoolDir: resolveSerialSpoolDir(process.env),
   allowSerialWrite: resolveAllowSerialWrite(process.env),
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),

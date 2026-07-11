@@ -22,7 +22,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{PortRange, DEFAULT_HOSTFWD_PORT_RANGE};
+use crate::config::{PortRange, SerialBackend, DEFAULT_HOSTFWD_PORT_RANGE};
 
 use super::image_store::{resolve_image_path, ImageFormat};
 use super::iso_store::resolve_iso_path;
@@ -518,6 +518,11 @@ pub struct HardwareSpecParams {
     /// only; the ring buffer's size is the operator's `QMP_MCP_SERIAL_BUFFER_BYTES`.
     #[serde(default)]
     pub serial: bool,
+    /// Optional spool subdirectory NAME under `QMP_MCP_SERIAL_SPOOL_DIR` for the spool backend
+    /// (ADR-0015). Validated like a Store name; ignored (with a warning) unless the spool backend
+    /// is active. Never a host path.
+    #[serde(default)]
+    pub serial_spool: Option<String>,
     /// Optional boot order as QEMU drive letters, e.g. `d` or `dc`.
     #[serde(default)]
     pub boot: Option<String>,
@@ -633,6 +638,8 @@ pub struct HardwareSpec {
     pub share: bool,
     /// Attach the guest's Serial Port and capture its output (ADR-0015; ringbuf backend).
     pub serial: bool,
+    /// Optional spool subdirectory name under `QMP_MCP_SERIAL_SPOOL_DIR` (ADR-0015, spool backend).
+    pub serial_spool: Option<String>,
     /// Optional validated boot order.
     pub boot: Option<BootOrder>,
     /// Optional external kernel image (by name in the Image Store) to direct-boot.
@@ -782,6 +789,7 @@ pub fn parse_hardware_spec(
         cdrom,
         share: params.share,
         serial: params.serial,
+        serial_spool: params.serial_spool,
         boot,
         kernel,
         initrd,
@@ -958,6 +966,12 @@ pub struct ArgvOptions {
     /// Ring-buffer size (bytes) for the Serial Port's QEMU `ringbuf` chardev when the
     /// spec sets `serial: true` (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two).
     pub serial_buffer_bytes: u32,
+    /// The Serial Port backend (ADR-0015): `Ringbuf` emits a ringbuf chardev, `Spool` a file
+    /// chardev under `serial_spool_dir`.
+    pub serial_backend: SerialBackend,
+    /// Operator root directory for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`),
+    /// required when `serial_backend` is `Spool`.
+    pub serial_spool_dir: Option<String>,
     /// Inclusive host-port range a forward's `hostPort` must fall within; defaults
     /// to [`DEFAULT_HOSTFWD_PORT_RANGE`] when `None`.
     pub hostfwd_port_range: Option<PortRange>,
@@ -1077,16 +1091,72 @@ pub const SERIAL_CHARDEV_ID: &str = "serialbuf";
 /// configured size, bound to the machine's first serial port with `-serial chardev:`.
 /// Board-agnostic — no per-UART device name — and the explicit `-serial` redirect wins
 /// over the `-nographic` console mux. Mirrors the TS `buildSerialArgs`.
-fn build_serial_args(options: &ArgvOptions) -> Vec<String> {
-    vec![
-        "-chardev".to_string(),
-        format!(
+fn build_serial_args(
+    options: &ArgvOptions,
+    spec: &HardwareSpec,
+) -> Result<Vec<String>, HardwareSpecError> {
+    let chardev = match options.serial_backend {
+        SerialBackend::Ringbuf => format!(
             "ringbuf,id={SERIAL_CHARDEV_ID},size={}",
             options.serial_buffer_bytes
         ),
+        SerialBackend::Spool => format!(
+            "file,id={SERIAL_CHARDEV_ID},path={}",
+            escape_qemu_opts_value(&resolve_serial_spool_path(
+                options.serial_spool_dir.as_deref(),
+                spec.serial_spool.as_deref(),
+            )?)
+        ),
+    };
+    Ok(vec![
+        "-chardev".to_string(),
+        chardev,
         "-serial".to_string(),
         format!("chardev:{SERIAL_CHARDEV_ID}"),
-    ]
+    ])
+}
+
+/// Resolve the spool-backend host log path: `<spool_dir>/<serialSpool>/serial.log`, or
+/// `<spool_dir>/serial.log` when no `serialSpool` is set (ADR-0015). The subdir is validated like a
+/// Store name (single component, no traversal), so it can never escape the operator root. Also used
+/// by the Orchestrator to create the directory and read the log. Mirrors the TS
+/// `resolveSerialSpoolPath`.
+pub fn resolve_serial_spool_path(
+    spool_dir: Option<&str>,
+    serial_spool: Option<&str>,
+) -> Result<String, HardwareSpecError> {
+    let root = match spool_dir {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => {
+            return Err(HardwareSpecError(
+                "Serial Port spool backend requires QMP_MCP_SERIAL_SPOOL_DIR to be configured."
+                    .to_string(),
+            ))
+        }
+    };
+    let mut path = std::path::PathBuf::from(root);
+    if let Some(subdir) = serial_spool {
+        validate_serial_spool_name(subdir)?;
+        path.push(subdir);
+    }
+    path.push("serial.log");
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Validate a `serialSpool` subdirectory name (ADR-0015): the same charset as Image/ISO Store
+/// names, so it is a single component that cannot escape the operator root.
+fn validate_serial_spool_name(name: &str) -> Result<(), HardwareSpecError> {
+    let mut chars = name.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(HardwareSpecError(format!(
+            "serialSpool \"{name}\" must match ^[A-Za-z0-9][A-Za-z0-9._-]* — a single subdirectory \
+             name under QMP_MCP_SERIAL_SPOOL_DIR with no slash, '..', or leading dot (never a host path)."
+        )))
+    }
 }
 
 fn build_cdrom_args(
@@ -1384,7 +1454,7 @@ pub fn build_argv(
     // Serial Port capture (ADR-0015). The explicit `-serial chardev:` redirect binds the
     // machine's first UART and wins over the earlier `-nographic` console mux.
     if spec.serial {
-        argv.extend(build_serial_args(options));
+        argv.extend(build_serial_args(options, spec)?);
     }
     if let Some(boot) = &spec.boot {
         // boot is allowlisted to [a-dnp]+ already; emit the single order= form (and
@@ -1453,6 +1523,8 @@ mod tests {
             host_share_dir: None,
             share_readonly: None,
             serial_buffer_bytes: 1 << 20,
+            serial_backend: SerialBackend::Ringbuf,
+            serial_spool_dir: None,
             hostfwd_port_range: None,
             allow_host_net: false,
             max_memory_mb: None,
@@ -1849,6 +1921,32 @@ mod tests {
         let argv = build_argv(&spec(json!({})), &opts()).unwrap();
         assert!(!argv.iter().any(|s| s == "-chardev"));
         assert!(!argv.iter().any(|s| s == "-serial"));
+    }
+
+    #[test]
+    fn spool_backend_emits_file_chardev_and_validates_serial_spool() {
+        // ADR-0015: the spool backend emits a file chardev under the operator root + serialSpool.
+        let mut o = opts();
+        o.serial_backend = SerialBackend::Spool;
+        o.serial_spool_dir = Some("/var/log/qmp-serial".to_string());
+        let argv = build_argv(&spec(json!({ "serial": true, "serialSpool": "run1" })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-chardev"),
+            "file,id=serialbuf,path=/var/log/qmp-serial/run1/serial.log"
+        );
+        // No serialSpool → the log sits directly under the root.
+        let argv = build_argv(&spec(json!({ "serial": true })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-chardev"),
+            "file,id=serialbuf,path=/var/log/qmp-serial/serial.log"
+        );
+        // A serialSpool that could escape the root (leading dot / traversal) is rejected.
+        let e = build_argv(
+            &spec(json!({ "serial": true, "serialSpool": "../etc" })),
+            &o,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("serialSpool"));
     }
 
     #[test]

@@ -44,6 +44,8 @@ const DEFAULTS: Config = {
   autoStart: true,
   eventBufferSize: 256,
   serialBufferBytes: 1048576,
+  serialBackend: 'ringbuf',
+  serialSpoolDir: undefined,
   allowRawArgs: false,
   viewerPassword: undefined,
   viewerUser: undefined,
@@ -88,6 +90,19 @@ describe('loadConfig', () => {
   it('reads QMP_MCP_ALLOW_SERIAL_WRITE (default false, opt-in true) — ADR-0015', () => {
     expect(loadConfig({}).allowSerialWrite).toBe(false);
     expect(loadConfig({ QMP_MCP_ALLOW_SERIAL_WRITE: 'true' }).allowSerialWrite).toBe(true);
+  });
+
+  it('reads QMP_MCP_SERIAL_BACKEND (default ringbuf; spool requires a dir) — ADR-0015', () => {
+    expect(loadConfig({}).serialBackend).toBe('ringbuf');
+    const c = loadConfig({
+      QMP_MCP_SERIAL_BACKEND: 'spool',
+      QMP_MCP_SERIAL_SPOOL_DIR: '/var/log/qmp-serial',
+    });
+    expect(c.serialBackend).toBe('spool');
+    expect(c.serialSpoolDir).toBe('/var/log/qmp-serial');
+    expect(() => loadConfig({ QMP_MCP_SERIAL_BACKEND: 'spool' })).toThrowError(
+      /QMP_MCP_SERIAL_SPOOL_DIR/,
+    );
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

@@ -39,6 +39,8 @@ interface FixtureOptions {
   shareReadonly?: boolean;
   // Serial Port ring-buffer size (ADR-0015); omitted fixtures default to 1 MiB.
   serialBufferBytes?: number;
+  serialBackend?: 'ringbuf' | 'spool';
+  serialSpoolDir?: string;
 }
 
 interface Fixture {
@@ -87,6 +89,8 @@ describe('argv parity fixtures (ADR-0012)', () => {
         hostShareDir: fixture.options.hostShareDir,
         shareReadonly: fixture.options.shareReadonly,
         serialBufferBytes: fixture.options.serialBufferBytes ?? 1 << 20,
+        serialBackend: fixture.options.serialBackend ?? 'ringbuf',
+        serialSpoolDir: fixture.options.serialSpoolDir,
         hostfwdPortRange: fixture.options.hostfwdPortRange,
         allowHostNet: fixture.options.allowHostNet,
         maxMemoryMb: fixture.options.maxMemoryMb,

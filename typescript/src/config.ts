@@ -21,6 +21,10 @@ export type LogLevel = 'debug' | 'info' | 'warning' | 'error';
 export type AuthMode = 'apikey' | 'jwt';
 
 export const TRANSPORT_MODES: readonly TransportMode[] = ['stdio', 'http', 'both'];
+
+/** The Serial Port backend (ADR-0015): in-QEMU `ringbuf` or a host `spool` file. */
+export type SerialBackend = 'ringbuf' | 'spool';
+export const SERIAL_BACKENDS: readonly SerialBackend[] = ['ringbuf', 'spool'];
 export const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warning', 'error'];
 export const AUTH_MODES: readonly AuthMode[] = ['apikey', 'jwt'];
 
@@ -169,6 +173,10 @@ export interface Config {
    * Power-of-two; the size QEMU's `ringbuf` chardev is created with when `serial: true`.
    */
   serialBufferBytes: number;
+  /** The Serial Port backend (`QMP_MCP_SERIAL_BACKEND`, ADR-0015): `ringbuf` or `spool`. */
+  serialBackend: SerialBackend;
+  /** Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or undefined. */
+  serialSpoolDir?: string;
   /**
    * When true, a Hardware Spec's `extraArgs` (raw QEMU arguments) are appended to
    * the generated argv (`QMP_MCP_ALLOW_RAW_ARGS`). Default false: raw args are
@@ -551,6 +559,36 @@ export function resolveAllowSerialWrite(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Resolve the Serial Port backend (`QMP_MCP_SERIAL_BACKEND`, default `ringbuf` — ADR-0015).
+ * Exported so the Orchestrator singleton and {@link loadConfig} share one source of truth.
+ */
+export function resolveSerialBackend(env: NodeJS.ProcessEnv): SerialBackend {
+  return parseEnum(
+    'QMP_MCP_SERIAL_BACKEND',
+    env.QMP_MCP_SERIAL_BACKEND,
+    SERIAL_BACKENDS,
+    'ringbuf',
+  );
+}
+
+/**
+ * Resolve `QMP_MCP_SERIAL_SPOOL_DIR` — the operator's absolute root directory that spool-backend
+ * Serial Port logs are written under (ADR-0015). Blank reads as unset; a relative path is rejected.
+ * Mirrors the Rust `resolve_serial_spool_dir`.
+ */
+export function resolveSerialSpoolDir(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_SERIAL_SPOOL_DIR?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  if (!raw.startsWith('/')) {
+    throw new ConfigError(
+      `QMP_MCP_SERIAL_SPOOL_DIR must be an absolute path (got "${raw}"). It is the host directory ` +
+        'the Serial Port log is written under.',
+    );
+  }
+  return raw;
+}
+
+/**
  * Resolve the noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010), or
  * undefined when unset. A whitespace-only value is treated as unset (mirroring
  * `QMP_MCP_JWT_SECRET`) so the Viewer stays fail-closed rather than serving behind
@@ -656,6 +694,15 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     }
   }
 
+  const serialBackend = resolveSerialBackend(env);
+  const serialSpoolDir = resolveSerialSpoolDir(env);
+  if (serialBackend === 'spool' && serialSpoolDir === undefined) {
+    throw new ConfigError(
+      'QMP_MCP_SERIAL_BACKEND=spool requires QMP_MCP_SERIAL_SPOOL_DIR — the host directory the ' +
+        'Serial Port log is written under.',
+    );
+  }
+
   return {
     transport,
     logLevel,
@@ -682,6 +729,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     autoStart: resolveAutoStart(env),
     eventBufferSize: resolveEventBufferSize(env),
     serialBufferBytes: resolveSerialBufferBytes(env),
+    serialBackend,
+    serialSpoolDir,
     allowRawArgs: resolveAllowRawArgs(env),
     viewerPassword: resolveViewerPassword(env),
     viewerUser: resolveViewerUser(env),
