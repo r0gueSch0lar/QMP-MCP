@@ -741,6 +741,7 @@ mod tests {
             host_share_dir: None,
             guest_share_dir: None,
             share_readonly: None,
+            serial_buffer_bytes: 1 << 20,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,

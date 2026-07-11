@@ -175,6 +175,9 @@ pub struct OrchestratorOptions {
     /// Whether the shared folder is read-only (default true; `Some(false)` only when
     /// the operator set `QMP_MCP_ALLOW_SHARE_WRITE`). Threaded into the argv fail-closed.
     pub share_readonly: Option<bool>,
+    /// Serial Port ring-buffer size in bytes when a spec sets `serial: true`
+    /// (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two). Passed to the argv generator.
+    pub serial_buffer_bytes: u32,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -578,6 +581,7 @@ impl Orchestrator {
             iso_dir: self.options.iso_dir.clone(),
             host_share_dir: self.options.host_share_dir.clone(),
             share_readonly: self.options.share_readonly,
+            serial_buffer_bytes: self.options.serial_buffer_bytes,
             hostfwd_port_range: self.options.hostfwd_port_range,
             allow_host_net: self.options.allow_host_net,
             max_memory_mb: self.options.max_memory_mb,
@@ -1103,6 +1107,7 @@ mod tests {
             host_share_dir: None,
             guest_share_dir: None,
             share_readonly: None,
+            serial_buffer_bytes: 1 << 20,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
