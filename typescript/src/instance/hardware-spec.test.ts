@@ -37,6 +37,8 @@ describe('parseHardwareSpec', () => {
       disks: [],
       // No folder sharing by default (ADR-0014).
       share: false,
+      // No Serial Port by default (ADR-0015).
+      serial: false,
       // Networking defaults to user-mode (SLiRP) with an allowlisted NIC and no
       // port-forwards (ADR-0009).
       network: { mode: 'user', model: 'virtio-net-pci', hostForwards: [] },

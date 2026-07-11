@@ -160,6 +160,11 @@ export interface Config {
    */
   eventBufferSize: number;
   /**
+   * Serial Port ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015).
+   * Power-of-two; the size QEMU's `ringbuf` chardev is created with when `serial: true`.
+   */
+  serialBufferBytes: number;
+  /**
    * When true, a Hardware Spec's `extraArgs` (raw QEMU arguments) are appended to
    * the generated argv (`QMP_MCP_ALLOW_RAW_ARGS`). Default false: raw args are
    * host-compromise-equivalent, so a spec carrying `extraArgs` is REFUSED unless
@@ -274,6 +279,24 @@ function parsePositiveInt(varName: string, raw: string | undefined, fallback: nu
     throw new ConfigError(`${varName} must be a positive integer >= 1 (got "${raw}").`);
   }
   return Number(value);
+}
+
+/**
+ * Parse a byte size that must be a power of two (the QEMU `ringbuf` chardev requirement,
+ * ADR-0015). Undefined or empty reads as the fallback; otherwise requires a positive integer
+ * that is an exact power of two, failing closed so the server never hands QEMU a size it
+ * rejects at launch.
+ */
+function parsePowerOfTwo(varName: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim();
+  const n = Number(value);
+  if (!/^\d+$/.test(value) || n < 1 || (n & (n - 1)) !== 0) {
+    throw new ConfigError(
+      `${varName} must be a power-of-two number of bytes (e.g. 65536, 1048576) — got "${raw}".`,
+    );
+  }
+  return n;
 }
 
 /**
@@ -424,6 +447,25 @@ export function resolveAllowHostNet(env: NodeJS.ProcessEnv): boolean {
  */
 export function resolveAutoStart(env: NodeJS.ProcessEnv): boolean {
   return parseBoolean('QMP_MCP_AUTO_START', env.QMP_MCP_AUTO_START, true);
+}
+
+/**
+ * Default Serial Port ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015):
+ * 1 MiB — a power of two large enough for a verbose boot log. Mirrors the Rust constant.
+ */
+export const DEFAULT_SERIAL_BUFFER_BYTES = 1 << 20;
+
+/**
+ * Resolve the Serial Port ring-buffer size (`QMP_MCP_SERIAL_BUFFER_BYTES`, default
+ * {@link DEFAULT_SERIAL_BUFFER_BYTES}). Power-of-two, fail-closed. Exported so the Orchestrator
+ * singleton and {@link loadConfig} share one source of truth (ADR-0015).
+ */
+export function resolveSerialBufferBytes(env: NodeJS.ProcessEnv): number {
+  return parsePowerOfTwo(
+    'QMP_MCP_SERIAL_BUFFER_BYTES',
+    env.QMP_MCP_SERIAL_BUFFER_BYTES,
+    DEFAULT_SERIAL_BUFFER_BYTES,
+  );
 }
 
 /**
@@ -624,6 +666,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     allowShareWrite: resolveAllowShareWrite(env),
     autoStart: resolveAutoStart(env),
     eventBufferSize: resolveEventBufferSize(env),
+    serialBufferBytes: resolveSerialBufferBytes(env),
     allowRawArgs: resolveAllowRawArgs(env),
     viewerPassword: resolveViewerPassword(env),
     viewerUser: resolveViewerUser(env),

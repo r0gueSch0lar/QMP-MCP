@@ -138,6 +138,13 @@ export type Cdrom = z.infer<typeof cdromSchema>;
 export const SHARE_MOUNT_TAG = 'share';
 
 /**
+ * The fixed QEMU chardev id for the Serial Port's ring buffer (ADR-0015). A server-owned
+ * CONSTANT — never operator- or agent-supplied — so it can never inject an extra property.
+ * Mirrors the Rust `SERIAL_CHARDEV_ID`.
+ */
+export const SERIAL_CHARDEV_ID = 'serialbuf';
+
+/**
  * Strict allowlist of guest NIC models the agent may pick (ADR-0009). The model
  * is emitted verbatim into `-device <model>,netdev=...`, so it is a CLOSED enum,
  * never a free string: a free string could carry a comma to inject extra
@@ -422,6 +429,14 @@ export const hardwareSpecSchema = z
           'the operator set QMP_MCP_ALLOW_SHARE_WRITE. Mount it in the guest with the command ' +
           'get_share reports. Not supported on raspi* boards (no PCI bus).',
       ),
+    serial: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Attach the Guest Serial Port and capture its output (ADR-0015). Boolean opt-in only; ' +
+          'the ring-buffer size is the operator QMP_MCP_SERIAL_BUFFER_BYTES. Read it with read_serial ' +
+          '(each read drains the buffer); get_serial reports the expected guest console device.',
+      ),
     boot: z
       .string()
       .regex(VALID_BOOT_ORDER, bootOrderMessage)
@@ -665,6 +680,11 @@ export interface ArgvOptions {
    */
   shareReadonly?: boolean;
   /**
+   * Ring-buffer size (bytes) for the Serial Port's QEMU `ringbuf` chardev when the spec sets
+   * `serial: true` (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two).
+   */
+  serialBufferBytes: number;
+  /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (`QMP_MCP_HOSTFWD_PORT_RANGE`). A forward outside it is rejected
    * naming the range. Defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE} when omitted
@@ -822,6 +842,22 @@ function buildShareArgs(options: ArgvOptions, raspi: boolean, machine: string): 
     fsdev.join(','),
     '-device',
     `virtio-9p-pci,fsdev=fsdev0,mount_tag=${SHARE_MOUNT_TAG}`,
+  ];
+}
+
+/**
+ * Render the Serial Port argument pair for a spec that opted in with `serial: true`
+ * (ADR-0015, ringbuf backend): a QEMU in-tree `ringbuf` chardev of the operator's configured
+ * size, bound to the machine's first serial port with `-serial chardev:`. Board-agnostic — no
+ * per-UART device name — and the explicit `-serial` redirect wins over the `-nographic` console
+ * mux. Mirrors the Rust `build_serial_args`.
+ */
+function buildSerialArgs(options: ArgvOptions): string[] {
+  return [
+    '-chardev',
+    `ringbuf,id=${SERIAL_CHARDEV_ID},size=${options.serialBufferBytes}`,
+    '-serial',
+    `chardev:${SERIAL_CHARDEV_ID}`,
   ];
 }
 
@@ -1056,6 +1092,11 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   // operator-configured, read-only unless enabled, refused on raspi (no PCI bus).
   if (spec.share) {
     argv.push(...buildShareArgs(options, raspi, spec.machine));
+  }
+  // Serial Port capture (ADR-0015). The explicit `-serial chardev:` redirect binds the
+  // machine's first UART and wins over the earlier `-nographic` console mux.
+  if (spec.serial) {
+    argv.push(...buildSerialArgs(options));
   }
   if (spec.boot !== undefined) {
     // boot is already allowlisted to [a-dnp]+ by the schema; emit the single
