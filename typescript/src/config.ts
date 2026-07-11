@@ -147,9 +147,9 @@ export interface Config {
   /**
    * When true, `create_instance` auto-starts the Guest: it issues QMP `cont`
    * immediately after launch (`QMP_MCP_AUTO_START`), so the Instance begins
-   * executing rather than staying frozen at the `-S` startup pause. Default false —
-   * the Guest loads paused for deterministic inspection and only runs on an explicit
-   * `resume_instance` (issue #8).
+   * executing rather than staying frozen at the `-S` startup pause. Default TRUE
+   * (ADR-0016) — set false to load the Guest paused for deterministic inspection,
+   * running it only on an explicit `resume_instance` (issue #8/#10).
    */
   autoStart: boolean;
   /**
@@ -419,11 +419,11 @@ export function resolveAllowHostNet(env: NodeJS.ProcessEnv): boolean {
 
 /**
  * Resolve whether `create_instance` auto-starts the Guest (`QMP_MCP_AUTO_START`,
- * default false). Exported so the Orchestrator singleton and {@link loadConfig}
- * share one source of truth (issue #8).
+ * default true — ADR-0016). Exported so the Orchestrator singleton and
+ * {@link loadConfig} share one source of truth (issue #8/#10).
  */
 export function resolveAutoStart(env: NodeJS.ProcessEnv): boolean {
-  return parseBoolean('QMP_MCP_AUTO_START', env.QMP_MCP_AUTO_START, false);
+  return parseBoolean('QMP_MCP_AUTO_START', env.QMP_MCP_AUTO_START, true);
 }
 
 /**
