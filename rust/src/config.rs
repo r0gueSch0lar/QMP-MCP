@@ -27,6 +27,10 @@ pub type EnvMap = HashMap<String, String>;
 /// server (issue #12).
 pub const DEFAULT_EVENT_BUFFER_SIZE: u32 = 256;
 
+/// Default Serial Port ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015):
+/// 1 MiB — a power of two large enough for a verbose boot log. Mirrors the TS constant.
+pub const DEFAULT_SERIAL_BUFFER_BYTES: u32 = 1 << 20;
+
 /// Fallback `qemu-system-*` binary: the arch that `machine_arch` degrades an unknown
 /// (or x86) `machine` to, i.e. what `qemu_binary_for_machine` returns for anything not
 /// mapped to ARM. The Orchestrator normally DERIVES the binary from the Instance's
@@ -200,6 +204,9 @@ pub struct Config {
     pub auto_start: bool,
     /// Capacity of the Event Buffer (issue #12).
     pub event_buffer_size: u32,
+    /// Serial Port ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015).
+    /// Power-of-two; the size QEMU's `ringbuf` chardev is created with when `serial: true`.
+    pub serial_buffer_bytes: u32,
     /// When true, a Hardware Spec's `extraArgs` are appended to the argv (ADR-0002).
     pub allow_raw_args: bool,
     /// The password gating the noVNC Viewer (ADR-0010), or `None` when unset.
@@ -326,6 +333,30 @@ fn parse_positive_int(var: &str, raw: Option<&str>, fallback: u32) -> Result<u32
     }
     match value.parse::<u32>() {
         Ok(n) if n >= 1 => Ok(n),
+        _ => Err(err()),
+    }
+}
+
+/// Parse a byte size that must be a power of two (the QEMU `ringbuf` chardev requirement,
+/// ADR-0015). Undefined or blank reads as the fallback; otherwise requires a positive
+/// integer that is an exact power of two, failing closed with an actionable message so the
+/// server never hands QEMU a size it rejects at launch.
+fn parse_power_of_two(var: &str, raw: Option<&str>, fallback: u32) -> Result<u32, ConfigError> {
+    let value = match raw {
+        None => return Ok(fallback),
+        Some(v) if v.trim().is_empty() => return Ok(fallback),
+        Some(v) => v.trim(),
+    };
+    let err = || {
+        ConfigError(format!(
+            "{var} must be a power-of-two number of bytes (e.g. 65536, 1048576) — got \"{value}\"."
+        ))
+    };
+    if !is_all_digits(value) {
+        return Err(err());
+    }
+    match value.parse::<u32>() {
+        Ok(n) if n >= 1 && n.is_power_of_two() => Ok(n),
         _ => Err(err()),
     }
 }
@@ -631,6 +662,11 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_EVENT_BUFFER_SIZE"),
             DEFAULT_EVENT_BUFFER_SIZE,
         )?,
+        serial_buffer_bytes: parse_power_of_two(
+            "QMP_MCP_SERIAL_BUFFER_BYTES",
+            get(env, "QMP_MCP_SERIAL_BUFFER_BYTES"),
+            DEFAULT_SERIAL_BUFFER_BYTES,
+        )?,
         allow_raw_args: parse_boolean(
             "QMP_MCP_ALLOW_RAW_ARGS",
             get(env, "QMP_MCP_ALLOW_RAW_ARGS"),
@@ -692,6 +728,7 @@ mod tests {
             allow_share_write: false,
             auto_start: true,
             event_buffer_size: 256,
+            serial_buffer_bytes: 1 << 20,
             allow_raw_args: false,
             viewer_password: None,
             viewer_user: None,
@@ -1178,6 +1215,21 @@ mod tests {
                 .unwrap()
                 .auto_start
         );
+    }
+
+    #[test]
+    fn serial_buffer_bytes_defaults_1mib_and_requires_power_of_two() {
+        // ADR-0015: default 1 MiB; a non-power-of-two fails closed before launch.
+        assert_eq!(load_config(&env(&[])).unwrap().serial_buffer_bytes, 1 << 20);
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_SERIAL_BUFFER_BYTES", "65536")]))
+                .unwrap()
+                .serial_buffer_bytes,
+            65536
+        );
+        let e = load_config(&env(&[("QMP_MCP_SERIAL_BUFFER_BYTES", "100000")])).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_SERIAL_BUFFER_BYTES"));
+        assert!(e.0.contains("power-of-two"));
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "description": "Serial Port capture with a non-default ring-buffer size (ADR-0015): the operator's QMP_MCP_SERIAL_BUFFER_BYTES (here 65536, a power of two) flows verbatim into the ringbuf chardev size. TCG.",
+  "spec": { "serial": true },
+  "options": { "accel": "tcg", "serialBufferBytes": 65536 },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-chardev", "ringbuf,id=serialbuf,size=65536",
+    "-serial", "chardev:serialbuf",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

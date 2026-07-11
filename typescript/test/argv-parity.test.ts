@@ -37,6 +37,8 @@ interface FixtureOptions {
   // through a Store), so fixtures use a literal path — no placeholder needed.
   hostShareDir?: string;
   shareReadonly?: boolean;
+  // Serial Port ring-buffer size (ADR-0015); omitted fixtures default to 1 MiB.
+  serialBufferBytes?: number;
 }
 
 interface Fixture {
@@ -84,6 +86,7 @@ describe('argv parity fixtures (ADR-0012)', () => {
         isoDir,
         hostShareDir: fixture.options.hostShareDir,
         shareReadonly: fixture.options.shareReadonly,
+        serialBufferBytes: fixture.options.serialBufferBytes ?? 1 << 20,
         hostfwdPortRange: fixture.options.hostfwdPortRange,
         allowHostNet: fixture.options.allowHostNet,
         maxMemoryMb: fixture.options.maxMemoryMb,

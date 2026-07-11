@@ -1,0 +1,19 @@
+{
+  "description": "Serial Port capture (ADR-0015): serial:true attaches a QEMU in-tree ringbuf chardev of the operator's QMP_MCP_SERIAL_BUFFER_BYTES size (default 1 MiB) bound to the machine's first serial port with -serial chardev. Board-agnostic (no per-UART device). TCG.",
+  "spec": { "serial": true },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-chardev", "ringbuf,id=serialbuf,size=1048576",
+    "-serial", "chardev:serialbuf",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

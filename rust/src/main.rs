@@ -228,6 +228,8 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         host_share_dir: config.host_share_dir.clone(),
         guest_share_dir: config.guest_share_dir.clone(),
         share_readonly: Some(!config.allow_share_write),
+        // Serial Port ring-buffer size (ADR-0015), passed through to the argv generator.
+        serial_buffer_bytes: config.serial_buffer_bytes,
         hostfwd_port_range: Some(config.hostfwd_port_range),
         allow_host_net: config.allow_host_net,
         auto_start: config.auto_start,
