@@ -40,6 +40,7 @@ const DEFAULTS: Config = {
   hostShareDir: undefined,
   guestShareDir: undefined,
   allowShareWrite: false,
+  allowSerialWrite: false,
   autoStart: true,
   eventBufferSize: 256,
   serialBufferBytes: 1048576,
@@ -82,6 +83,11 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ QMP_MCP_SERIAL_BUFFER_BYTES: '100000' })).toThrowError(
       /power-of-two/,
     );
+  });
+
+  it('reads QMP_MCP_ALLOW_SERIAL_WRITE (default false, opt-in true) — ADR-0015', () => {
+    expect(loadConfig({}).allowSerialWrite).toBe(false);
+    expect(loadConfig({ QMP_MCP_ALLOW_SERIAL_WRITE: 'true' }).allowSerialWrite).toBe(true);
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

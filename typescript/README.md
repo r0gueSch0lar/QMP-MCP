@@ -89,7 +89,7 @@ loopback, and it's off entirely until you set the password.
 | `create_instance` / `destroy_instance` | build & launch a VM from a hardware spec / tear it down |
 | `get_instance` / `get_status` | the current instance + lifecycle state / the live guest run state |
 | `get_share` | report the host↔guest folder-sharing config + the exact 9p mount command |
-| `get_serial` / `read_serial` | report the Serial Port capture config + guest console device / drain the Guest's serial output |
+| `get_serial` / `read_serial` / `write_serial` | report the Serial Port config + console device / drain the Guest's serial output / type input into the console (gated by `QMP_MCP_ALLOW_SERIAL_WRITE`) |
 | `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
 | `reset_instance` / `powerdown_instance` | hard reset / graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks / per-CPU info |

@@ -207,6 +207,10 @@ pub struct Config {
     /// Serial Port ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015).
     /// Power-of-two; the size QEMU's `ringbuf` chardev is created with when `serial: true`.
     pub serial_buffer_bytes: u32,
+    /// Whether writing to the Guest Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`,
+    /// ADR-0015; default false ⇒ read-only). Gates the `write_serial` tool; the agent can
+    /// never enable it.
+    pub allow_serial_write: bool,
     /// When true, a Hardware Spec's `extraArgs` are appended to the argv (ADR-0002).
     pub allow_raw_args: bool,
     /// The password gating the noVNC Viewer (ADR-0010), or `None` when unset.
@@ -667,6 +671,11 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_SERIAL_BUFFER_BYTES"),
             DEFAULT_SERIAL_BUFFER_BYTES,
         )?,
+        allow_serial_write: parse_boolean(
+            "QMP_MCP_ALLOW_SERIAL_WRITE",
+            get(env, "QMP_MCP_ALLOW_SERIAL_WRITE"),
+            false,
+        )?,
         allow_raw_args: parse_boolean(
             "QMP_MCP_ALLOW_RAW_ARGS",
             get(env, "QMP_MCP_ALLOW_RAW_ARGS"),
@@ -729,6 +738,7 @@ mod tests {
             auto_start: true,
             event_buffer_size: 256,
             serial_buffer_bytes: 1 << 20,
+            allow_serial_write: false,
             allow_raw_args: false,
             viewer_password: None,
             viewer_user: None,
@@ -1230,6 +1240,17 @@ mod tests {
         let e = load_config(&env(&[("QMP_MCP_SERIAL_BUFFER_BYTES", "100000")])).unwrap_err();
         assert!(e.0.contains("QMP_MCP_SERIAL_BUFFER_BYTES"));
         assert!(e.0.contains("power-of-two"));
+    }
+
+    #[test]
+    fn allow_serial_write_defaults_false_and_reads_true() {
+        // ADR-0015: console write is off by default; operator opt-in via env.
+        assert!(!load_config(&env(&[])).unwrap().allow_serial_write);
+        assert!(
+            load_config(&env(&[("QMP_MCP_ALLOW_SERIAL_WRITE", "true")]))
+                .unwrap()
+                .allow_serial_write
+        );
     }
 
     #[test]

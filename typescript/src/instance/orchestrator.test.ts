@@ -418,6 +418,24 @@ describe('Orchestrator control commands (fake driver)', () => {
   const commands = (process: { executed: Array<{ command: string }> }): string[] =>
     process.executed.map((e) => e.command);
 
+  it('write_serial is gated by allowSerialWrite and read_serial drains (ADR-0015)', async () => {
+    // Disabled by default: refused, naming the env var, and no ringbuf-write is issued.
+    const { orch, process } = await running();
+    await expect(orch.writeSerial('id\n', 'utf8')).rejects.toThrow(/QMP_MCP_ALLOW_SERIAL_WRITE/);
+    expect(commands(process)).not.toContain('ringbuf-write');
+    expect(orch.describeSerial().writable).toBe(false);
+    // read_serial drains the ring buffer (ringbuf-read).
+    expect(await orch.readSerial(undefined, 'utf8')).toMatchObject({
+      output: 'fake-serial-output',
+    });
+
+    // With allowSerialWrite, write_serial issues ringbuf-write.
+    const { orch: orch2, process: process2 } = await running({ allowSerialWrite: true });
+    expect(orch2.describeSerial().writable).toBe(true);
+    expect(await orch2.writeSerial('id\n', 'utf8')).toEqual({ bytesWritten: 3 });
+    expect(commands(process2)).toContain('ringbuf-write');
+  });
+
   it('pause issues QMP stop and moves RUNNING -> PAUSED (reflected by get_status)', async () => {
     const { orch, process } = await running();
     expect(orch.getInstance().state).toBe('RUNNING');

@@ -67,6 +67,7 @@ fn test_server() -> QmpMcpServer {
         guest_share_dir: None,
         share_readonly: None,
         serial_buffer_bytes: 1 << 20,
+        allow_serial_write: false,
         hostfwd_port_range: None,
         allow_host_net: false,
         auto_start: false,
