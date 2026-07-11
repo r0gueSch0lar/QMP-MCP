@@ -33,8 +33,8 @@ use super::event_buffer::{
 };
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
-    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, SHARE_MOUNT_TAG,
-    VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
+    Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec, SERIAL_CHARDEV_ID,
+    SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -114,6 +114,83 @@ pub struct ShareReport {
     pub mount_command: Option<String>,
     /// A human hint on how to use (or enable) the share.
     pub hint: String,
+}
+
+/// The read-only Serial Port report returned by the `get_serial` tool (ADR-0015). Advisory:
+/// it names the capture backend, the ring-buffer size, how `read_serial` behaves, and a
+/// best-effort guess of the guest console device — which the guest's own `console=` cmdline
+/// ultimately decides. Mirrors the TS `SerialReport`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialReport {
+    /// The capture backend carrying the Serial Port's output (`ringbuf`).
+    pub backend: String,
+    /// Ring-buffer size in bytes (`QMP_MCP_SERIAL_BUFFER_BYTES`).
+    pub buffer_bytes: u32,
+    /// How `read_serial` behaves: `drain` (ringbuf returns and clears new output).
+    pub read_semantics: String,
+    /// Whether writing to the console is enabled (always false in the read-only slice).
+    pub writable: bool,
+    /// Whether the current Instance has a Serial Port attached (`serial: true`).
+    pub enabled: bool,
+    /// Best-effort expected guest console device for the current machine, when known
+    /// (`ttyS0` on q35/pc, `ttyAMA0` on virt). Advisory only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console_device: Option<String>,
+    /// A hint on reading the Serial Port and setting the guest console.
+    pub hint: String,
+}
+
+/// The result of a `read_serial` drain (ADR-0015). Mirrors the TS `SerialReadResult`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialReadResult {
+    /// The serial output read and cleared (drained). Empty when nothing was buffered.
+    pub output: String,
+    /// Encoding of `output`: `utf8` (text) or `base64` (non-UTF8 early-boot bytes).
+    pub format: String,
+    /// Number of characters returned in `output`.
+    pub bytes: usize,
+}
+
+/// The encoding `read_serial` requests from QMP `ringbuf-read`. Defaults to `utf8`. Mirrors
+/// the TS `read_serial` `format` union.
+#[derive(
+    Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SerialFormat {
+    /// UTF-8 text (default).
+    #[default]
+    Utf8,
+    /// Base64 — for non-UTF8 bytes.
+    Base64,
+}
+
+impl SerialFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf8",
+            Self::Base64 => "base64",
+        }
+    }
+}
+
+/// Best-effort guess of the guest's serial console device for a machine (ADR-0015). Advisory
+/// only — the guest's own `console=` cmdline is authoritative. `None` for boards we cannot
+/// guess (incl. the `raspi*` two-UART case, which the hint covers). Mirrors the TS helper.
+fn guess_console_device(machine: &str) -> Option<&'static str> {
+    if machine.starts_with("q35")
+        || machine.starts_with("pc")
+        || machine.starts_with("microvm")
+        || machine.starts_with("isapc")
+    {
+        Some("ttyS0")
+    } else if machine.starts_with("virt") {
+        Some("ttyAMA0")
+    } else {
+        None
+    }
 }
 
 /// The result of a successful [`Orchestrator::create_instance`].
@@ -853,6 +930,62 @@ impl Orchestrator {
             .execute("query-cpus-fast", None)
             .await
             .map_err(|e| LifecycleError(e.0))
+    }
+
+    /// Drain the Serial Port's ring buffer via QMP `ringbuf-read`: returns the guest serial
+    /// output produced since the last read (the ring is destructive), up to `max_bytes`
+    /// (defaulting to the full buffer). Rejects when no Instance is running. Mirrors the TS
+    /// `Orchestrator.readSerial`.
+    pub async fn read_serial(
+        &self,
+        max_bytes: Option<u32>,
+        format: SerialFormat,
+    ) -> Result<SerialReadResult, LifecycleError> {
+        let size = max_bytes.unwrap_or(self.options.serial_buffer_bytes);
+        let value = self
+            .require_handle("read its Serial Port")?
+            .execute(
+                "ringbuf-read",
+                Some(serde_json::json!({
+                    "device": SERIAL_CHARDEV_ID,
+                    "size": size,
+                    "format": format.as_str(),
+                })),
+            )
+            .await
+            .map_err(|e| LifecycleError(e.0))?;
+        // QMP `ringbuf-read` returns the read data as a bare string.
+        let output = value.as_str().unwrap_or_default().to_string();
+        Ok(SerialReadResult {
+            bytes: output.chars().count(),
+            format: format.as_str().to_string(),
+            output,
+        })
+    }
+
+    /// Report the Serial Port configuration and a best-effort guest console-device guess
+    /// (`get_serial`, ADR-0015). Advisory and infallible — like `describe_share`, it reports
+    /// config even with no Instance running. Mirrors the TS `Orchestrator.describeSerial`.
+    pub fn describe_serial(&self) -> SerialReport {
+        let console_device = self
+            .spec
+            .as_ref()
+            .and_then(|s| guess_console_device(s.machine.as_str()))
+            .map(str::to_string);
+        let enabled = self.spec.as_ref().is_some_and(|s| s.serial);
+        SerialReport {
+            backend: "ringbuf".to_string(),
+            buffer_bytes: self.options.serial_buffer_bytes,
+            read_semantics: "drain".to_string(),
+            writable: false,
+            enabled,
+            console_device,
+            hint: "Set serial: true on create_instance to attach the Serial Port, then read its \
+                   output with read_serial (each read drains the ring buffer). The guest must use \
+                   the shown console device in its own console= kernel cmdline for output to appear; \
+                   raspi* boards have two UARTs and may need adjusting."
+                .to_string(),
+        }
     }
 
     /// Capture a screenshot of the Instance's display via QMP `screendump` and return

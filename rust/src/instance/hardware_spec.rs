@@ -1833,6 +1833,25 @@ mod tests {
     }
 
     #[test]
+    fn emits_serial_ringbuf_chardev_pair_at_the_operator_size() {
+        // ADR-0015: serial:true emits a ringbuf chardev of the operator size + a board-
+        // agnostic `-serial chardev:` that (after -nographic) wins the first UART.
+        let mut o = opts();
+        o.serial_buffer_bytes = 65536;
+        let argv = build_argv(&spec(json!({ "serial": true })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-chardev"),
+            "ringbuf,id=serialbuf,size=65536"
+        );
+        assert_eq!(value_after(&argv, "-serial"), "chardev:serialbuf");
+        assert!(index_of(&argv, "-nographic") < index_of(&argv, "-serial"));
+        // serial:false emits neither the chardev nor the -serial redirect.
+        let argv = build_argv(&spec(json!({})), &opts()).unwrap();
+        assert!(!argv.iter().any(|s| s == "-chardev"));
+        assert!(!argv.iter().any(|s| s == "-serial"));
+    }
+
+    #[test]
     fn emits_virtio_9p_share_read_only_and_refuses_on_raspi() {
         // share:true with no shareReadonly override => read-only (fail-closed).
         let mut o = opts();

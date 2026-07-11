@@ -1218,6 +1218,21 @@ mod tests {
     }
 
     #[test]
+    fn serial_buffer_bytes_defaults_1mib_and_requires_power_of_two() {
+        // ADR-0015: default 1 MiB; a non-power-of-two fails closed before launch.
+        assert_eq!(load_config(&env(&[])).unwrap().serial_buffer_bytes, 1 << 20);
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_SERIAL_BUFFER_BYTES", "65536")]))
+                .unwrap()
+                .serial_buffer_bytes,
+            65536
+        );
+        let e = load_config(&env(&[("QMP_MCP_SERIAL_BUFFER_BYTES", "100000")])).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_SERIAL_BUFFER_BYTES"));
+        assert!(e.0.contains("power-of-two"));
+    }
+
+    #[test]
     fn folder_sharing_defaults_and_reads() {
         let c = load_config(&env(&[])).unwrap();
         assert_eq!(c.host_share_dir, None);
