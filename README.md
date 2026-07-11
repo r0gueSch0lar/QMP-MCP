@@ -208,7 +208,7 @@ The agent's vocabulary — the actions it can take:
 | `create_instance` / `destroy_instance` | build & launch the Instance from a Hardware Spec / tear it down |
 | `get_instance` / `get_status` | the current Instance + lifecycle state / the live guest run state |
 | `get_share` | report the host↔guest folder-sharing config + the exact 9p mount command for the guest |
-| `get_serial` / `read_serial` | report the Serial Port capture config + guest console device / drain the Guest's serial output |
+| `get_serial` / `read_serial` / `write_serial` | report the Serial Port config + console device / drain the Guest's serial output / type input into the console (gated by `QMP_MCP_ALLOW_SERIAL_WRITE`) |
 | `pause_instance` / `resume_instance` | freeze / unfreeze the guest CPUs |
 | `reset_instance` / `powerdown_instance` | hard reset / request a graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks & backing media / per-CPU info |

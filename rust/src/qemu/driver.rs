@@ -324,6 +324,10 @@ impl InstanceHandle for FakeInstanceHandle {
             "query-block" => Ok(serde_json::json!([{ "device": "virtio0", "removable": false }])),
             "query-cpus-fast" => Ok(serde_json::json!([{ "cpu-index": 0, "target": "x86_64" }])),
             "query-version" => Ok(serde_json::json!({ "qemu": { "major": 9, "minor": 0 } })),
+            // Serial Port (ADR-0015): `ringbuf-read` returns the buffered console text (draining
+            // is not modelled), `ringbuf-write` types input in and returns QMP's empty success.
+            "ringbuf-read" => Ok(serde_json::json!("fake-serial-output")),
+            "ringbuf-write" => Ok(serde_json::json!({})),
             // `screendump` writes an arbitrary host file at the server-chosen path in
             // its `filename` argument; the fake writes a tiny PNG-ish blob there so the
             // Orchestrator can read it back, base64-encode it, and delete it.

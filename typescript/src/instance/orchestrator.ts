@@ -23,6 +23,7 @@ import {
   type PortRange,
   resolveAllowHostNet,
   resolveAllowRawArgs,
+  resolveAllowSerialWrite,
   resolveAllowShareWrite,
   resolveAutoStart,
   resolveEventBufferSize,
@@ -174,6 +175,11 @@ export interface OrchestratorOptions {
    * (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two). Threaded into the argv.
    */
   serialBufferBytes?: number;
+  /**
+   * Whether writing to the Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`, ADR-0015;
+   * default false). Gates the `write_serial` tool; the agent can never enable it.
+   */
+  allowSerialWrite?: boolean;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
@@ -396,7 +402,7 @@ export class Orchestrator {
       backend: 'ringbuf',
       bufferBytes: this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
       readSemantics: 'drain',
-      writable: false,
+      writable: this.#options.allowSerialWrite === true,
       enabled: this.#spec?.serial === true,
       consoleDevice: machine ? this.#guessConsoleDevice(machine) : undefined,
       hint:
@@ -443,6 +449,24 @@ export class Orchestrator {
     // QMP `ringbuf-read` returns the read data as a bare string.
     const output = typeof value === 'string' ? value : '';
     return { output, format, bytes: output.length };
+  }
+
+  /**
+   * Write raw bytes to the Guest Serial Port via QMP `ringbuf-write` — types `data` into the
+   * guest console (keyboard-equivalent input). Refused unless the operator enabled writing
+   * (`QMP_MCP_ALLOW_SERIAL_WRITE`); no auto-newline (the caller submits its own). Rejects when no
+   * Instance is running. Mirrors the Rust `write_serial`.
+   */
+  async writeSerial(data: string, format: 'utf8' | 'base64'): Promise<{ bytesWritten: number }> {
+    if (this.#options.allowSerialWrite !== true) {
+      throw new LifecycleError(
+        'Writing to the Serial Port is disabled. Set QMP_MCP_ALLOW_SERIAL_WRITE=true to enable ' +
+          'write_serial (it types raw input into the guest console).',
+      );
+    }
+    const process = this.#requireInstance('write to its Serial Port');
+    await process.execute('ringbuf-write', { device: SERIAL_CHARDEV_ID, data, format });
+    return { bytesWritten: [...data].length };
   }
 
   /**
@@ -911,6 +935,7 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   guestShareDir: resolveGuestShareDir(process.env),
   shareReadonly: !resolveAllowShareWrite(process.env),
   serialBufferBytes: resolveSerialBufferBytes(process.env),
+  allowSerialWrite: resolveAllowSerialWrite(process.env),
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),

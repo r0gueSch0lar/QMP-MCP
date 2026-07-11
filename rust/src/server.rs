@@ -28,7 +28,8 @@ use crate::instance::image_store::{
 };
 use crate::instance::iso_store::{IsoListing, IsoStore};
 use crate::instance::orchestrator::{
-    InstanceState, Orchestrator, SerialFormat, SerialReadResult, SerialReport, ShareReport,
+    InstanceState, Orchestrator, SerialFormat, SerialReadResult, SerialReport, SerialWriteResult,
+    ShareReport,
 };
 
 /// A compact, JSON-serialisable summary of a validated Hardware Spec, returned by
@@ -178,6 +179,18 @@ pub struct ReadSerialParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u32>,
     /// Output encoding: `utf8` (default) or `base64` for non-UTF8 bytes.
+    #[serde(default)]
+    pub format: SerialFormat,
+}
+
+/// Validated input for `write_serial`: the data to type into the console and its encoding.
+/// Mirrors the TS `write_serial` zod schema.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct WriteSerialParams {
+    /// Raw bytes to write to the guest console. No newline is appended — include `\n` to
+    /// submit a line.
+    pub data: String,
+    /// Encoding of `data`: `utf8` (default) or `base64`.
     #[serde(default)]
     pub format: SerialFormat,
 }
@@ -446,6 +459,29 @@ impl QmpMcpServer {
             .lock()
             .await
             .read_serial(params.max_bytes, params.format)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
+    }
+
+    /// Write raw bytes to the running Guest's Serial Port (QMP `ringbuf-write`) — types into the
+    /// guest console. Refused unless `QMP_MCP_ALLOW_SERIAL_WRITE=true`. Rejects when nothing runs.
+    #[tool(
+        description = "Type raw bytes into the running Guest's Serial Port console (QMP \
+                       ringbuf-write). DISABLED by default: the server must run with \
+                       QMP_MCP_ALLOW_SERIAL_WRITE=true, else this fails. Requires create_instance \
+                       serial: true. No newline is appended — include \\n in data to submit a line. \
+                       format is utf8 (default) or base64. Fails if no Instance is running."
+    )]
+    async fn write_serial(
+        &self,
+        Parameters(params): Parameters<WriteSerialParams>,
+    ) -> Result<Json<SerialWriteResult>, McpError> {
+        let result = self
+            .orchestrator
+            .lock()
+            .await
+            .write_serial(params.data, params.format)
             .await
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(Json(result))
@@ -792,6 +828,7 @@ mod tests {
             guest_share_dir: None,
             share_readonly: None,
             serial_buffer_bytes: 1 << 20,
+            allow_serial_write: false,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -907,6 +944,7 @@ mod tests {
             // Serial Port surface (ADR-0015).
             "get_serial",
             "read_serial",
+            "write_serial",
             // Image/ISO stores (this slice).
             "create_image",
             "list_images",
