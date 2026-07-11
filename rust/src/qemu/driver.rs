@@ -264,9 +264,9 @@ impl FakeInstanceHandle {
     ) -> Self {
         Self {
             // Starts NOT running, modelling QEMU's `-S` startup pause: the Guest is
-            // loaded but frozen until the first `cont` (resume_instance, or create's
-            // auto-start). So `query-status` reads `paused` right after create,
-            // matching the PAUSED lifecycle state the Orchestrator defaults to (#10).
+            // loaded but frozen until the first `cont` (create's auto-start by default,
+            // or resume_instance). So `query-status` reads `paused` until that `cont`;
+            // with auto-start off the Instance stays PAUSED (#10; ADR-0016).
             state: Mutex::new(FakeHandleState {
                 running: false,
                 closed: false,

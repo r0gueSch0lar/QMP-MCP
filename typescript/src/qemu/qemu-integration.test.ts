@@ -37,6 +37,9 @@ describe.skipIf(!qemuOnPath())('real QEMU lifecycle (TCG)', () => {
       // Force TCG so the test is deterministic regardless of host KVM.
       kvmAvailable: () => false,
       socketOccupied: async () => false,
+      // Pin auto-start OFF so this test exercises the create→PAUSED→resume→RUNNING
+      // lifecycle explicitly (production defaults auto-start ON — ADR-0016).
+      autoStart: false,
     });
   });
 
@@ -50,8 +53,8 @@ describe.skipIf(!qemuOnPath())('real QEMU lifecycle (TCG)', () => {
 
   it('create -> PAUSED under TCG, resume -> RUNNING, round-trips query-status, then destroy -> NONE', async () => {
     const created = await orchestrator.createInstance({ accel: 'tcg', memoryMb: 128, vcpus: 1 });
-    // Issue #10: create loads the Guest frozen at the -S startup pause, so it lands
-    // PAUSED (not RUNNING) until resume_instance issues QMP cont.
+    // Auto-start off (see beforeAll): create loads the Guest frozen at the -S startup
+    // pause, so it lands PAUSED (not RUNNING) until resume_instance issues QMP cont (issue #10).
     expect(created.state).toBe('PAUSED');
     expect(created.accel).toBe('tcg');
     expect(orchestrator.getInstance().state).toBe('PAUSED');

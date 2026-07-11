@@ -194,8 +194,9 @@ pub struct Config {
     /// false ⇒ read-only). The agent can never escalate to writable.
     pub allow_share_write: bool,
     /// When true, `create_instance` auto-starts the Guest by issuing QMP `cont`
-    /// right after launch (`QMP_MCP_AUTO_START`, issue #8). Default false: the Guest
-    /// loads paused at the `-S` startup pause and only runs on `resume_instance`.
+    /// right after launch (`QMP_MCP_AUTO_START`, issue #8; ADR-0016). Default TRUE:
+    /// the Guest starts active. Set false to load it paused at the `-S` startup pause
+    /// and run only on `resume_instance` — the deterministic inspect-before-run opt-out.
     pub auto_start: bool,
     /// Capacity of the Event Buffer (issue #12).
     pub event_buffer_size: u32,
@@ -624,7 +625,7 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_ALLOW_SHARE_WRITE"),
             false,
         )?,
-        auto_start: parse_boolean("QMP_MCP_AUTO_START", get(env, "QMP_MCP_AUTO_START"), false)?,
+        auto_start: parse_boolean("QMP_MCP_AUTO_START", get(env, "QMP_MCP_AUTO_START"), true)?,
         event_buffer_size: parse_positive_int(
             "QMP_MCP_EVENT_BUFFER_SIZE",
             get(env, "QMP_MCP_EVENT_BUFFER_SIZE"),
@@ -689,7 +690,7 @@ mod tests {
             host_share_dir: None,
             guest_share_dir: None,
             allow_share_write: false,
-            auto_start: false,
+            auto_start: true,
             event_buffer_size: 256,
             allow_raw_args: false,
             viewer_password: None,
@@ -1168,11 +1169,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_start_defaults_false_and_reads_true() {
-        // issue #8: create_instance leaves the Guest paused unless QMP_MCP_AUTO_START.
-        assert!(!load_config(&env(&[])).unwrap().auto_start);
+    fn auto_start_defaults_true_and_reads_false() {
+        // ADR-0016: create_instance auto-starts the Guest by default; QMP_MCP_AUTO_START=false
+        // opts into the paused-for-inspection start (issue #8/#10).
+        assert!(load_config(&env(&[])).unwrap().auto_start);
         assert!(
-            load_config(&env(&[("QMP_MCP_AUTO_START", "true")]))
+            !load_config(&env(&[("QMP_MCP_AUTO_START", "false")]))
                 .unwrap()
                 .auto_start
         );
