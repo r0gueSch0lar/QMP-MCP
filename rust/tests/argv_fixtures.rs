@@ -51,6 +51,10 @@ struct FixtureOptions {
     // Serial Port ring-buffer size (ADR-0015); omitted fixtures default to 1 MiB.
     #[serde(default)]
     serial_buffer_bytes: Option<u32>,
+    #[serde(default)]
+    serial_backend: Option<String>,
+    #[serde(default)]
+    serial_spool_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +156,12 @@ fn rust_generator_reproduces_the_shared_argv_corpus() {
             host_share_dir: fixture.options.host_share_dir.clone(),
             share_readonly: fixture.options.share_readonly,
             serial_buffer_bytes: fixture.options.serial_buffer_bytes.unwrap_or(1 << 20),
+            serial_backend: if fixture.options.serial_backend.as_deref() == Some("spool") {
+                qmp_mcp::config::SerialBackend::Spool
+            } else {
+                qmp_mcp::config::SerialBackend::Ringbuf
+            },
+            serial_spool_dir: fixture.options.serial_spool_dir.clone(),
             hostfwd_port_range: fixture.options.hostfwd_port_range.map(|r| PortRange {
                 low: r.low,
                 high: r.high,
