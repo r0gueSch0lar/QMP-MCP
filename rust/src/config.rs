@@ -125,6 +125,42 @@ impl AuthMode {
     }
 }
 
+/// The backend that carries the Guest Serial Port's output (ADR-0015). Operator-selected via
+/// `QMP_MCP_SERIAL_BACKEND`; drives both the argv (`-chardev`) and how `read_serial` behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SerialBackend {
+    /// In-QEMU `ringbuf` chardev, drained (destructively) over QMP `ringbuf-read` (default).
+    #[default]
+    Ringbuf,
+    /// Host file under the operator's `QMP_MCP_SERIAL_SPOOL_DIR`; read non-destructively (tail).
+    Spool,
+}
+
+impl SerialBackend {
+    const ALLOWED: &'static str = "ringbuf, spool";
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.to_lowercase().as_str() {
+            "ringbuf" => Some(Self::Ringbuf),
+            "spool" => Some(Self::Spool),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase spelling (reported by `get_serial`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ringbuf => "ringbuf",
+            Self::Spool => "spool",
+        }
+    }
+
+    /// Whether this backend writes to a host file and thus needs `QMP_MCP_SERIAL_SPOOL_DIR`.
+    pub fn is_spool(self) -> bool {
+        matches!(self, Self::Spool)
+    }
+}
+
 /// An inclusive `[low, high]` host-port range. A user-mode port-forward's
 /// `hostPort` must fall inside it (ADR-0009), so the agent can never bind an
 /// arbitrary or privileged host port.
@@ -211,6 +247,12 @@ pub struct Config {
     /// ADR-0015; default false ⇒ read-only). Gates the `write_serial` tool; the agent can
     /// never enable it.
     pub allow_serial_write: bool,
+    /// The Serial Port backend (`QMP_MCP_SERIAL_BACKEND`, ADR-0015): `ringbuf` (default, in-QEMU)
+    /// or `spool` (host file under `serial_spool_dir`).
+    pub serial_backend: SerialBackend,
+    /// Operator root directory for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`),
+    /// or `None`. Required when `serial_backend` is `spool` (validated at load).
+    pub serial_spool_dir: Option<String>,
     /// When true, a Hardware Spec's `extraArgs` are appended to the argv (ADR-0002).
     pub allow_raw_args: bool,
     /// The password gating the noVNC Viewer (ADR-0010), or `None` when unset.
@@ -544,6 +586,23 @@ pub fn resolve_host_share_dir(env: &EnvMap) -> Result<Option<String>, ConfigErro
     Ok(Some(value.to_string()))
 }
 
+/// Resolve `QMP_MCP_SERIAL_SPOOL_DIR` — the operator's absolute root directory that spool-backend
+/// Serial Port logs are written under (ADR-0015). A blank value reads as unset; a relative path is
+/// rejected. Mirrors the TS `resolveSerialSpoolDir`.
+pub fn resolve_serial_spool_dir(env: &EnvMap) -> Result<Option<String>, ConfigError> {
+    let value = match trimmed_non_empty(env, "QMP_MCP_SERIAL_SPOOL_DIR") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if !value.starts_with('/') {
+        return Err(ConfigError(format!(
+            "QMP_MCP_SERIAL_SPOOL_DIR must be an absolute path (got \"{value}\"). It is the host \
+             directory the Serial Port log is written under."
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Build a validated [`Config`] from an environment map. Returns a [`ConfigError`]
 /// on any invalid value, and — per ADR-0005 — when the HTTP transport is selected
 /// without configured auth and without an explicit insecure override.
@@ -616,6 +675,21 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         }
     }
 
+    let serial_backend = parse_enum(
+        "QMP_MCP_SERIAL_BACKEND",
+        get(env, "QMP_MCP_SERIAL_BACKEND"),
+        SerialBackend::ALLOWED,
+        SerialBackend::Ringbuf,
+        SerialBackend::parse,
+    )?;
+    let serial_spool_dir = resolve_serial_spool_dir(env)?;
+    if serial_backend.is_spool() && serial_spool_dir.is_none() {
+        return Err(ConfigError(
+            "QMP_MCP_SERIAL_BACKEND=spool requires QMP_MCP_SERIAL_SPOOL_DIR — the host directory \
+             the Serial Port log is written under."
+                .to_string(),
+        ));
+    }
     Ok(Config {
         transport,
         log_level,
@@ -676,6 +750,8 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
             get(env, "QMP_MCP_ALLOW_SERIAL_WRITE"),
             false,
         )?,
+        serial_backend,
+        serial_spool_dir,
         allow_raw_args: parse_boolean(
             "QMP_MCP_ALLOW_RAW_ARGS",
             get(env, "QMP_MCP_ALLOW_RAW_ARGS"),
@@ -739,6 +815,8 @@ mod tests {
             event_buffer_size: 256,
             serial_buffer_bytes: 1 << 20,
             allow_serial_write: false,
+            serial_backend: SerialBackend::Ringbuf,
+            serial_spool_dir: None,
             allow_raw_args: false,
             viewer_password: None,
             viewer_user: None,
@@ -1251,6 +1329,24 @@ mod tests {
                 .unwrap()
                 .allow_serial_write
         );
+    }
+
+    #[test]
+    fn serial_backend_defaults_ringbuf_and_spool_requires_dir() {
+        // ADR-0015: default ringbuf; the spool backend fails closed without a spool dir.
+        assert_eq!(
+            load_config(&env(&[])).unwrap().serial_backend,
+            SerialBackend::Ringbuf
+        );
+        let c = load_config(&env(&[
+            ("QMP_MCP_SERIAL_BACKEND", "spool"),
+            ("QMP_MCP_SERIAL_SPOOL_DIR", "/var/log/qmp-serial"),
+        ]))
+        .unwrap();
+        assert_eq!(c.serial_backend, SerialBackend::Spool);
+        assert_eq!(c.serial_spool_dir.as_deref(), Some("/var/log/qmp-serial"));
+        let e = load_config(&env(&[("QMP_MCP_SERIAL_BACKEND", "spool")])).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_SERIAL_SPOOL_DIR"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 import { accessSync, constants } from 'node:fs';
 import { z } from 'zod';
-import { DEFAULT_HOSTFWD_PORT_RANGE, type PortRange } from '../config.js';
+import { DEFAULT_HOSTFWD_PORT_RANGE, type PortRange, type SerialBackend } from '../config.js';
 import { IMAGE_FORMATS, ImageStoreError, resolveImagePath } from './image-store.js';
 import { IsoStoreError, resolveIsoPath } from './iso-store.js';
 
@@ -437,6 +437,14 @@ export const hardwareSpecSchema = z
           'the ring-buffer size is the operator QMP_MCP_SERIAL_BUFFER_BYTES. Read it with read_serial ' +
           '(each read drains the buffer); get_serial reports the expected guest console device.',
       ),
+    serialSpool: z
+      .string()
+      .optional()
+      .describe(
+        'Optional subdirectory name under QMP_MCP_SERIAL_SPOOL_DIR for the spool backend ' +
+          '(ADR-0015). Validated like a Store name; ignored (with a warning) unless the spool ' +
+          'backend is active. Never a host path.',
+      ),
     boot: z
       .string()
       .regex(VALID_BOOT_ORDER, bootOrderMessage)
@@ -684,6 +692,10 @@ export interface ArgvOptions {
    * `serial: true` (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two).
    */
   serialBufferBytes: number;
+  /** The Serial Port backend (ADR-0015): `ringbuf` emits a ringbuf chardev, `spool` a file chardev. */
+  serialBackend: SerialBackend;
+  /** Operator root for spool-backend Serial Port logs, required when `serialBackend` is 'spool'. */
+  serialSpoolDir?: string;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (`QMP_MCP_HOSTFWD_PORT_RANGE`). A forward outside it is rejected
@@ -852,13 +864,51 @@ function buildShareArgs(options: ArgvOptions, raspi: boolean, machine: string): 
  * per-UART device name — and the explicit `-serial` redirect wins over the `-nographic` console
  * mux. Mirrors the Rust `build_serial_args`.
  */
-function buildSerialArgs(options: ArgvOptions): string[] {
-  return [
-    '-chardev',
-    `ringbuf,id=${SERIAL_CHARDEV_ID},size=${options.serialBufferBytes}`,
-    '-serial',
-    `chardev:${SERIAL_CHARDEV_ID}`,
-  ];
+function buildSerialArgs(options: ArgvOptions, spec: HardwareSpec): string[] {
+  const chardev =
+    options.serialBackend === 'spool'
+      ? `file,id=${SERIAL_CHARDEV_ID},path=${escapeQemuOptsValue(
+          resolveSerialSpoolPath(options.serialSpoolDir, spec.serialSpool),
+        )}`
+      : `ringbuf,id=${SERIAL_CHARDEV_ID},size=${options.serialBufferBytes}`;
+  return ['-chardev', chardev, '-serial', `chardev:${SERIAL_CHARDEV_ID}`];
+}
+
+/**
+ * Resolve the spool-backend host log path: `<spoolDir>/<serialSpool>/serial.log`, or
+ * `<spoolDir>/serial.log` when no `serialSpool` is set (ADR-0015). The subdir is validated like a
+ * Store name (single component, no traversal), so it can never escape the operator root. Mirrors
+ * the Rust `resolve_serial_spool_path`.
+ */
+export function resolveSerialSpoolPath(
+  spoolDir: string | undefined,
+  serialSpool: string | undefined,
+): string {
+  if (spoolDir === undefined || spoolDir.trim() === '') {
+    throw new HardwareSpecError(
+      'Serial Port spool backend requires QMP_MCP_SERIAL_SPOOL_DIR to be configured.',
+    );
+  }
+  const parts = [spoolDir.replace(/\/+$/, '')];
+  if (serialSpool !== undefined) {
+    validateSerialSpoolName(serialSpool);
+    parts.push(serialSpool);
+  }
+  parts.push('serial.log');
+  return parts.join('/');
+}
+
+/**
+ * Validate a `serialSpool` subdirectory name (ADR-0015): the same charset as Image/ISO Store
+ * names, so it is a single component that cannot escape the operator root.
+ */
+function validateSerialSpoolName(name: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new HardwareSpecError(
+      `serialSpool "${name}" must match ^[A-Za-z0-9][A-Za-z0-9._-]* — a single subdirectory name ` +
+        "under QMP_MCP_SERIAL_SPOOL_DIR with no slash, '..', or leading dot (never a host path).",
+    );
+  }
 }
 
 /**
@@ -1096,7 +1146,7 @@ export function buildArgv(spec: HardwareSpec, options: ArgvOptions): string[] {
   // Serial Port capture (ADR-0015). The explicit `-serial chardev:` redirect binds the
   // machine's first UART and wins over the earlier `-nographic` console mux.
   if (spec.serial) {
-    argv.push(...buildSerialArgs(options));
+    argv.push(...buildSerialArgs(options, spec));
   }
   if (spec.boot !== undefined) {
     // boot is already allowlisted to [a-dnp]+ by the schema; emit the single

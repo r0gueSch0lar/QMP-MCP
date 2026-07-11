@@ -1,0 +1,19 @@
+{
+  "description": "Serial Port spool backend (ADR-0015): serial:true with QMP_MCP_SERIAL_BACKEND=spool emits a file chardev writing to <QMP_MCP_SERIAL_SPOOL_DIR>/<serialSpool>/serial.log. The spec's serialSpool names a validated subdir under the operator root (never a host path); truncate-per-boot. TCG.",
+  "spec": { "serial": true, "serialSpool": "ci-run" },
+  "options": { "accel": "tcg", "serialBackend": "spool", "serialSpoolDir": "/var/log/qmp-serial" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-chardev", "file,id=serialbuf,path=/var/log/qmp-serial/ci-run/serial.log",
+    "-serial", "chardev:serialbuf",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
