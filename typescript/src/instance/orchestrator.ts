@@ -94,8 +94,8 @@ export interface InstanceView {
 }
 
 /** The result of a successful {@link Orchestrator.createInstance}. `RUNNING` when
- * the Guest was auto-started (`QMP_MCP_AUTO_START`), else `PAUSED` (loaded, frozen
- * at `-S` until `resume_instance`). */
+ * the Guest was auto-started (`QMP_MCP_AUTO_START`, on by default — ADR-0016), else
+ * `PAUSED` (loaded, frozen at `-S` until `resume_instance`). */
 export interface CreateInstanceResult {
   state: 'RUNNING' | 'PAUSED';
   /** The validated Hardware Spec the Instance was built from. */
@@ -483,11 +483,11 @@ export class Orchestrator {
       this.#viewer = viewer;
       this.#spec = spec;
       this.#accel = resolution.accel;
-      // Auto-start (issues #8, #10) decides the lifecycle state create lands in.
-      // The Guest launches frozen at the `-S` startup pause; unless we resume it
-      // below it is NOT executing, so the honest lifecycle state is PAUSED — which
-      // agrees with get_status/query-status (the Guest reads paused/prelaunch until
-      // resume_instance). With QMP_MCP_AUTO_START on we `cont` it and land in RUNNING.
+      // Auto-start (issues #8, #10; default flipped in ADR-0016) decides the lifecycle
+      // state create lands in. The Guest always launches frozen at the `-S` startup
+      // pause; by default we `cont` it below (sub-second) and land in RUNNING. With
+      // QMP_MCP_AUTO_START=false we skip the `cont` and stay PAUSED — the honest state,
+      // agreeing with get_status/query-status (paused/prelaunch until resume_instance).
       const started = this.#options.autoStart === true;
       this.#state = started ? 'RUNNING' : 'PAUSED';
       this.#launchToken = undefined;
@@ -498,9 +498,10 @@ export class Orchestrator {
       // If the process exits on its own, reflect that the Instance is gone.
       void process.exited.then(() => this.#onProcessExit());
 
-      // When auto-start is on, resume the Guest now (QMP `cont`) so it begins
-      // executing; done AFTER event capture is wired so the boot's QMP events are
-      // recorded. Otherwise it stays PAUSED, frozen at `-S`, until resume_instance.
+      // When auto-start is on (the default), resume the Guest now (QMP `cont`) so it
+      // begins executing; done AFTER event capture is wired so the boot's QMP events
+      // are recorded. With auto-start off it stays PAUSED, frozen at `-S`, until
+      // resume_instance.
       if (started) {
         await process.execute('cont');
         logger.info(`Instance RUNNING (auto-started; ${resolution.reason})`);

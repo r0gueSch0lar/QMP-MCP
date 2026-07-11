@@ -29,6 +29,10 @@ function makeOrchestrator(
     qmpSocketPath: SOCK,
     kvmAvailable: () => false,
     socketOccupied: async () => false,
+    // Pin auto-start OFF for the lifecycle tests so create lands in a deterministic
+    // frozen (PAUSED) state; the `running()` helper overrides it. Production defaults
+    // auto-start ON (ADR-0016).
+    autoStart: false,
     ...options,
   });
 }
@@ -69,14 +73,14 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(s.mountCommand).not.toContain(',ro');
   });
 
-  it('create loads the Instance PAUSED by default (frozen at -S) and launches via the driver port (issue #10)', async () => {
+  it('create loads the Instance PAUSED when auto-start is off (frozen at -S) and launches via the driver port (issue #10)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver);
 
     const result = await orch.createInstance({ machine: 'q35', memoryMb: 128 });
 
-    // Default (no auto-start): the Guest is loaded but frozen at -S, so the honest
-    // lifecycle state is PAUSED — and get_status agrees (query-status: paused).
+    // Auto-start off (the inspect opt-out — ADR-0016): the Guest is loaded but frozen
+    // at -S, so the honest lifecycle state is PAUSED — and get_status agrees (paused).
     expect(result.state).toBe('PAUSED');
     expect(orch.getInstance().state).toBe('PAUSED');
     expect(await orch.getStatus()).toMatchObject({ running: false });
@@ -87,14 +91,14 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     expect(driver.launches[0]?.argv).toContain('-qmp');
   });
 
-  it('does NOT issue cont on create by default — the Guest stays paused (issue #8)', async () => {
+  it('does NOT issue cont on create when auto-start is off — the Guest stays paused (issue #8)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver);
     await orch.createInstance({});
     expect(driver.lastProcess?.executed.some((e) => e.command === 'cont')).toBe(false);
   });
 
-  it('auto-starts the Guest with a QMP cont on create when autoStart is set (issues #8, #10)', async () => {
+  it('auto-starts the Guest with a QMP cont on create when autoStart is on — the default (issues #8, #10; ADR-0016)', async () => {
     const driver = new FakeQemuDriver();
     const orch = makeOrchestrator(driver, { autoStart: true });
     const result = await orch.createInstance({});
@@ -168,7 +172,7 @@ describe('Orchestrator lifecycle (fake driver)', () => {
     await orch.createInstance({});
     await expect(orch.createInstance({})).rejects.toBeInstanceOf(LifecycleError);
     await expect(orch.createInstance({})).rejects.toThrow(/destroy_instance/);
-    // Still exactly one Instance (PAUSED by default — issue #10).
+    // Still exactly one Instance (PAUSED — auto-start off in these tests; issue #10).
     expect(orch.getInstance().state).toBe('PAUSED');
   });
 
@@ -345,7 +349,7 @@ describe('Orchestrator vnc Display + Viewer (fake driver, ADR-0010)', () => {
     expect(viewers[0]?.options.vncPort).toBe(5900);
     expect(viewers[0]?.options.password).toBe('human-secret');
     expect(viewers[0]?.options.vncPassword).toBe(vncPassword);
-    // The vnc Instance loads PAUSED by default like any other (issue #10).
+    // The vnc Instance loads PAUSED like any other when auto-start is off (issue #10).
     expect(orch.getInstance().state).toBe('PAUSED');
 
     await orch.destroyInstance();
