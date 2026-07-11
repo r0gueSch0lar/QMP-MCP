@@ -119,8 +119,8 @@ pub struct ShareReport {
 /// The result of a successful [`Orchestrator::create_instance`].
 #[derive(Debug, Clone)]
 pub struct CreateInstanceResult {
-    /// `RUNNING` when the Guest was auto-started (`QMP_MCP_AUTO_START`), else `PAUSED`
-    /// (loaded, frozen at `-S` until `resume_instance`) — issue #10.
+    /// `RUNNING` when the Guest was auto-started (`QMP_MCP_AUTO_START`, on by default —
+    /// ADR-0016), else `PAUSED` (loaded, frozen at `-S` until `resume_instance`).
     pub state: InstanceState,
     /// The validated Hardware Spec the Instance was built from.
     pub spec: HardwareSpec,
@@ -470,11 +470,12 @@ impl Orchestrator {
                 // so a stale watcher for a prior Instance can never clobber this one.
                 self.generation = self.generation.wrapping_add(1);
                 let generation = self.generation;
-                // Auto-start (issues #8, #10) decides the state create lands in. The
-                // Guest launches frozen at the `-S` startup pause; unless we resume it
-                // below it is NOT executing, so the honest state is PAUSED — which
-                // agrees with get_status/query-status (paused/prelaunch until
-                // resume_instance). With QMP_MCP_AUTO_START on we `cont` and land RUNNING.
+                // Auto-start (issues #8, #10; default flipped in ADR-0016) decides the
+                // state create lands in. The Guest always launches frozen at the `-S`
+                // startup pause; by default we `cont` it below (sub-second) and land
+                // RUNNING. With QMP_MCP_AUTO_START=false we skip the `cont` and stay
+                // PAUSED — the honest state, agreeing with get_status/query-status
+                // (paused/prelaunch until resume_instance).
                 let started = self.options.auto_start;
                 self.state = if started {
                     InstanceState::Running
@@ -482,9 +483,10 @@ impl Orchestrator {
                     InstanceState::Paused
                 };
                 self.spawn_exit_watcher(generation, exited);
-                // When auto-start is on, resume the Guest now (QMP `cont`) so it begins
-                // executing; done AFTER event capture is wired so the boot's events are
-                // recorded. Otherwise it stays PAUSED, frozen at `-S`, until resume.
+                // When auto-start is on (the default), resume the Guest now (QMP `cont`)
+                // so it begins executing; done AFTER event capture is wired so the boot's
+                // events are recorded. With auto-start off it stays PAUSED, frozen at
+                // `-S`, until resume_instance.
                 if started {
                     self.handle
                         .as_ref()
@@ -1160,9 +1162,10 @@ mod tests {
         assert!(!s.mount_command.unwrap().contains(",ro"));
     }
 
-    /// An Orchestrator with auto-start on, so `create_instance` lands in RUNNING —
-    /// the starting point for tests that exercise pause/resume/reset semantics on a
-    /// running Guest (issue #10; default create now lands in PAUSED).
+    /// An Orchestrator with auto-start explicit-on, so `create_instance` lands in
+    /// RUNNING — the starting point for tests that exercise pause/resume/reset on a
+    /// running Guest. (The `test_options` scaffolding pins auto-start OFF for a
+    /// deterministic frozen Guest; production defaults it ON — ADR-0016.)
     fn orchestrator_autostart(driver: FakeQemuDriver) -> Orchestrator {
         let mut options = test_options();
         options.auto_start = true;
@@ -1170,9 +1173,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_does_not_cont_by_default_guest_stays_paused() {
-        // issue #8: without auto-start, create must NOT issue `cont` — the Guest
-        // stays frozen at the `-S` startup pause until resume_instance.
+    async fn create_does_not_cont_when_auto_start_off_guest_stays_paused() {
+        // issue #8: with QMP_MCP_AUTO_START=false, create must NOT issue `cont` — the
+        // Guest stays frozen at the `-S` startup pause until resume_instance (ADR-0016
+        // opt-out). `test_options` pins auto-start off.
         let driver = FakeQemuDriver::new();
         let commands = driver.commands();
         let mut orch = orchestrator_with(driver);
@@ -1182,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_auto_starts_with_cont_when_enabled() {
-        // issue #8: with QMP_MCP_AUTO_START, create issues `cont` after launch.
+        // issue #8: with auto-start (the default — ADR-0016), create issues `cont` after launch.
         let driver = FakeQemuDriver::new();
         let commands = driver.commands();
         let mut options = test_options();
@@ -1646,7 +1650,7 @@ mod tests {
         assert!(msg.contains("An Instance already exists"), "got: {msg}");
         assert!(msg.contains("state PAUSED"), "got: {msg}");
         assert!(msg.contains("destroy_instance"), "got: {msg}");
-        // Still exactly one Instance (PAUSED by default — issue #10).
+        // Still exactly one Instance (PAUSED — auto-start off in these tests; issue #10).
         assert_eq!(orch.state(), InstanceState::Paused);
     }
 

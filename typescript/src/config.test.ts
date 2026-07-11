@@ -40,7 +40,7 @@ const DEFAULTS: Config = {
   hostShareDir: undefined,
   guestShareDir: undefined,
   allowShareWrite: false,
-  autoStart: false,
+  autoStart: true,
   eventBufferSize: 256,
   allowRawArgs: false,
   viewerPassword: undefined,
@@ -70,9 +70,9 @@ describe('loadConfig', () => {
     expect(loadConfig({ QMP_MCP_TRANSPORT: '' })).toEqual(DEFAULTS);
   });
 
-  it('reads QMP_MCP_AUTO_START (default false, opt-in true) — issue #8', () => {
-    expect(loadConfig({}).autoStart).toBe(false);
-    expect(loadConfig({ QMP_MCP_AUTO_START: 'true' }).autoStart).toBe(true);
+  it('reads QMP_MCP_AUTO_START (default true, opt-out false) — issue #8/#10; ADR-0016', () => {
+    expect(loadConfig({}).autoStart).toBe(true);
+    expect(loadConfig({ QMP_MCP_AUTO_START: 'false' }).autoStart).toBe(false);
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

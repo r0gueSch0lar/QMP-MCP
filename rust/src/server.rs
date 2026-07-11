@@ -306,10 +306,10 @@ impl QmpMcpServer {
     #[tool(
         description = "Build and launch the single managed QEMU Instance from a Hardware Spec and \
                        negotiate its QMP session. Reports the chosen accelerator (KVM or TCG). \
-                       Rejected if an Instance already exists — destroy it first. The Guest loads \
-                       PAUSED (CPUs frozen at the -S startup pause for inspection) — call \
-                       resume_instance to start it, unless the server runs with \
-                       QMP_MCP_AUTO_START=true (then it auto-starts)."
+                       Rejected if an Instance already exists — destroy it first. The Guest \
+                       auto-starts to RUNNING by default; run the server with \
+                       QMP_MCP_AUTO_START=false to load it PAUSED (CPUs frozen at the -S startup \
+                       pause for inspection) and start it later with resume_instance."
     )]
     async fn create_instance(
         &self,
