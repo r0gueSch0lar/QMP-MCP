@@ -153,6 +153,14 @@ pub struct SerialReadResult {
     pub bytes: usize,
 }
 
+/// The result of a `write_serial` (ADR-0015). Mirrors the TS `SerialWriteResult`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialWriteResult {
+    /// Number of characters written to the console.
+    pub bytes_written: usize,
+}
+
 /// The encoding `read_serial` requests from QMP `ringbuf-read`. Defaults to `utf8`. Mirrors
 /// the TS `read_serial` `format` union.
 #[derive(
@@ -255,6 +263,9 @@ pub struct OrchestratorOptions {
     /// Serial Port ring-buffer size in bytes when a spec sets `serial: true`
     /// (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two). Passed to the argv generator.
     pub serial_buffer_bytes: u32,
+    /// Whether writing to the Serial Port is enabled (`QMP_MCP_ALLOW_SERIAL_WRITE`, ADR-0015;
+    /// default false). Gates the `write_serial` tool; the agent can never enable it.
+    pub allow_serial_write: bool,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -963,6 +974,37 @@ impl Orchestrator {
         })
     }
 
+    /// Write raw bytes to the Guest Serial Port via QMP `ringbuf-write` — types `data` into the
+    /// guest console (keyboard-equivalent input). Refused unless the operator enabled writing
+    /// (`QMP_MCP_ALLOW_SERIAL_WRITE`); no auto-newline (the caller submits its own). Rejects when
+    /// no Instance is running. Mirrors the TS `Orchestrator.writeSerial`.
+    pub async fn write_serial(
+        &self,
+        data: String,
+        format: SerialFormat,
+    ) -> Result<SerialWriteResult, LifecycleError> {
+        if !self.options.allow_serial_write {
+            return Err(LifecycleError(
+                "Writing to the Serial Port is disabled. Set QMP_MCP_ALLOW_SERIAL_WRITE=true to \
+                 enable write_serial (it types raw input into the guest console)."
+                    .to_string(),
+            ));
+        }
+        let bytes_written = data.chars().count();
+        self.require_handle("write to its Serial Port")?
+            .execute(
+                "ringbuf-write",
+                Some(serde_json::json!({
+                    "device": SERIAL_CHARDEV_ID,
+                    "data": data,
+                    "format": format.as_str(),
+                })),
+            )
+            .await
+            .map_err(|e| LifecycleError(e.0))?;
+        Ok(SerialWriteResult { bytes_written })
+    }
+
     /// Report the Serial Port configuration and a best-effort guest console-device guess
     /// (`get_serial`, ADR-0015). Advisory and infallible — like `describe_share`, it reports
     /// config even with no Instance running. Mirrors the TS `Orchestrator.describeSerial`.
@@ -977,7 +1019,7 @@ impl Orchestrator {
             backend: "ringbuf".to_string(),
             buffer_bytes: self.options.serial_buffer_bytes,
             read_semantics: "drain".to_string(),
-            writable: false,
+            writable: self.options.allow_serial_write,
             enabled,
             console_device,
             hint: "Set serial: true on create_instance to attach the Serial Port, then read its \
@@ -1241,6 +1283,7 @@ mod tests {
             guest_share_dir: None,
             share_readonly: None,
             serial_buffer_bytes: 1 << 20,
+            allow_serial_write: false,
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -1333,6 +1376,55 @@ mod tests {
         let result = orch.create_instance(json!({})).await.expect("create");
         assert_eq!(result.state, InstanceState::Running);
         assert!(commands.lock().unwrap().iter().any(|c| c == "cont"));
+    }
+
+    #[tokio::test]
+    async fn write_serial_gated_by_allow_serial_write_and_read_serial_drains() {
+        // ADR-0015: write is refused by default (read-only), naming the env var, no ringbuf-write.
+        let driver = FakeQemuDriver::new();
+        let commands = driver.commands();
+        let mut orch = orchestrator_with(driver);
+        orch.create_instance(json!({ "serial": true }))
+            .await
+            .expect("create");
+        assert!(!orch.describe_serial().writable);
+        let e = orch
+            .write_serial("id\n".to_string(), SerialFormat::Utf8)
+            .await
+            .unwrap_err();
+        assert!(e.0.contains("QMP_MCP_ALLOW_SERIAL_WRITE"));
+        assert!(!commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "ringbuf-write"));
+        // read_serial drains the ring buffer (ringbuf-read).
+        let r = orch
+            .read_serial(None, SerialFormat::Utf8)
+            .await
+            .expect("read");
+        assert_eq!(r.output, "fake-serial-output");
+
+        // With QMP_MCP_ALLOW_SERIAL_WRITE the write is issued (ringbuf-write).
+        let driver = FakeQemuDriver::new();
+        let commands = driver.commands();
+        let mut options = test_options();
+        options.allow_serial_write = true;
+        let mut orch = Orchestrator::new(Box::new(driver), options);
+        orch.create_instance(json!({ "serial": true }))
+            .await
+            .expect("create");
+        assert!(orch.describe_serial().writable);
+        let w = orch
+            .write_serial("id\n".to_string(), SerialFormat::Utf8)
+            .await
+            .expect("write");
+        assert_eq!(w.bytes_written, 3);
+        assert!(commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "ringbuf-write"));
     }
 
     use crate::viewer::ViewerError;
