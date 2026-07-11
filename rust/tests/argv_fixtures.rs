@@ -48,6 +48,9 @@ struct FixtureOptions {
     host_share_dir: Option<String>,
     #[serde(default)]
     share_readonly: Option<bool>,
+    // Serial Port ring-buffer size (ADR-0015); omitted fixtures default to 1 MiB.
+    #[serde(default)]
+    serial_buffer_bytes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +151,7 @@ fn rust_generator_reproduces_the_shared_argv_corpus() {
             iso_dir: Some(iso.path.to_string_lossy().into_owned()),
             host_share_dir: fixture.options.host_share_dir.clone(),
             share_readonly: fixture.options.share_readonly,
+            serial_buffer_bytes: fixture.options.serial_buffer_bytes.unwrap_or(1 << 20),
             hostfwd_port_range: fixture.options.hostfwd_port_range.map(|r| PortRange {
                 low: r.low,
                 high: r.high,

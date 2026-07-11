@@ -19,6 +19,7 @@ import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  DEFAULT_SERIAL_BUFFER_BYTES,
   type PortRange,
   resolveAllowHostNet,
   resolveAllowRawArgs,
@@ -33,6 +34,7 @@ import {
   resolveMaxMemoryMb,
   resolveMaxVcpus,
   resolveQemuBinaryOverride,
+  resolveSerialBufferBytes,
   resolveViewerHost,
   resolveViewerPassword,
   resolveViewerPort,
@@ -69,6 +71,7 @@ import {
   qemuArchOfBinary,
   qemuBinaryForMachine,
   resolveAccel,
+  SERIAL_CHARDEV_ID,
   SHARE_MOUNT_TAG,
   VNC_LOOPBACK_HOST,
   VNC_LOOPBACK_PORT,
@@ -166,6 +169,11 @@ export interface OrchestratorOptions {
    * operator set `QMP_MCP_ALLOW_SHARE_WRITE`). Threaded into the argv fail-closed.
    */
   shareReadonly?: boolean;
+  /**
+   * Serial Port ring-buffer size in bytes when a spec sets `serial: true`
+   * (`QMP_MCP_SERIAL_BUFFER_BYTES`, ADR-0015; power-of-two). Threaded into the argv.
+   */
+  serialBufferBytes?: number;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
@@ -370,6 +378,74 @@ export class Orchestrator {
   }
 
   /**
+   * Report the Serial Port configuration and a best-effort guest console-device guess
+   * (`get_serial`, ADR-0015). Advisory — like {@link describeShare}, it reports config even
+   * with no Instance running. Mirrors the Rust `describe_serial`.
+   */
+  describeSerial(): {
+    backend: string;
+    bufferBytes: number;
+    readSemantics: string;
+    writable: boolean;
+    enabled: boolean;
+    consoleDevice: string | undefined;
+    hint: string;
+  } {
+    const machine = this.#spec?.machine;
+    return {
+      backend: 'ringbuf',
+      bufferBytes: this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
+      readSemantics: 'drain',
+      writable: false,
+      enabled: this.#spec?.serial === true,
+      consoleDevice: machine ? this.#guessConsoleDevice(machine) : undefined,
+      hint:
+        'Set serial: true on create_instance to attach the Serial Port, then read its output with ' +
+        'read_serial (each read drains the ring buffer). The guest must use the shown console device ' +
+        'in its own console= kernel cmdline for output to appear; raspi* boards have two UARTs and ' +
+        'may need adjusting.',
+    };
+  }
+
+  /**
+   * Best-effort guess of the guest serial console device for a machine (ADR-0015). Advisory
+   * only — the guest's own `console=` cmdline is authoritative. Mirrors the Rust helper.
+   */
+  #guessConsoleDevice(machine: string): string | undefined {
+    if (
+      machine.startsWith('q35') ||
+      machine.startsWith('pc') ||
+      machine.startsWith('microvm') ||
+      machine.startsWith('isapc')
+    ) {
+      return 'ttyS0';
+    }
+    if (machine.startsWith('virt')) return 'ttyAMA0';
+    return undefined;
+  }
+
+  /**
+   * Drain the Serial Port's ring buffer via QMP `ringbuf-read`: returns the guest serial
+   * output produced since the last read (destructive), up to `maxBytes` (default the full
+   * buffer). Rejects when no Instance is running. Mirrors the Rust `read_serial`.
+   */
+  async readSerial(
+    maxBytes: number | undefined,
+    format: 'utf8' | 'base64',
+  ): Promise<{ output: string; format: string; bytes: number }> {
+    const process = this.#requireInstance('read its Serial Port');
+    const size = maxBytes ?? this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES;
+    const value = await process.execute('ringbuf-read', {
+      device: SERIAL_CHARDEV_ID,
+      size,
+      format,
+    });
+    // QMP `ringbuf-read` returns the read data as a bare string.
+    const output = typeof value === 'string' ? value : '';
+    return { output, format, bytes: output.length };
+  }
+
+  /**
    * Build and launch a new Instance from an untrusted candidate Hardware Spec,
    * negotiate its QMP Session, and bring it to `RUNNING`. Rejects when an
    * Instance already exists or the QMP socket path is occupied.
@@ -435,6 +511,7 @@ export class Orchestrator {
         isoDir: this.#options.isoDir,
         hostShareDir: this.#options.hostShareDir,
         shareReadonly: this.#options.shareReadonly,
+        serialBufferBytes: this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
         hostfwdPortRange: this.#options.hostfwdPortRange,
         allowHostNet: this.#options.allowHostNet,
         maxMemoryMb: this.#options.maxMemoryMb,
@@ -833,6 +910,7 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   hostShareDir: resolveHostShareDir(process.env),
   guestShareDir: resolveGuestShareDir(process.env),
   shareReadonly: !resolveAllowShareWrite(process.env),
+  serialBufferBytes: resolveSerialBufferBytes(process.env),
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),

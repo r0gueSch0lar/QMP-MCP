@@ -67,3 +67,14 @@ The optional noVNC browser bridge over a Guest's VNC Display, started and stoppe
 the server for the lifetime of a `display: vnc` Instance. Reads the Display only —
 never the QMP Session — and is fail-closed behind its own password.
 _Avoid_: console, GUI, web UI, VNC server
+
+**Serial Port**:
+The Guest's emulated serial line, attached on demand (`serial: true`). One of two
+operator-selected backends (`QMP_MCP_SERIAL_BACKEND`) carries its output: **ringbuf** — a
+bounded QEMU `ringbuf` chardev the server drains over QMP with `ringbuf-read` (ephemeral;
+deliberately QEMU's own buffer, not a server-side one — contrast the Event Buffer); or
+**spool** — a host file under the operator's `QMP_MCP_SERIAL_SPOOL_DIR` root, placed in a
+per-Instance subdirectory the spec may name (validated like an Image/ISO Store name, never a
+raw host path). Its content is the Guest's serial console output; read-only by default,
+writable (ringbuf only) behind an operator env gate. Portable: a plain QEMU feature.
+_Avoid_: serial console (as a standalone term), COM port, tty, ring buffer (that is the Event Buffer)
