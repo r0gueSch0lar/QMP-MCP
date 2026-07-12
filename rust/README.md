@@ -77,7 +77,7 @@ The HTTP transport is **fail-closed**: no credentials, no start — unless you s
 
 ## Docker
 
-The image is a cargo-chef multi-stage build onto a slim `debian:bookworm-slim` runtime
+The image is a cargo-chef multi-stage build onto a slim `debian:trixie-slim` runtime
 with QEMU, running as a non-root user and defaulting to the HTTP transport bound to all
 interfaces. Because the viewer assets are embedded in the binary, the runtime image
 copies exactly one file — the compiled server. It's tagged distinctly from the

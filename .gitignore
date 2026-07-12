@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .npm/
+.pnpm-store/
 *.log
 *.tsbuildinfo
 

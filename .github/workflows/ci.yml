@@ -50,16 +50,19 @@ jobs:
         working-directory: typescript
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: typescript/package-lock.json
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - run: pnpm run build
       - uses: actions/upload-artifact@v7
         with:
           name: typescript-dist
@@ -153,9 +156,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           registry-url: 'https://registry.npmjs.org'
       - name: Publish (skips when NPM_TOKEN is unset)
         working-directory: typescript
@@ -163,11 +169,11 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN secret not set — skipping npm publish."
+            echo "NPM_TOKEN secret not set — skipping the publish to npm."
             exit 0
           fi
-          npm ci
-          npm publish
+          pnpm install --frozen-lockfile
+          pnpm publish --no-git-checks
 
   # A single aggregate check for branch protection: green unless one of the gate
   # jobs actually failed (a change-scoped job that was *skipped* is fine). Require

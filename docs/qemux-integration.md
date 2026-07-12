@@ -133,7 +133,7 @@ surface.
 
 | Axis | Purpose-built slim (today) | qemux-derived |
 | --- | --- | --- |
-| Image size / leanness | `debian:bookworm-slim` + `qemu-system` (all archs, so any guest the spec supports), `qemu-utils`, Node, prod deps — no unused runtime cruft. | Heavier: also noVNC, websockets, passt, Python + `qemu.qmp`, qemux scripts — much of it unused if the entrypoint is overridden. |
+| Image size / leanness | `debian:trixie-slim` + `qemu-system` (all archs, so any guest the spec supports), `qemu-utils`, Node, prod deps — no unused runtime cruft. | Heavier: also noVNC, websockets, passt, Python + `qemu.qmp`, qemux scripts — much of it unused if the entrypoint is overridden. |
 | Control / reproducibility | We own every layer and the `ENTRYPOINT`; build is deterministic from our lockfile + apt. | We inherit upstream's layers, scripts, and update cadence; our build tracks an external image. |
 | Version pinning | We pin Debian + the qemu packages directly. | QEMU version is whatever qemux/Debian trixie ships; pinning means pinning an upstream tag and trusting its contents. |
 | Attack surface | Only what the server launches and probes. Non-root, no `NET_ADMIN`, user-mode net. | Adds a network-listening viewer (8006), websockets, an interpreter, download/fetch tooling, and root-leaning defaults — all to suppress, not use. |
