@@ -25,9 +25,11 @@
 # distributable production image.
 
 # ── Chef base: the Rust toolchain + cargo-chef ──────────────────────────────────
-# `rust:1-bookworm` matches the dev toolchain (1.96) and the CI fmt/clippy/test
-# image, so the image builds with the exact compiler the checks ran against.
-FROM rust:1-bookworm AS chef
+# `rust:1-trixie` pins the latest stable 1.x compiler on Debian trixie, matching
+# the runtime stage's glibc so the binary is built and run against the same libc
+# (no forward-compat gap). CI runs fmt/clippy/test via `dtolnay/rust-toolchain@stable`,
+# i.e. the same stable channel this image tracks.
+FROM rust:1-trixie AS chef
 # `--locked` installs cargo-chef against its own pinned lockfile for a reproducible
 # planner/cook toolchain. cargo-chef splits dependency compilation from the app
 # build so the (slow) dependency layer caches until Cargo.toml/Cargo.lock change.
@@ -53,7 +55,9 @@ COPY . .
 RUN cargo build --release --bin qmp-mcp
 
 # ── Runtime: slim Debian + QEMU, non-root ────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+# Debian trixie (13) ships QEMU 10.0.x, well clear of the deprecations audited in
+# issue #31 (7.2 → 11). Still distro-packaged QEMU, not source-built (ADR-0007).
+FROM debian:trixie-slim AS runtime
 
 # QEMU full-system emulators (all architectures) + qemu-img, from Debian. The
 # `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,

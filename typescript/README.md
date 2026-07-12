@@ -8,7 +8,8 @@ TypeScript variant.
 
 ## Requirements
 
-- **Node 20+**
+- **Node 22+** (with **pnpm** as the package manager — pinned via package.json `packageManager`;
+  run `corepack enable` once and it's activated automatically)
 - **QEMU** on your `PATH` at runtime — the emulator is picked from the spec's `machine`
   (`qemu-system-x86_64`, `qemu-system-aarch64` for ARM/raspi, …; override with
   `QMP_MCP_QEMU_BINARY`), plus `qemu-img`.
@@ -19,8 +20,8 @@ From a checkout of this repo:
 
 ```bash
 cd typescript
-npm ci
-npm run build          # compiles to dist/
+pnpm install           # or: corepack enable && pnpm install
+pnpm build             # compiles to dist/
 node dist/index.js     # an MCP server over stdio
 ```
 
@@ -115,11 +116,11 @@ local, uncommitted convenience). The scripts:
 
 ```bash
 cd typescript
-npm ci
-npm run lint          # biome
-npm run typecheck     # tsc --noEmit
-npm test              # vitest
-npm run build         # tsc -> dist/
+pnpm install          # pnpm is pinned via package.json "packageManager"; corepack activates it
+pnpm lint             # biome
+pnpm typecheck        # tsc --noEmit
+pnpm test             # vitest
+pnpm build            # tsc -> dist/
 ```
 
 The test suite includes the cross-implementation parity tests in `test/`, which assert

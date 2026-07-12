@@ -1,9 +1,10 @@
 # Keep the build context small and reproducible: dependencies and build output are
-# regenerated inside the image (npm ci + npm run build), never copied from the host.
+# regenerated inside the image (pnpm install + pnpm run build), never copied from the host.
 node_modules
 dist
 coverage
 .npm
+.pnpm-store
 *.log
 *.tsbuildinfo
 
