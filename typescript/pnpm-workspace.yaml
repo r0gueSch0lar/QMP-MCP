@@ -1,0 +1,8 @@
+# pnpm project settings. pnpm 11 moved these out of package.json's "pnpm" field
+# into this file (https://pnpm.io/settings), even for a single-package repo.
+#
+# pnpm blocks dependency build/postinstall scripts by default as a supply-chain
+# safeguard; `allowBuilds` opts in the ones we vet. esbuild (pulled in by vitest/
+# vite) needs its postinstall to link the platform-specific binary.
+allowBuilds:
+  esbuild: true

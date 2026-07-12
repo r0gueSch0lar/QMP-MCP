@@ -11,22 +11,31 @@
 # distributable production image.
 
 # ── Build stage: compile TypeScript -> dist/ ────────────────────────────────────
-FROM node:20-bookworm-slim AS build
+# Node 22 LTS on Debian trixie (13). Trixie ships QEMU 10.0.x for the runtime stage
+# (issue #31, 7.2 → 11 audit); Node 22 replaces the now-EOL Node 20.
+FROM node:22-trixie-slim AS build
 WORKDIR /app
+
+# Activate pnpm via corepack, pinned by the `packageManager` field in package.json.
+RUN corepack enable
 
 # Install ALL dependencies (including the dev toolchain) from the lockfile for a
 # reproducible build. Copy only the manifests first so this layer caches until the
-# dependency set actually changes.
-COPY package.json package-lock.json ./
-RUN npm ci
+# dependency set actually changes. pnpm-workspace.yaml carries the `allowBuilds`
+# opt-in without which pnpm's pre-script deps check fails on esbuild's build script.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
 
 # Compile the server (tsc -> dist/). Only the inputs the build needs are copied.
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN pnpm run build
 
 # ── Runtime stage: QEMU + Node, production deps only, non-root ───────────────────
-FROM node:20-bookworm-slim AS runtime
+# Same base as the build stage: Node 22 LTS on Debian trixie, whose `qemu-system`
+# metapackage provides QEMU 10.0.x (issue #31). Still distro QEMU, not source-built
+# (ADR-0007).
+FROM node:22-trixie-slim AS runtime
 
 # QEMU full-system emulators (all architectures) + qemu-img, from Debian. The
 # `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,
@@ -42,10 +51,14 @@ RUN apt-get update \
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Activate pnpm via corepack (pinned by the `packageManager` field), matching the
+# build stage's toolchain.
+RUN corepack enable
+
 # Production dependencies ONLY — the dev toolchain (tsc, vitest, biome) never ships
 # in the runtime image. The lockfile pins the same versions resolved at build time.
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --prod --frozen-lockfile
 
 # The compiled server. package.json is already present above, so the runtime
 # version lookup (`../package.json` relative to dist/index.js) resolves correctly.
