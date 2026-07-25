@@ -18,13 +18,18 @@
 //! launch-token bookkeeping the single-threaded-async TypeScript port needs is not
 //! required here.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::config::{PortRange, SerialBackend};
 
@@ -33,8 +38,9 @@ use super::event_buffer::{
 };
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
-    resolve_serial_spool_path, Accel, AccelResolution, ArgvOptions, DisplayMode, HardwareSpec,
-    SERIAL_CHARDEV_ID, SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
+    resolve_serial_spool_path, serial_socket_path, Accel, AccelResolution, ArgvOptions,
+    DisplayMode, HardwareSpec, SERIAL_CHARDEV_ID, SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST,
+    VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -364,6 +370,11 @@ pub struct Orchestrator {
     command_policy: ResolvedPolicy,
     state: InstanceState,
     handle: Option<Box<dyn InstanceHandle>>,
+    /// The socket-backend Serial Port bridge (ADR-0015): a live UNIX-socket connection to
+    /// QEMU's `serial` chardev plus the reader task draining it into a bounded ring. Present
+    /// only while a `serial: true` Instance runs under `QMP_MCP_SERIAL_BACKEND=socket`; torn
+    /// down with the Instance. `None` for the ringbuf/spool backends.
+    serial_bridge: Option<SerialBridge>,
     spec: Option<HardwareSpec>,
     accel: Option<Accel>,
     /// The running noVNC Viewer for a `display: vnc` Instance, if any (ADR-0010). Its
@@ -425,6 +436,7 @@ impl Orchestrator {
             command_policy,
             state: InstanceState::None,
             handle: None,
+            serial_bridge: None,
             spec: None,
             accel: None,
             viewer: None,
@@ -538,7 +550,7 @@ impl Orchestrator {
         // TOCTOU is structurally impossible (ADR-0011).
         self.state = InstanceState::Starting;
         match self.launch_instance(candidate).await {
-            Ok((spec, resolution, handle)) => {
+            Ok((spec, resolution, handle, serial_bridge)) => {
                 // For a vnc Display, arm the Display password over QMP and start the
                 // Viewer BEFORE publishing the Instance as RUNNING, so any failure tears
                 // the launched qemu down and leaves state NONE (fail-closed, ADR-0010).
@@ -546,6 +558,11 @@ impl Orchestrator {
                     match self.arm_display(handle.as_ref()).await {
                         Ok(viewer) => Some(viewer),
                         Err(err) => {
+                            // The serial bridge was attached during launch; tear it down too
+                            // so a Viewer failure leaves nothing running (fail-closed).
+                            if let Some(bridge) = serial_bridge {
+                                teardown_serial_bridge(bridge).await;
+                            }
                             let _ = handle.close().await;
                             self.state = InstanceState::None;
                             return Err(err);
@@ -563,6 +580,7 @@ impl Orchestrator {
                 // exit-watch task awaits it to reconcile an unexpected qemu exit to NONE.
                 let exited = handle.exited();
                 self.handle = Some(handle);
+                self.serial_bridge = serial_bridge;
                 self.viewer = viewer;
                 self.spec = Some(spec.clone());
                 self.accel = Some(resolution.accel);
@@ -625,7 +643,15 @@ impl Orchestrator {
     async fn launch_instance(
         &self,
         candidate: serde_json::Value,
-    ) -> Result<(HardwareSpec, AccelResolution, Box<dyn InstanceHandle>), LifecycleError> {
+    ) -> Result<
+        (
+            HardwareSpec,
+            AccelResolution,
+            Box<dyn InstanceHandle>,
+            Option<SerialBridge>,
+        ),
+        LifecycleError,
+    > {
         let spec = parse_hardware_spec(candidate).map_err(|e| LifecycleError(e.0))?;
         // Fail-closed coupling (ADR-0010): a vnc Display starts the browser Viewer,
         // which cannot serve without QMP_MCP_VIEWER_PASSWORD. Refuse BEFORE spawning
@@ -676,6 +702,20 @@ impl Orchestrator {
                 spec.serial
             );
         }
+        // Socket-backend Serial Port (ADR-0015): refuse-on-occupied, symmetric to the QMP
+        // socket's own check (real_driver). A leftover serial.sock means a stale or foreign
+        // owner in the server's runtime dir; refuse with an actionable message rather than let
+        // QEMU's server `bind()` fail obscurely with EADDRINUSE (surfaced only as a spawn error).
+        if spec.serial && self.options.serial_backend.is_socket() {
+            let serial_path = serial_socket_path(&self.options.qmp_socket_path);
+            if tokio::fs::symlink_metadata(&serial_path).await.is_ok() {
+                return Err(LifecycleError(format!(
+                    "The Serial Port socket path {serial_path} is already occupied — refusing to \
+                     start rather than clobber or adopt a process this server did not launch. \
+                     Remove the stale socket (or stop the other process), then retry."
+                )));
+            }
+        }
         tracing::info!(
             "creating Instance (machine={}, accel={})",
             spec.machine.as_str(),
@@ -690,7 +730,33 @@ impl Orchestrator {
             })
             .await
             .map_err(|e| LifecycleError(format!("Failed to create the Instance: {}", e.0)))?;
-        Ok((spec, resolution, handle))
+        // Socket-backend Serial Port (ADR-0015): dial QEMU's listening serial socket and
+        // start the reader NOW — before create_instance issues `cont` — so the guest's boot
+        // output is captured from the first byte. Fail-closed: a bridge that will not connect
+        // tears the just-launched qemu down rather than leaving a half-wired Instance.
+        let serial_bridge = if spec.serial && self.options.serial_backend.is_socket() {
+            match attach_serial_bridge(
+                &self.options.qmp_socket_path,
+                self.options.serial_buffer_bytes,
+            )
+            .await
+            {
+                Ok(bridge) => Some(bridge),
+                Err(err) => {
+                    let _ = handle.close().await;
+                    // Belt-and-suspenders: a SIGKILLed qemu would leave its serial.sock behind
+                    // (a clean SIGTERM exit removes it), which the refuse-guard above would then
+                    // trip on next create — so unlink it on this failure path too.
+                    let _ =
+                        tokio::fs::remove_file(serial_socket_path(&self.options.qmp_socket_path))
+                            .await;
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+        Ok((spec, resolution, handle, serial_bridge))
     }
 
     /// Assemble the [`ArgvOptions`] the pure argv generator needs from this slice's
@@ -784,6 +850,11 @@ impl Orchestrator {
             .take()
             .expect("handle present in a non-NONE state");
         let viewer = self.viewer.take();
+        // Socket-backend Serial Port: stop the reader and unlink the socket before qemu goes
+        // away, so a SIGKILLed qemu's leftover socket cannot block the next create.
+        if let Some(bridge) = self.serial_bridge.take() {
+            teardown_serial_bridge(bridge).await;
+        }
         self.spec = None;
         self.accel = None;
         self.state = InstanceState::Stopped;
@@ -1023,6 +1094,24 @@ impl Orchestrator {
                     SerialFormat::Base64 => base64_encode(slice),
                 }
             }
+            SerialBackend::Socket => {
+                // Socket: drain (destructively, like ringbuf) the in-server ring the reader
+                // task fills from QEMU's serial socket — up to `size` bytes from the oldest.
+                self.require_handle("read its Serial Port")?;
+                let bridge = self
+                    .serial_bridge
+                    .as_ref()
+                    .ok_or_else(serial_bridge_missing)?;
+                let drained: Vec<u8> = {
+                    let mut ring = bridge.ring.lock().expect("serial ring mutex poisoned");
+                    let take = (size as usize).min(ring.len());
+                    ring.drain(..take).collect()
+                };
+                match format {
+                    SerialFormat::Utf8 => String::from_utf8_lossy(&drained).into_owned(),
+                    SerialFormat::Base64 => base64_encode(&drained),
+                }
+            }
         };
         Ok(SerialReadResult {
             bytes: output.chars().count(),
@@ -1053,6 +1142,49 @@ impl Orchestrator {
                  enable write_serial (it types raw input into the guest console)."
                     .to_string(),
             ));
+        }
+        // Socket backend: write raw bytes straight into QEMU's serial socket — a real,
+        // connected serial line, so this input actually reaches the guest console (unlike
+        // ringbuf-write). Decode base64 ourselves; utf8 goes as its raw bytes.
+        if self.options.serial_backend.is_socket() {
+            self.require_handle("write to its Serial Port")?;
+            let bridge = self
+                .serial_bridge
+                .as_ref()
+                .ok_or_else(serial_bridge_missing)?;
+            let raw = match format {
+                SerialFormat::Utf8 => data.into_bytes(),
+                SerialFormat::Base64 => base64_decode(&data).map_err(LifecycleError)?,
+            };
+            let bytes_written = raw.len();
+            let mut write = bridge.write.lock().await;
+            // BOUND the write: this method runs holding the single global Orchestrator lock, and
+            // QEMU applies real serial flow control — if the guest is not draining its UART RX
+            // (paused, panicked, or no console reader), the socket buffer fills and an unbounded
+            // write would block FOREVER, wedging every other tool (destroy/resume included). A
+            // timeout releases the lock and returns an actionable error instead.
+            let write_result = tokio::time::timeout(SERIAL_WRITE_TIMEOUT, async {
+                write.write_all(&raw).await?;
+                write.flush().await
+            })
+            .await;
+            match write_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(LifecycleError(format!(
+                        "Failed to write to the Serial Port socket: {e}"
+                    )))
+                }
+                Err(_elapsed) => {
+                    return Err(LifecycleError(format!(
+                        "Timed out after {}ms writing to the Serial Port. The guest is not draining \
+                         its serial input — is it paused, has it panicked, or is nothing reading the \
+                         console (no getty on the shown console device)?",
+                        SERIAL_WRITE_TIMEOUT.as_millis()
+                    )))
+                }
+            }
+            return Ok(SerialWriteResult { bytes_written });
         }
         let bytes_written = data.chars().count();
         self.require_handle("write to its Serial Port")?
@@ -1096,9 +1228,11 @@ impl Orchestrator {
             spool_subdir,
             console_device,
             hint: "Set serial: true on create_instance to attach the Serial Port, then read its \
-                   output with read_serial (ringbuf drains on read; spool tails a persistent file). \
-                   The guest must use the shown console device in its own console= kernel cmdline for \
-                   output to appear; raspi* boards have two UARTs and may need adjusting."
+                   output with read_serial (ringbuf and socket drain on read; spool tails a \
+                   persistent file). The socket backend also makes write_serial a real interactive \
+                   console — typed input reaches the guest as a connected serial line. The guest \
+                   must use the shown console device in its own console= kernel cmdline for output \
+                   to appear; raspi* boards have two UARTs and may need adjusting."
                 .to_string(),
         }
     }
@@ -1300,6 +1434,177 @@ fn generate_vnc_password() -> String {
         }
     }
     out
+}
+
+/// How long to wait for QEMU's serial `socket` chardev to accept our connection. QEMU
+/// creates the listening socket during chardev init — before the QMP socket the launch
+/// already dialed — so this normally connects on the first try; the retry only covers a
+/// tiny startup race.
+const SERIAL_DIAL_TIMEOUT: Duration = Duration::from_millis(2_000);
+/// Delay between serial-socket connection attempts.
+const SERIAL_DIAL_INTERVAL: Duration = Duration::from_millis(25);
+/// Read chunk size for the serial reader task.
+const SERIAL_READ_CHUNK: usize = 4_096;
+/// Upper bound on a single `write_serial` to the serial socket. Bounds the time the global
+/// Orchestrator lock is held when the guest is not draining its serial input, so a stuck
+/// guest can never wedge the whole server.
+const SERIAL_WRITE_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// The live bridge to a socket-backend Serial Port (ADR-0015). Owns the write half of the
+/// UNIX-socket connection to QEMU's `serial` chardev (interactive `write_serial`), the
+/// bounded ring the reader task drains guest output into (`read_serial`), the reader task
+/// itself (aborted on teardown), and the server-owned socket path (removed on teardown).
+#[derive(Debug)]
+struct SerialBridge {
+    /// Write half of the serial socket; `write_serial` types raw bytes into the guest here.
+    write: Mutex<OwnedWriteHalf>,
+    /// Bounded ring of captured guest serial output; `read_serial` drains it destructively,
+    /// matching the ringbuf backend's drain-on-read semantics.
+    ring: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    /// The reader task pumping the socket into `ring`; aborted on teardown.
+    reader: JoinHandle<()>,
+    /// The server-owned serial socket path, unlinked on teardown (belt-and-suspenders: QEMU
+    /// removes its own listening socket on a clean exit, but a SIGKILLed qemu leaves it).
+    socket_path: String,
+}
+
+/// Append `data` to a bounded serial ring, evicting the oldest bytes once it exceeds `cap`
+/// — the same overwrite-oldest behaviour QEMU's `ringbuf` chardev has, so a slow reader
+/// never blocks the guest's serial writes (it just loses the oldest unread output).
+fn ring_push_bounded(ring: &mut VecDeque<u8>, data: &[u8], cap: usize) {
+    ring.extend(data.iter().copied());
+    let overflow = ring.len().saturating_sub(cap);
+    if overflow > 0 {
+        ring.drain(..overflow);
+    }
+}
+
+/// The reader task body: pump the serial socket's read half into the bounded ring until the
+/// socket closes (guest gone) or errors. Always draining is what keeps the socket buffers
+/// empty, so the guest never stalls writing to its serial port (the ringbuf backend's flaw).
+async fn run_serial_reader(
+    mut read: OwnedReadHalf,
+    ring: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    cap: usize,
+) {
+    let mut buf = [0u8; SERIAL_READ_CHUNK];
+    loop {
+        match read.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut ring = ring.lock().expect("serial ring mutex poisoned");
+                ring_push_bounded(&mut ring, &buf[..n], cap);
+            }
+        }
+    }
+}
+
+/// Dial QEMU's serial `socket` chardev (server-owned UNIX socket), retrying briefly until it
+/// accepts, then start the reader task and return the live [`SerialBridge`]. Called during
+/// launch — BEFORE the `cont` — so the connection is up before the guest emits a byte and no
+/// boot output is lost. Fails (fail-closed) if the socket never accepts within the timeout.
+async fn attach_serial_bridge(
+    qmp_socket_path: &str,
+    buffer_bytes: u32,
+) -> Result<SerialBridge, LifecycleError> {
+    let socket_path = serial_socket_path(qmp_socket_path);
+    let deadline = Instant::now() + SERIAL_DIAL_TIMEOUT;
+    let stream = loop {
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(LifecycleError(format!(
+                        "Failed to connect to the Serial Port socket at {socket_path} within {}ms: \
+                         {err}. The socket backend needs QEMU's server chardev to be listening.",
+                        SERIAL_DIAL_TIMEOUT.as_millis()
+                    )));
+                }
+                sleep(SERIAL_DIAL_INTERVAL).await;
+            }
+        }
+    };
+    let (read_half, write_half) = stream.into_split();
+    let ring = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let reader = tokio::spawn(run_serial_reader(
+        read_half,
+        Arc::clone(&ring),
+        buffer_bytes as usize,
+    ));
+    Ok(SerialBridge {
+        write: Mutex::new(write_half),
+        ring,
+        reader,
+        socket_path,
+    })
+}
+
+/// Tear a [`SerialBridge`] down: stop the reader task and unlink the server-owned socket
+/// file. Dropping the bridge also closes the write half. Run from every path that discards
+/// a bridge — teardown, and the fail-closed create paths.
+async fn teardown_serial_bridge(bridge: SerialBridge) {
+    bridge.reader.abort();
+    let _ = tokio::fs::remove_file(&bridge.socket_path).await;
+}
+
+/// The error when a socket-backend serial op finds no attached bridge — no running Instance,
+/// or one created without `serial: true`. Shared by `read_serial`/`write_serial`.
+fn serial_bridge_missing() -> LifecycleError {
+    LifecycleError(
+        "The Serial Port socket bridge is not attached — create an Instance with serial: true \
+         (backend QMP_MCP_SERIAL_BACKEND=socket) first."
+            .to_string(),
+    )
+}
+
+/// Standard (RFC 4648) base64-decode; the inverse of [`base64_encode`]. Whitespace/newlines
+/// are ignored; invalid characters or trailing junk after padding are rejected so a bad
+/// `write_serial` payload surfaces a clear error instead of typing garbage into the guest.
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn sextet(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&b| !matches!(b, b'\n' | b'\r' | b' ' | b'\t'))
+        .collect();
+    let body_len = bytes.iter().take_while(|&&b| b != b'=').count();
+    if bytes[body_len..].iter().any(|&b| b != b'=') {
+        return Err(
+            "Invalid base64 in write_serial data: unexpected characters after padding.".to_string(),
+        );
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut nbits = 0u32;
+    for &c in &bytes[..body_len] {
+        let v = sextet(c).ok_or_else(|| {
+            format!("Invalid base64 in write_serial data (byte 0x{c:02x}). Use format: utf8 for raw text.")
+        })?;
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    // A base64 body length of 4n+1 leaves a dangling 6-bit sextet that completes no byte —
+    // an invalid encoding. Reject it rather than silently dropping the guest's last input.
+    if nbits >= 6 {
+        return Err(
+            "Invalid base64 in write_serial data: a dangling sextet (the input is not a valid \
+             base64 length)."
+                .to_string(),
+        );
+    }
+    Ok(out)
 }
 
 /// Standard (RFC 4648) base64-encode `bytes`, with `=` padding. Hand-rolled to avoid a
@@ -2420,5 +2725,100 @@ mod tests {
             "the driver must have launched exactly once"
         );
         assert_eq!(orch.lock().await.state(), InstanceState::Paused);
+    }
+
+    #[test]
+    fn ring_push_bounded_evicts_oldest_beyond_cap() {
+        // The socket ring keeps only the newest `cap` bytes — overwrite-oldest, like ringbuf.
+        let mut ring = VecDeque::new();
+        ring_push_bounded(&mut ring, b"abcdef", 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"cdef");
+        ring_push_bounded(&mut ring, b"XY", 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"efXY");
+        // A single push larger than cap keeps only the last cap bytes.
+        let mut ring = VecDeque::new();
+        ring_push_bounded(&mut ring, b"0123456789", 3);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"789");
+    }
+
+    #[test]
+    fn base64_decode_roundtrips_and_rejects_garbage() {
+        assert_eq!(base64_decode("Aw==").unwrap(), vec![0x03]); // Ctrl-C
+        assert_eq!(base64_decode("aGk=").unwrap(), b"hi");
+        assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
+        // Round-trips against the encoder over non-UTF8 bytes.
+        let data = b"\x00\x01\x02hello\xff";
+        assert_eq!(base64_decode(&base64_encode(data)).unwrap(), data);
+        // Invalid alphabet and trailing junk after padding are rejected.
+        assert!(base64_decode("!!!!").is_err());
+        assert!(base64_decode("aa=a").is_err());
+        // A dangling sextet (4n+1 body) is invalid — reject, don't silently truncate.
+        assert!(base64_decode("a").is_err());
+        assert!(base64_decode("YWJja").is_err());
+        // Valid non-padded lengths (4n+2, 4n+3) still decode.
+        assert_eq!(base64_decode("YWI").unwrap(), b"ab");
+        assert_eq!(base64_decode("YWJj").unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn serial_socket_bridge_reads_ring_and_writes_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        // Stand in for QEMU: a UNIX listener at the serial.sock sibling of a temp QMP path.
+        let dir = std::env::temp_dir().join(format!("qmp-mcp-serialbridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let qmp_path = dir.join("qmp.sock").to_string_lossy().into_owned();
+        let serial_path = serial_socket_path(&qmp_path);
+        let listener = UnixListener::bind(&serial_path).unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+
+        let bridge = attach_serial_bridge(&qmp_path, 1 << 20).await.unwrap();
+        let mut server = accept.await.unwrap();
+
+        // Guest→server: bytes the "guest" emits are drained into the bridge ring (read path).
+        server.write_all(b"boot log\n").await.unwrap();
+        server.flush().await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            {
+                let ring = bridge.ring.lock().unwrap();
+                if !ring.is_empty() {
+                    got = ring.iter().copied().collect();
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(got, b"boot log\n");
+
+        // Server→guest: bytes written through the bridge arrive on the socket (write path).
+        {
+            let mut w = bridge.write.lock().await;
+            w.write_all(b"id\n").await.unwrap();
+            w.flush().await.unwrap();
+        }
+        let mut buf = [0u8; 3];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"id\n");
+
+        // Teardown stops the reader and unlinks the socket file.
+        teardown_serial_bridge(bridge).await;
+        assert!(!std::path::Path::new(&serial_path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn attach_serial_bridge_times_out_when_nothing_listens() {
+        // No listener at the derived path → the dial fails closed with an actionable message.
+        let dir =
+            std::env::temp_dir().join(format!("qmp-mcp-serialbridge-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let qmp_path = dir.join("qmp.sock").to_string_lossy().into_owned();
+        let err = attach_serial_bridge(&qmp_path, 1 << 20).await.unwrap_err();
+        assert!(err.0.contains("Serial Port socket"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
