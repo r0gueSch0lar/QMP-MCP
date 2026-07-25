@@ -782,6 +782,231 @@ describe('Orchestrator Event Buffer (fake driver)', () => {
   });
 });
 
+describe('Orchestrator Display recording (fake driver, ADR-0017)', () => {
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  /** A fake ffmpeg encoder sink: records frames and whether it was finalized/aborted. */
+  class FakeSink {
+    readonly frames: Buffer[] = [];
+    finished = false;
+    aborted = false;
+    /** Overridable for the liveness test: simulate an ffmpeg that dies immediately after spawn. */
+    aliveResult: { alive: boolean; stderr: string } = { alive: true, stderr: '' };
+    writeFrame(frame: Buffer): boolean {
+      this.frames.push(frame);
+      return true;
+    }
+    drain(): Promise<void> {
+      return Promise.resolve();
+    }
+    checkAlive(): Promise<{ alive: boolean; stderr: string }> {
+      return Promise.resolve(this.aliveResult);
+    }
+    async finish(): Promise<void> {
+      this.finished = true;
+    }
+    async abort(): Promise<void> {
+      this.aborted = true;
+    }
+  }
+
+  /** RUNNING Instance with a display device + injected fake ffmpeg + a temp recording dir. */
+  async function recording(options: Partial<OrchestratorOptions> = {}) {
+    const recordingDir = await mkdtemp(join(tmpdir(), 'qmp-rec-'));
+    const sinks: FakeSink[] = [];
+    const driver = new FakeQemuDriver({
+      responses: {
+        // The fake plays qemu: screendump writes the PNG to whatever path the server chose.
+        screendump: async (args?: Record<string, unknown>) => {
+          await writeFile(args?.filename as string, PNG);
+          return {};
+        },
+      },
+    });
+    const orch = makeOrchestrator(driver, {
+      autoStart: true,
+      recordingDir,
+      ffmpegEncoders: async () => ['libx264'],
+      spawnFfmpeg: () => {
+        const sink = new FakeSink();
+        sinks.push(sink);
+        return sink;
+      },
+      ...options,
+    });
+    await orch.createInstance({ displayDevice: 'vga' });
+    return { orch, driver, recordingDir, sinks };
+  }
+
+  it('get_recording reports availability, the resolved knobs, and the codecs present', async () => {
+    const { orch, recordingDir } = await recording();
+    try {
+      expect(await orch.describeRecording()).toMatchObject({
+        available: true,
+        codec: 'libx264',
+        crf: 22,
+        maxFps: 15,
+        pixfmt: 'yuv420p',
+        active: false,
+        activePath: null,
+        outputDir: recordingDir,
+      });
+      // The "which known codecs the build carries" diagnostic is folded into reason (ADR-0012).
+      expect((await orch.describeRecording()).reason).toContain('libx264');
+    } finally {
+      await orch.destroyInstance();
+      await rm(recordingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('start captures a frame under the operator root, marks active, and stop finalizes', async () => {
+    const { orch, recordingDir, sinks } = await recording();
+    try {
+      const started = await orch.startRecording('run1');
+      expect(started.path).toBe(join(recordingDir, 'run1.mkv'));
+      expect(started.codec).toBe('libx264');
+      expect((await orch.describeRecording()).active).toBe(true);
+      // The awaited initial capture ran a screendump and fed the sink at least one frame.
+      expect(sinks).toHaveLength(1);
+      // biome-ignore lint/style/noNonNullAssertion: the sink exists right after start.
+      const sink = sinks[0]!;
+      expect(sink.frames.length).toBeGreaterThanOrEqual(1);
+      expect(sink.frames[0]).toEqual(PNG);
+
+      // Real ffmpeg writes the container; the fake sink does not, so simulate the output
+      // file so stop() can stat it (the real ffmpeg spawn is kept out of unit tests).
+      await writeFile(join(recordingDir, 'run1.mkv'), Buffer.alloc(64));
+      const stopped = await orch.stopRecording();
+      expect(stopped).toMatchObject({
+        path: join(recordingDir, 'run1.mkv'),
+        name: 'run1.mkv',
+        codec: 'libx264',
+        sizeBytes: 64,
+      });
+      expect(typeof stopped.durationMs).toBe('number');
+      expect(sink.finished).toBe(true);
+      expect((await orch.describeRecording()).active).toBe(false);
+      // A second stop is refused once none is running.
+      await expect(orch.stopRecording()).rejects.toThrow(/No recording is running/);
+    } finally {
+      await orch.destroyInstance();
+      await rm(recordingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to start without a display device, when unavailable, or when already running', async () => {
+    // No display device: refused (screendump needs a framebuffer).
+    const noDisplayDir = await mkdtemp(join(tmpdir(), 'qmp-rec-'));
+    const orchNoDisplay = makeOrchestrator(new FakeQemuDriver(), {
+      autoStart: true,
+      recordingDir: noDisplayDir,
+      ffmpegEncoders: async () => ['libx264'],
+      spawnFfmpeg: () => new FakeSink(),
+    });
+    await orchNoDisplay.createInstance({});
+    await expect(orchNoDisplay.startRecording()).rejects.toThrow(/display device/);
+    await orchNoDisplay.destroyInstance();
+    await rm(noDisplayDir, { recursive: true, force: true });
+
+    // ffmpeg unavailable: refused, naming ffmpeg; get_recording reports unavailable.
+    const unavailable = await recording({ ffmpegEncoders: async () => undefined });
+    try {
+      await expect(unavailable.orch.startRecording()).rejects.toThrow(/ffmpeg/);
+      expect((await unavailable.orch.describeRecording()).available).toBe(false);
+    } finally {
+      await unavailable.orch.destroyInstance();
+      await rm(unavailable.recordingDir, { recursive: true, force: true });
+    }
+
+    // Already running: the second start is refused.
+    const busy = await recording();
+    try {
+      await busy.orch.startRecording('a');
+      await expect(busy.orch.startRecording('b')).rejects.toThrow(/already running/);
+    } finally {
+      await busy.orch.destroyInstance();
+      await rm(busy.recordingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a concurrent second start so two overlapping calls never both spawn (T4)', async () => {
+    const { orch, recordingDir, sinks } = await recording();
+    try {
+      // Fire two starts without awaiting the first: the loser must hit the synchronous claim.
+      const results = await Promise.allSettled([
+        orch.startRecording('a'),
+        orch.startRecording('b'),
+      ]);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]?.reason).toBeInstanceOf(LifecycleError);
+      // Exactly one ffmpeg sink was ever spawned (the winner's).
+      expect(sinks).toHaveLength(1);
+    } finally {
+      await orch.destroyInstance();
+      await rm(recordingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('surfaces an ffmpeg that exits immediately as an actionable start error (T5)', async () => {
+    const recordingDir = await mkdtemp(join(tmpdir(), 'qmp-rec-'));
+    const driver = new FakeQemuDriver({
+      responses: {
+        screendump: async (args?: Record<string, unknown>) => {
+          await writeFile(args?.filename as string, PNG);
+          return {};
+        },
+      },
+    });
+    let spawned = 0;
+    const orch = makeOrchestrator(driver, {
+      autoStart: true,
+      recordingDir,
+      ffmpegEncoders: async () => ['libx264'],
+      spawnFfmpeg: () => {
+        spawned += 1;
+        const sink = new FakeSink();
+        // Simulate ffmpeg dying immediately after spawn (bad codec/pixfmt/output).
+        sink.aliveResult = { alive: false, stderr: 'Unknown encoder libx264' };
+        return sink;
+      },
+    });
+    await orch.createInstance({ displayDevice: 'vga' });
+    try {
+      await expect(orch.startRecording('dead')).rejects.toThrow(/exited immediately/);
+      expect(spawned).toBe(1);
+      // A failed start leaves no active recording, and the slot is released for a retry.
+      expect((await orch.describeRecording()).active).toBe(false);
+      await expect(orch.startRecording('retry')).rejects.toThrow(/exited immediately/);
+    } finally {
+      await orch.destroyInstance();
+      await rm(recordingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('tears down an active recording on destroy and on unexpected exit (no leak)', async () => {
+    // Destroy finalizes the active sink and returns to NONE.
+    const onDestroy = await recording();
+    await onDestroy.orch.startRecording('d');
+    await onDestroy.orch.destroyInstance();
+    // biome-ignore lint/style/noNonNullAssertion: the sink was created by startRecording.
+    expect(onDestroy.sinks[0]!.finished).toBe(true);
+    expect(onDestroy.orch.getInstance().state).toBe('NONE');
+    await rm(onDestroy.recordingDir, { recursive: true, force: true });
+
+    // An unexpected qemu exit finalizes it too (reconcile teardown).
+    const onExit = await recording();
+    await onExit.orch.startRecording('e');
+    onExit.driver.lastProcess?.simulateExit();
+    await tick();
+    // biome-ignore lint/style/noNonNullAssertion: the sink was created by startRecording.
+    expect(onExit.sinks[0]!.finished).toBe(true);
+    expect(onExit.orch.getInstance().state).toBe('NONE');
+    await rm(onExit.recordingDir, { recursive: true, force: true });
+  });
+});
+
 describe('defaultSocketOccupied', () => {
   it('returns true for an existing path and false for a missing one', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'orch-occ-'));

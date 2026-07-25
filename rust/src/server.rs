@@ -28,8 +28,8 @@ use crate::instance::image_store::{
 };
 use crate::instance::iso_store::{IsoListing, IsoStore};
 use crate::instance::orchestrator::{
-    InstanceState, Orchestrator, SerialFormat, SerialReadResult, SerialReport, SerialWriteResult,
-    ShareReport,
+    InstanceState, Orchestrator, RecordingReport, SerialFormat, SerialReadResult, SerialReport,
+    SerialWriteResult, ShareReport, StartRecordingResult, StopRecordingResult,
 };
 
 /// A compact, JSON-serialisable summary of a validated Hardware Spec, returned by
@@ -193,6 +193,17 @@ pub struct WriteSerialParams {
     /// Encoding of `data`: `utf8` (default) or `base64`.
     #[serde(default)]
     pub format: SerialFormat,
+}
+
+/// Validated input for `start_recording`: an optional file name for the recording. Mirrors the
+/// TS `start_recording` zod schema.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StartRecordingParams {
+    /// Optional file name (no extension) for the recording under QMP_MCP_RECORDING_DIR. Same
+    /// allowlist as serialSpool: ^[A-Za-z0-9][A-Za-z0-9._-]* — no slash, '..', or absolute path.
+    /// Omit to auto-generate a unique name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Validated input for `wait_for_event`: an optional event-name filter, a timeout, and
@@ -687,6 +698,60 @@ impl QmpMcpServer {
         )]))
     }
 
+    /// Read-only. Report display-recording capability and current state (ADR-0017): whether
+    /// recording is available and why, the resolved codec, whether a recording is active, the
+    /// output root, and the CRF/max-fps/pixel-format. Infallible.
+    #[tool(
+        description = "Report the display-recording capability: whether recording is available (an \
+                       ffmpeg with the selected codec, plus QMP_MCP_RECORDING_DIR) and why not if \
+                       unavailable, the resolved codec, whether a recording is active, the output \
+                       directory, and the CRF/max-fps/pixel-format. Read-only."
+    )]
+    async fn get_recording(&self) -> Json<RecordingReport> {
+        Json(self.orchestrator.lock().await.describe_recording())
+    }
+
+    /// Start recording the running Instance's display to a video file (ADR-0017). Fails closed
+    /// when there is no Instance, no display adapter, ffmpeg/codec/output-dir is unavailable, or a
+    /// recording is already running. Returns the output path and codec (not the video inline).
+    #[tool(
+        description = "Start recording the running QEMU Instance's display to a video file (ffmpeg \
+                       encodes a screendump-loop capture). Requires create_instance with a \
+                       displayDevice (virtio-gpu/vga/ramfb) and a server configured with ffmpeg + \
+                       QMP_MCP_RECORDING_DIR (see get_recording). Optional name (no extension) sets \
+                       the file under the output dir; omit to auto-generate. Returns the host path \
+                       and codec — the video is NOT returned inline; the operator retrieves the \
+                       file. Fails if no Instance is running or a recording is already active."
+    )]
+    async fn start_recording(
+        &self,
+        Parameters(params): Parameters<StartRecordingParams>,
+    ) -> Result<Json<StartRecordingResult>, McpError> {
+        let result = {
+            let mut orchestrator = self.orchestrator.lock().await;
+            orchestrator.start_recording(params.name).await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
+    }
+
+    /// Stop the running display recording and finalize the video file (ADR-0017). Returns the
+    /// file's path, name, codec, size, and duration. Fails when no recording is running.
+    #[tool(
+        description = "Stop the running display recording and finalize the video file (closes \
+                       ffmpeg cleanly). Returns the host path, file name, codec, size in bytes \
+                       (sizeBytes), and duration in milliseconds (durationMs). Fails if no \
+                       recording is running."
+    )]
+    async fn stop_recording(&self) -> Result<Json<StopRecordingResult>, McpError> {
+        let result = {
+            let mut orchestrator = self.orchestrator.lock().await;
+            orchestrator.stop_recording().await
+        }
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(result))
+    }
+
     /// Run an arbitrary QMP command against the running Instance, gated by the Command
     /// Policy (ADR-0003). The command name is checked BEFORE it can reach the QMP
     /// Session: a denied command returns an actionable error and never touches QEMU;
@@ -831,6 +896,13 @@ mod tests {
             allow_serial_write: false,
             serial_backend: crate::config::SerialBackend::Ringbuf,
             serial_spool_dir: None,
+            ffmpeg_binary: None,
+            recording_dir: None,
+            recording_codec: "libx264".to_string(),
+            recording_crf: 22,
+            recording_max_fps: 15,
+            recording_pixfmt: "yuv420p".to_string(),
+            recording_encoder_available: Box::new(|_| true),
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -947,6 +1019,10 @@ mod tests {
             "get_serial",
             "read_serial",
             "write_serial",
+            // Display recording surface (ADR-0017).
+            "get_recording",
+            "start_recording",
+            "stop_recording",
             // Image/ISO stores (this slice).
             "create_image",
             "list_images",
