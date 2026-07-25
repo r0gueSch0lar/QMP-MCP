@@ -9,7 +9,7 @@
 //! the fail-closed auth + origin guards (`crate::http`, ADR-0005), or `both`
 //! concurrently — mirroring `index.ts`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -18,7 +18,9 @@ use qmp_mcp::http;
 use qmp_mcp::instance::hardware_spec::{host_qemu_arch, probe_kvm};
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
-use qmp_mcp::instance::orchestrator::{InstanceState, Orchestrator, OrchestratorOptions};
+use qmp_mcp::instance::orchestrator::{
+    probe_ffmpeg_encoders, InstanceState, Orchestrator, OrchestratorOptions,
+};
 use qmp_mcp::logging;
 use qmp_mcp::policy::{self, ResolvedPolicy};
 use qmp_mcp::qemu::real_driver::RealQemuDriver;
@@ -87,9 +89,15 @@ async fn run(
     // `new_shared` installs the Orchestrator's `Weak` self back-reference so
     // create_instance can spawn the exit-watch task that reconciles an unexpected qemu
     // exit (crash, guest poweroff, external kill) back to NONE (issue #28).
+    //
+    // R1 (ADR-0017): probe the ffmpeg build's encoders ONCE here at startup — bounded, off the
+    // request path — into a cached set the recording capability check consults instantly. This
+    // replaces the old per-request blocking `ffmpeg -encoders` spawn that ran under the
+    // Orchestrator's async mutex.
+    let recording_encoders = probe_ffmpeg_encoders(config.ffmpeg_binary.as_deref()).await;
     let orchestrator = Orchestrator::new_shared(
         Box::new(RealQemuDriver),
-        orchestrator_options(&config, command_policy),
+        orchestrator_options(&config, command_policy, recording_encoders),
     );
 
     // The two allowlisted stores (ADR-0006): a read-write Image Store that provisions
@@ -212,7 +220,11 @@ async fn serve_both(
 /// Assemble the Orchestrator's options from the validated config and the resolved
 /// Command Policy. The QMP socket is a per-server file under the OS temp dir (the
 /// server owns it; ADR-0004).
-fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> OrchestratorOptions {
+fn orchestrator_options(
+    config: &Config,
+    command_policy: ResolvedPolicy,
+    recording_encoders: HashSet<String>,
+) -> OrchestratorOptions {
     OrchestratorOptions {
         // argv[0] for the launched guest. When QMP_MCP_QEMU_BINARY is unset the binary
         // is derived per-instance from the spec's machine (q35 -> x86_64, virt/raspi*
@@ -233,6 +245,18 @@ fn orchestrator_options(config: &Config, command_policy: ResolvedPolicy) -> Orch
         allow_serial_write: config.allow_serial_write,
         serial_backend: config.serial_backend,
         serial_spool_dir: config.serial_spool_dir.clone(),
+        // Display recording (ADR-0017): the resolved ffmpeg binary, output root, and encoder
+        // knobs. The encoder-presence check is an instant lookup into the set probed ONCE at
+        // startup (R1): empty when ffmpeg is unresolved/absent, so recording is then unavailable.
+        ffmpeg_binary: config.ffmpeg_binary.clone(),
+        recording_dir: config.recording_dir.clone(),
+        recording_codec: config.recording_codec.clone(),
+        recording_crf: config.recording_crf,
+        recording_max_fps: config.recording_max_fps,
+        recording_pixfmt: config.recording_pixfmt.clone(),
+        recording_encoder_available: Box::new(move |codec: &str| {
+            recording_encoders.contains(codec)
+        }),
         hostfwd_port_range: Some(config.hostfwd_port_range),
         allow_host_net: config.allow_host_net,
         auto_start: config.auto_start,

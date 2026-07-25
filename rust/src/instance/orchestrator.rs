@@ -18,7 +18,7 @@
 //! launch-token bookkeeping the single-threaded-async TypeScript port needs is not
 //! required here.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -39,8 +40,8 @@ use super::event_buffer::{
 use super::hardware_spec::{
     build_argv, parse_hardware_spec, qemu_arch_of_binary, qemu_binary_for_machine, resolve_accel,
     resolve_serial_spool_path, serial_socket_path, Accel, AccelResolution, ArgvOptions,
-    DisplayMode, HardwareSpec, SERIAL_CHARDEV_ID, SHARE_MOUNT_TAG, VNC_LOOPBACK_HOST,
-    VNC_LOOPBACK_PORT,
+    DisplayDevice, DisplayMode, HardwareSpec, SERIAL_CHARDEV_ID, SHARE_MOUNT_TAG,
+    VNC_LOOPBACK_HOST, VNC_LOOPBACK_PORT,
 };
 use crate::policy::{
     build_policy, decide_command, CommandPolicyError, PolicyOverrides, ResolvedPolicy,
@@ -239,6 +240,65 @@ pub struct ScreendumpResult {
     pub bytes: usize,
 }
 
+/// The read-only display-recording capability report returned by the `get_recording` tool
+/// (ADR-0017). Advisory and infallible (like `describe_share`/`describe_serial`): it says whether
+/// recording is available and why, the resolved codec, whether a recording is active now, the
+/// output root, and the CRF/max-fps/pixfmt the encoder is run with. Mirrors the TS `RecordingReport`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingReport {
+    /// Whether display recording is available (ffmpeg resolved, output dir set, codec present).
+    pub available: bool,
+    /// Human-readable reason: why recording is unavailable, or that it is available. Actionable.
+    pub reason: String,
+    /// The resolved recording codec (`QMP_MCP_RECORDING_CODEC`).
+    pub codec: String,
+    /// The CRF / constant-quality target the encoder uses.
+    pub crf: u32,
+    /// The max frame rate the `screendump` loop is paced to (the capture-loop pacing cap).
+    pub max_fps: u32,
+    /// The pixel format the encoder writes.
+    pub pixfmt: String,
+    /// Whether a recording is running on the current Instance right now.
+    pub active: bool,
+    /// When active, the host path being written to; otherwise `null`.
+    pub active_path: Option<String>,
+    /// The operator output root recordings are written under (`QMP_MCP_RECORDING_DIR`), or `null`.
+    pub output_dir: Option<String>,
+}
+
+/// The result of a successful [`Orchestrator::start_recording`] (ADR-0017). The video is large, so
+/// — unlike `screendump`'s inline PNG — only the host path is returned; the operator retrieves the
+/// file. Converged with the TS `RecordingStartResult` to exactly `{ path, name, codec }` (ADR-0012).
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StartRecordingResult {
+    /// The host path the recording is being written to (under `QMP_MCP_RECORDING_DIR`).
+    pub path: String,
+    /// The output file's base name (the on-disk file name, e.g. `run1.mkv`).
+    pub name: String,
+    /// The codec the recording is encoded with.
+    pub codec: String,
+}
+
+/// The result of a successful [`Orchestrator::stop_recording`] (ADR-0017): the finalized file's
+/// path/name/codec, its size in bytes, and the wall-clock duration in MILLISECONDS. Converged with
+/// the TS `RecordingStopResult` to exactly `{ path, name, codec, sizeBytes, durationMs }` (ADR-0012).
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRecordingResult {
+    /// The host path of the finalized recording.
+    pub path: String,
+    /// The output file's base name.
+    pub name: String,
+    /// The codec the recording was encoded with.
+    pub codec: String,
+    /// Size of the finalized file in bytes (0 if it could not be stat'd).
+    pub size_bytes: u64,
+    /// Wall-clock recording duration in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// Knobs the Orchestrator needs that are not part of the Hardware Spec. The
 /// singleton injects the env-resolved values (mirrors the TS `OrchestratorOptions`,
 /// trimmed to what this slice's `build_argv` + accel resolution consume).
@@ -281,6 +341,26 @@ pub struct OrchestratorOptions {
     pub serial_backend: SerialBackend,
     /// Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or `None`.
     pub serial_spool_dir: Option<String>,
+    /// Resolved `ffmpeg` binary for display recording (`QMP_MCP_FFMPEG_BINARY` or PATH, ADR-0017),
+    /// or `None` when absent — recording is then unavailable and `start_recording` fails closed.
+    pub ffmpeg_binary: Option<String>,
+    /// Operator output root display recordings are written under (`QMP_MCP_RECORDING_DIR`, ADR-0017),
+    /// or `None`. The agent names only a file under it (the spool trust model).
+    pub recording_dir: Option<String>,
+    /// Display-recording codec (`QMP_MCP_RECORDING_CODEC`, ADR-0017; default `libx264`).
+    pub recording_codec: String,
+    /// Display-recording CRF / constant-quality target (`QMP_MCP_RECORDING_CRF`, ADR-0017).
+    pub recording_crf: u32,
+    /// Max frame rate the `screendump` loop is paced to (`QMP_MCP_RECORDING_MAX_FPS`, ADR-0017).
+    pub recording_max_fps: u32,
+    /// Display-recording pixel format (`QMP_MCP_RECORDING_PIXFMT`, ADR-0017; default `yuv420p`).
+    pub recording_pixfmt: String,
+    /// Whether the selected codec is compiled into the resolved ffmpeg build (ADR-0017). Injected
+    /// for testability, exactly like `kvm_available`: production wires an INSTANT lookup into the
+    /// encoder set probed ONCE at startup ([`probe_ffmpeg_encoders`], R1) — no per-request spawn,
+    /// no blocking call under the lock; tests force a deterministic value so no ffmpeg is spawned.
+    /// Only consulted when ffmpeg + output dir are set.
+    pub recording_encoder_available: Box<dyn Fn(&str) -> bool + Send + Sync>,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -369,12 +449,20 @@ pub struct Orchestrator {
     /// to the built-in allowlist when the options omit one.
     command_policy: ResolvedPolicy,
     state: InstanceState,
-    handle: Option<Box<dyn InstanceHandle>>,
+    /// The live Instance handle. An `Arc` (not a `Box`) so a background task — the display
+    /// recording's `screendump` loop (ADR-0017) — can hold a clone and issue QMP commands
+    /// concurrently while the Orchestrator still owns and later closes it. `execute`/`close`
+    /// both take `&self`, so shared ownership is sound.
+    handle: Option<Arc<dyn InstanceHandle>>,
     /// The socket-backend Serial Port bridge (ADR-0015): a live UNIX-socket connection to
     /// QEMU's `serial` chardev plus the reader task draining it into a bounded ring. Present
     /// only while a `serial: true` Instance runs under `QMP_MCP_SERIAL_BACKEND=socket`; torn
     /// down with the Instance. `None` for the ringbuf/spool backends.
     serial_bridge: Option<SerialBridge>,
+    /// The active display recording (ADR-0017): the ffmpeg child, its stdin, the frame-loop task,
+    /// and the output path. Present only while a recording runs; torn down with the Instance and
+    /// on an unexpected qemu exit, exactly like [`SerialBridge`]. `None` when nothing is recording.
+    recording: Option<Recording>,
     spec: Option<HardwareSpec>,
     accel: Option<Accel>,
     /// The running noVNC Viewer for a `display: vnc` Instance, if any (ADR-0010). Its
@@ -437,6 +525,7 @@ impl Orchestrator {
             state: InstanceState::None,
             handle: None,
             serial_bridge: None,
+            recording: None,
             spec: None,
             accel: None,
             viewer: None,
@@ -579,7 +668,8 @@ impl Orchestrator {
                 // Capture the exit signal BEFORE the handle moves into the field; the
                 // exit-watch task awaits it to reconcile an unexpected qemu exit to NONE.
                 let exited = handle.exited();
-                self.handle = Some(handle);
+                // Store the handle behind an `Arc` so the recording loop can share it (ADR-0017).
+                self.handle = Some(Arc::from(handle));
                 self.serial_bridge = serial_bridge;
                 self.viewer = viewer;
                 self.spec = Some(spec.clone());
@@ -850,6 +940,12 @@ impl Orchestrator {
             .take()
             .expect("handle present in a non-NONE state");
         let viewer = self.viewer.take();
+        // Display recording (ADR-0017): stop the frame loop and finalize/kill ffmpeg BEFORE the
+        // handle closes qemu, so the loop stops issuing `screendump` and no ffmpeg child leaks.
+        // Runs on both destroy and unexpected-exit reconcile (this is their shared teardown).
+        if let Some(recording) = self.recording.take() {
+            let _ = finalize_recording(recording).await;
+        }
         // Socket-backend Serial Port: stop the reader and unlink the socket before qemu goes
         // away, so a SIGKILLed qemu's leftover socket cannot block the next create.
         if let Some(bridge) = self.serial_bridge.take() {
@@ -1286,6 +1382,230 @@ impl Orchestrator {
         result
     }
 
+    /// Report the display-recording capability and current state (`get_recording`, ADR-0017).
+    /// Advisory and infallible — like `describe_share`/`describe_serial`, it reports config even
+    /// with no Instance running. Availability is: ffmpeg resolved AND an output dir set AND the
+    /// selected codec compiled into the ffmpeg build (the last checked only when the first two
+    /// hold, so no ffmpeg is spawned when recording is plainly unconfigured). Mirrors the TS
+    /// `Orchestrator.describeRecording`.
+    pub fn describe_recording(&self) -> RecordingReport {
+        let codec = self.options.recording_codec.clone();
+        let (available, reason) = recording_capability(
+            self.options.ffmpeg_binary.as_deref(),
+            self.options.recording_dir.as_deref(),
+            &codec,
+            || (self.options.recording_encoder_available)(&codec),
+        );
+        RecordingReport {
+            available,
+            reason,
+            codec,
+            crf: self.options.recording_crf,
+            max_fps: self.options.recording_max_fps,
+            pixfmt: self.options.recording_pixfmt.clone(),
+            active: self.recording.is_some(),
+            active_path: self.recording.as_ref().map(|r| r.output_path.clone()),
+            output_dir: self.options.recording_dir.clone(),
+        }
+    }
+
+    /// Start recording the running Instance's display to a video file (ADR-0017, the documented
+    /// `screendump`-loop fallback). A co-located ffmpeg child encodes the stream; a background task
+    /// loops QMP `screendump` at up to `recording_max_fps`, feeding each PNG frame into ffmpeg's
+    /// stdin (`-f image2pipe`). Fails closed — with an actionable message — when there is no
+    /// Instance, the Instance has no display adapter (no framebuffer to capture), the recording
+    /// capability is unavailable (no ffmpeg / no output dir / codec absent), or a recording is
+    /// already running. An agent-supplied `name` is validated with the same allowlist as
+    /// `serialSpool` and resolved under `QMP_MCP_RECORDING_DIR`; otherwise a unique name is
+    /// generated. Returns the output path and codec (the file is large, so it is NOT returned
+    /// inline — the operator retrieves it). Mirrors the TS `Orchestrator.startRecording`.
+    pub async fn start_recording(
+        &mut self,
+        name: Option<String>,
+    ) -> Result<StartRecordingResult, LifecycleError> {
+        // 1) A running Instance is required, and we need a shareable handle for the loop task.
+        self.require_handle("start a display recording")?;
+        let handle = Arc::clone(
+            self.handle
+                .as_ref()
+                .expect("handle present after require_handle"),
+        );
+        // 2) A display adapter must be present — `screendump` captures a framebuffer, and a
+        //    headless (displayDevice: none) Instance has none.
+        let has_display = self
+            .spec
+            .as_ref()
+            .is_some_and(|s| s.display_device != DisplayDevice::None);
+        if !has_display {
+            return Err(LifecycleError(
+                "The running Instance has no display adapter (displayDevice is \"none\"), so there \
+                 is no framebuffer to record. Recreate it with a displayDevice such as \
+                 \"virtio-gpu\", \"vga\", or \"ramfb\"."
+                    .to_string(),
+            ));
+        }
+        // 3) The recording capability must be available (ffmpeg + output dir + selected codec).
+        let codec = self.options.recording_codec.clone();
+        let (available, reason) = recording_capability(
+            self.options.ffmpeg_binary.as_deref(),
+            self.options.recording_dir.as_deref(),
+            &codec,
+            || (self.options.recording_encoder_available)(&codec),
+        );
+        if !available {
+            return Err(LifecycleError(reason));
+        }
+        // 4) One recording per Instance.
+        if self.recording.is_some() {
+            return Err(LifecycleError(
+                "A display recording is already running. Stop it with stop_recording before \
+                 starting another."
+                    .to_string(),
+            ));
+        }
+
+        // Resolve the output path under the operator root (agent names only the file).
+        let output_path =
+            resolve_recording_path(self.options.recording_dir.as_deref(), name.as_deref())?;
+        if let Some(parent) = std::path::Path::new(&output_path).parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                LifecycleError(format!(
+                    "Failed to create the recording output directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        // A server-chosen transient path the `screendump` loop writes each PNG frame to.
+        let frame_dir = std::env::temp_dir().join("qmp-mcp").join("recordings");
+        tokio::fs::create_dir_all(&frame_dir).await.map_err(|e| {
+            LifecycleError(format!(
+                "Failed to create the recording frame directory {}: {e}",
+                frame_dir.display()
+            ))
+        })?;
+        let frame_path = recording_frame_path(&frame_dir);
+
+        // Spawn the ffmpeg encoder: stdin piped (fed the PNG frames), stdout silenced, stderr
+        // PIPED so the post-spawn liveness check (R5) can report why an immediate exit happened,
+        // and `kill_on_drop(true)` (R4) so a dropped `Recording` can never leak the process.
+        let ffmpeg = self
+            .options
+            .ffmpeg_binary
+            .as_deref()
+            .expect("capability check guaranteed ffmpeg is resolved");
+        let args = build_ffmpeg_args(
+            &codec,
+            self.options.recording_crf,
+            self.options.recording_max_fps,
+            &self.options.recording_pixfmt,
+            &output_path,
+        );
+        let mut child = Command::new(ffmpeg)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                LifecycleError(format!(
+                    "Failed to start ffmpeg ({ffmpeg}) for display recording: {e}. Check \
+                     QMP_MCP_FFMPEG_BINARY or that ffmpeg is installed."
+                ))
+            })?;
+        let mut stderr = child.stderr.take();
+
+        // Post-spawn liveness (R5, parity with the TS T5): ffmpeg that dies immediately (bad
+        // codec/pixfmt/output) must surface as an actionable start error, not a silent empty file.
+        tokio::time::sleep(POST_SPAWN_LIVENESS_WINDOW).await;
+        if let Ok(Some(status)) = child.try_wait() {
+            let captured = if let Some(mut e) = stderr.take() {
+                let mut buf = Vec::new();
+                let _ = e.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).trim().to_string()
+            } else {
+                String::new()
+            };
+            // Best-effort remove the empty/partial output so the host is left clean.
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(LifecycleError(format!(
+                "ffmpeg exited immediately ({status}) after starting the display recording \
+                 ({ffmpeg}, codec \"{codec}\", pixfmt \"{}\"). Check the codec/pixel-format/output \
+                 path. ffmpeg stderr: {}",
+                self.options.recording_pixfmt,
+                if captured.is_empty() {
+                    "(none)"
+                } else {
+                    captured.as_str()
+                }
+            )));
+        }
+        // Alive: drain stderr in the background so a full pipe never blocks ffmpeg (aborted on
+        // teardown). If stderr somehow wasn't captured, an inert task keeps the field uniform.
+        let stderr_task = match stderr.take() {
+            Some(e) => tokio::spawn(drain_ffmpeg_stderr(e)),
+            None => tokio::spawn(async {}),
+        };
+
+        let stdin = child
+            .stdin
+            .take()
+            .expect("ffmpeg child was spawned with a piped stdin");
+        let stdin = Arc::new(Mutex::new(stdin));
+
+        // Pace the loop to the target fps; a background task pumps frames until stopped.
+        let interval = Duration::from_millis(1_000 / self.options.recording_max_fps.max(1) as u64);
+        let loop_task = tokio::spawn(run_recording_loop(
+            handle,
+            Arc::clone(&stdin),
+            frame_path.clone(),
+            interval,
+        ));
+
+        let file_name = std::path::Path::new(&output_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| output_path.clone());
+        self.recording = Some(Recording {
+            child,
+            stdin: Some(stdin),
+            loop_task,
+            stderr_task,
+            output_path: output_path.clone(),
+            name: file_name.clone(),
+            codec: codec.clone(),
+            frame_path,
+            started_at: Instant::now(),
+        });
+        tracing::info!("display recording started -> {output_path} (codec {codec})");
+        Ok(StartRecordingResult {
+            path: output_path,
+            name: file_name,
+            codec,
+        })
+    }
+
+    /// Stop the running display recording (ADR-0017): abort the frame loop, close ffmpeg's stdin so
+    /// it flushes and finalizes the container, and await the child. Returns the finalized file's
+    /// path, size, and approximate duration. Fails closed when no recording is running. Mirrors the
+    /// TS `Orchestrator.stopRecording`.
+    pub async fn stop_recording(&mut self) -> Result<StopRecordingResult, LifecycleError> {
+        let recording = self.recording.take().ok_or_else(|| {
+            LifecycleError(
+                "No display recording is running. Start one with start_recording first."
+                    .to_string(),
+            )
+        })?;
+        let result = finalize_recording(recording).await;
+        tracing::info!(
+            "display recording stopped -> {} ({} bytes, {} ms)",
+            result.path,
+            result.size_bytes,
+            result.duration_ms
+        );
+        Ok(result)
+    }
+
     /// Run a generic QMP command against the running Instance, gated by the Command
     /// Policy (ADR-0003). The command name is checked FIRST: a denied command returns a
     /// [`CommandPolicyError`] and never reaches the QMP Session — fail-closed, so a
@@ -1557,6 +1877,381 @@ fn serial_bridge_missing() -> LifecycleError {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Display recording (ADR-0017) — the documented `screendump`-loop → ffmpeg fallback.
+// ---------------------------------------------------------------------------
+
+/// The file extension (and thus container) recordings are written with. Matroska holds every
+/// encoder the operator may select (`libx264`/`libx265`/`libvpx-vp9`/`libsvtav1`), so it never
+/// fails the way an `.mp4` muxer would for VP9/AV1 — a robust, codec-agnostic default.
+const RECORDING_EXTENSION: &str = "mkv";
+
+/// How long to wait for ffmpeg to flush and finalize the container after its stdin closes, before
+/// we give up and kill it. Ample for a low-fps screen capture; bounds the teardown path.
+const FFMPEG_FINALIZE_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// How long to wait for ffmpeg to die after a `start_kill()` on finalize-timeout, before giving up
+/// (R3). Bounds the SECOND `wait()` so teardown never awaits unbounded even if the kill is slow;
+/// `kill_on_drop(true)` (R4) is the final backstop when the `Recording` is dropped.
+const FFMPEG_KILL_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// How long a freshly-spawned ffmpeg is watched for an immediate exit before it is declared live
+/// (R5, post-spawn liveness). Long enough to catch an instant failure (bad codec/pixfmt), short
+/// enough not to delay a healthy start.
+const POST_SPAWN_LIVENESS_WINDOW: Duration = Duration::from_millis(150);
+
+/// Bound on the one-shot startup encoder probe (`ffmpeg -encoders`, R1), so a hung ffmpeg at
+/// startup can never wedge server boot.
+const FFMPEG_PROBE_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// Process-unique counter making each server-chosen recording frame path unique (with the PID and
+/// a high-resolution timestamp), so concurrent test runs never collide.
+static RECORDING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The live display recording (ADR-0017): the ffmpeg child encoding the stream, its stdin (fed the
+/// PNG frames — shared with the loop task, closed on stop to finalize the file), the frame-loop
+/// task (aborted on teardown), the output path, the transient frame path (removed on teardown), and
+/// the start time (for the reported duration). Mirrors the [`SerialBridge`] lifecycle discipline.
+struct Recording {
+    /// The ffmpeg encoder child; awaited on stop so the container is finalized before we return.
+    /// Spawned with `kill_on_drop(true)` (R4) so a dropped `Recording` can never leak the process.
+    child: Child,
+    /// ffmpeg's stdin, shared with the loop task. Behind an `Arc<Mutex>` so the loop can write
+    /// frames while the Orchestrator retains ownership; dropping the last reference (after the loop
+    /// task is aborted+joined) closes the pipe, giving ffmpeg EOF so it finalizes the file.
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
+    /// The frame-loop task issuing `screendump` and pumping frames; aborted on teardown.
+    loop_task: JoinHandle<()>,
+    /// The background task draining ffmpeg's stderr (so a full pipe never blocks the encoder);
+    /// aborted on teardown. Present once the post-spawn liveness check passed (R5).
+    stderr_task: JoinHandle<()>,
+    /// The host path the recording is written to (under `QMP_MCP_RECORDING_DIR`).
+    output_path: String,
+    /// The output file's base name (e.g. `run1.mkv`), reported by start/stop.
+    name: String,
+    /// The codec the recording is encoded with, reported by start/stop.
+    codec: String,
+    /// The transient per-frame PNG path the loop writes and re-reads; removed on teardown.
+    frame_path: PathBuf,
+    /// When the recording started, for the reported wall-clock duration.
+    started_at: Instant,
+}
+
+/// Decide whether display recording is available and why (ADR-0017), as a pure function of the
+/// resolved ffmpeg binary, the output directory, the selected codec, and a lazily-evaluated
+/// encoder-presence probe. The probe (`ffmpeg -encoders`) runs ONLY when ffmpeg and the output dir
+/// are both present, so an unconfigured server never spawns ffmpeg. Returns `(available, reason)`
+/// with an actionable reason naming the offending variable. Mirrors the TS `recordingCapability`.
+fn recording_capability(
+    ffmpeg: Option<&str>,
+    recording_dir: Option<&str>,
+    codec: &str,
+    encoder_present: impl FnOnce() -> bool,
+) -> (bool, String) {
+    if ffmpeg.is_none_or(str::is_empty) {
+        return (
+            false,
+            "Display recording requires ffmpeg, which was not found. Install ffmpeg or set \
+             QMP_MCP_FFMPEG_BINARY to its path."
+                .to_string(),
+        );
+    }
+    if recording_dir.is_none_or(|d| d.trim().is_empty()) {
+        return (
+            false,
+            "Display recording requires an output directory. Set QMP_MCP_RECORDING_DIR to the host \
+             directory recordings are written under."
+                .to_string(),
+        );
+    }
+    if !encoder_present() {
+        return (
+            false,
+            format!(
+                "Display recording codec \"{codec}\" is not compiled into this ffmpeg build \
+                 (checked ffmpeg -encoders). Set QMP_MCP_RECORDING_CODEC to an available encoder \
+                 (e.g. libx264), or rebuild ffmpeg with it."
+            ),
+        );
+    }
+    (
+        true,
+        format!("Display recording is available (ffmpeg present, codec \"{codec}\")."),
+    )
+}
+
+/// Parse the output of `ffmpeg -encoders` into the set of encoder names (ADR-0017). The listing
+/// has a flags column (six chars over `[A-Z.]`) then the encoder name and a description, after a
+/// `------` separator line; this returns the second token of every post-separator entry. Pure so
+/// it can be unit-tested against a captured corpus without spawning ffmpeg. Mirrors the TS
+/// `parseFfmpegEncoders`.
+pub fn parse_ffmpeg_encoders(output: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut past_header = false;
+    for line in output.lines() {
+        if !past_header {
+            if line.contains("------") {
+                past_header = true;
+            }
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        if let Some(flags) = tokens.next() {
+            let flags_ok =
+                flags.len() == 6 && flags.bytes().all(|b| b.is_ascii_uppercase() || b == b'.');
+            if flags_ok {
+                if let Some(name) = tokens.next() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Probe the ffmpeg build's compiled-in encoders ONCE, bounded (R1). Runs
+/// `ffmpeg -hide_banner -encoders` via `tokio::process` under a [`FFMPEG_PROBE_TIMEOUT`] so a hung
+/// or missing ffmpeg can never wedge startup, and parses the result with [`parse_ffmpeg_encoders`].
+/// Returns an empty set when ffmpeg is unresolved, cannot be run, or times out — recording is then
+/// reported unavailable. The server calls this ONCE at boot and caches the set, so
+/// `recording_encoder_available` becomes an instant in-memory lookup (no per-request spawn, no
+/// blocking call under the Orchestrator lock).
+pub async fn probe_ffmpeg_encoders(binary: Option<&str>) -> HashSet<String> {
+    let Some(binary) = binary.filter(|b| !b.is_empty()) else {
+        return HashSet::new();
+    };
+    let fut = Command::new(binary)
+        .args(["-hide_banner", "-encoders"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match tokio::time::timeout(FFMPEG_PROBE_TIMEOUT, fut).await {
+        Ok(Ok(output)) if output.status.success() => {
+            parse_ffmpeg_encoders(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => HashSet::new(),
+    }
+}
+
+/// Drain an ffmpeg child's stderr to the debug log so a full stderr pipe never blocks the encoder
+/// (R5 keeps stderr piped for the liveness check, so it must be drained for the recording's life).
+/// Ends when the pipe closes; aborted on teardown.
+async fn drain_ffmpeg_stderr(mut stderr: ChildStderr) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => tracing::debug!("ffmpeg: {}", String::from_utf8_lossy(&buf[..n]).trim_end()),
+        }
+    }
+}
+
+/// Build the ffmpeg argv for the `screendump`-loop encoder (ADR-0017), a PURE, unit-testable
+/// function pinned byte-for-byte by the shared golden corpus (`testdata/ffmpeg-argv/*.json`,
+/// ADR-0012). Reads concatenated PNG frames from stdin (`-f image2pipe -i pipe:0`), stamps each
+/// with a real wall-clock presentation timestamp (`-use_wallclock_as_timestamps 1`), encodes with
+/// the selected codec at the quality-targeted CRF and pixel format, and muxes variable-frame-rate
+/// (`-fps_mode vfr`) so the output's duration matches real elapsed time. `libx264` additionally
+/// gets the screen-content `-tune stillimage`; `-y` overwrites the output.
+///
+/// `max_fps` is intentionally NOT part of the argv: with wallclock timestamps + VFR it is only the
+/// capture-loop pacing cap, so an input `-framerate` would double-count time and skew duration. It
+/// stays in the signature (and the shared fixture tuple) so the golden corpus pins that it never
+/// leaks into the argv.
+pub fn build_ffmpeg_args(
+    codec: &str,
+    crf: u32,
+    max_fps: u32,
+    pixfmt: &str,
+    out_path: &str,
+) -> Vec<String> {
+    // Referenced only to document that max_fps is deliberately excluded from the argv (see above).
+    let _ = max_fps;
+    let mut args = vec![
+        "-f".to_string(),
+        "image2pipe".to_string(),
+        "-use_wallclock_as_timestamps".to_string(),
+        "1".to_string(),
+        "-i".to_string(),
+        "pipe:0".to_string(),
+        "-c:v".to_string(),
+        codec.to_string(),
+    ];
+    if codec == "libx264" {
+        args.push("-tune".to_string());
+        args.push("stillimage".to_string());
+    }
+    args.push("-crf".to_string());
+    args.push(crf.to_string());
+    args.push("-pix_fmt".to_string());
+    args.push(pixfmt.to_string());
+    args.push("-fps_mode".to_string());
+    args.push("vfr".to_string());
+    args.push("-y".to_string());
+    args.push(out_path.to_string());
+    args
+}
+
+/// A fresh, server-chosen transient frame path under `dir` (PID + high-resolution clock + a
+/// process-unique counter) — never agent input. The `screendump` loop writes each PNG here and
+/// re-reads it; a single reused path is safe because each frame is fully read before the next write.
+fn recording_frame_path(dir: &std::path::Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = RECORDING_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("frame-{}-{nanos}-{seq}.png", std::process::id()))
+}
+
+/// Validate an agent-supplied recording file name (ADR-0017): the SAME allowlist as `serialSpool`
+/// and the Image/ISO Store names — a single component `^[A-Za-z0-9][A-Za-z0-9._-]*` — so it can
+/// never carry a slash, `..`, or an absolute path and escape the operator's `QMP_MCP_RECORDING_DIR`.
+fn validate_recording_name(name: &str) -> Result<(), LifecycleError> {
+    let mut chars = name.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(LifecycleError(format!(
+            "Recording name \"{name}\" must match ^[A-Za-z0-9][A-Za-z0-9._-]* — a single file name \
+             under QMP_MCP_RECORDING_DIR with no slash, '..', or leading dot (never a host path)."
+        )))
+    }
+}
+
+/// Resolve the recording's host output path: `<recording_dir>/<name>.mkv` for a validated
+/// agent-supplied name, else a generated `<recording_dir>/recording-<pid>-<nanos>-<seq>.mkv`
+/// (ADR-0017). The name is validated like a Store name, so it can never escape the operator root.
+fn resolve_recording_path(
+    recording_dir: Option<&str>,
+    name: Option<&str>,
+) -> Result<String, LifecycleError> {
+    let root =
+        match recording_dir {
+            Some(d) if !d.trim().is_empty() => d,
+            _ => return Err(LifecycleError(
+                "Display recording requires QMP_MCP_RECORDING_DIR — the host directory recordings \
+                 are written under."
+                    .to_string(),
+            )),
+        };
+    let file = match name {
+        Some(n) => {
+            validate_recording_name(n)?;
+            format!("{n}.{RECORDING_EXTENSION}")
+        }
+        None => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = RECORDING_SEQ.fetch_add(1, Ordering::Relaxed);
+            format!(
+                "recording-{}-{nanos}-{seq}.{RECORDING_EXTENSION}",
+                std::process::id()
+            )
+        }
+    };
+    let mut path = PathBuf::from(root);
+    path.push(file);
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The frame-loop task body (ADR-0017): at up to the target fps, capture the Guest display via QMP
+/// `screendump` to the transient frame path, read the PNG back, and write it into ffmpeg's stdin
+/// (`image2pipe` splits the concatenated PNGs). Breaks when the Instance's QMP round-trip fails
+/// (qemu gone) or ffmpeg's stdin closes (encoder exited) — either way the recording is over.
+async fn run_recording_loop(
+    handle: Arc<dyn InstanceHandle>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    frame_path: PathBuf,
+    interval: Duration,
+) {
+    let filename = frame_path.to_string_lossy().into_owned();
+    loop {
+        let tick = Instant::now();
+        // Capture one frame to the server-chosen path (mirrors `Orchestrator::screendump`).
+        if handle
+            .execute(
+                "screendump",
+                Some(serde_json::json!({ "filename": filename, "format": "png" })),
+            )
+            .await
+            .is_err()
+        {
+            break;
+        }
+        // Read the PNG back and feed it to ffmpeg. A read error is a transient miss (skip the
+        // frame); a write error means ffmpeg is gone (stop).
+        if let Ok(bytes) = tokio::fs::read(&frame_path).await {
+            let mut guard = stdin.lock().await;
+            if guard.write_all(&bytes).await.is_err() || guard.flush().await.is_err() {
+                break;
+            }
+        }
+        // Pace to the target frame rate, accounting for the time this frame already took.
+        let elapsed = tick.elapsed();
+        if elapsed < interval {
+            sleep(interval - elapsed).await;
+        }
+    }
+}
+
+/// Fully stop a [`Recording`] (ADR-0017) and report the result: abort the frame loop and join it
+/// (releasing its stdin clone), close ffmpeg's stdin so it flushes and finalizes the container,
+/// await the child (bounded — killed if it overruns), remove the transient frame file, then stat
+/// the output. Shared by `stop_recording` (returns the result) and teardown (discards it), so a
+/// destroy / unexpected exit can never leak the ffmpeg child or a half-written file.
+async fn finalize_recording(recording: Recording) -> StopRecordingResult {
+    let Recording {
+        mut child,
+        stdin,
+        loop_task,
+        stderr_task,
+        output_path,
+        name,
+        codec,
+        frame_path,
+        started_at,
+    } = recording;
+    // Stop the loop first so it issues no more `screendump`s, then join it so its stdin clone is
+    // dropped — leaving the Recording's clone as the sole owner.
+    loop_task.abort();
+    let _ = loop_task.await;
+    // Stop draining stderr — we are tearing the child down next.
+    stderr_task.abort();
+    let _ = stderr_task.await;
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    // Close ffmpeg's stdin (drop the last reference) → EOF → ffmpeg flushes and finalizes the file.
+    drop(stdin);
+    // Give ffmpeg a bounded window to finalize; kill it if it overruns so nothing leaks.
+    if tokio::time::timeout(FFMPEG_FINALIZE_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        // R3: bound the post-kill wait too, so teardown never awaits unbounded. `kill_on_drop`
+        // (R4) is the final backstop when `child` is dropped after this returns.
+        let _ = tokio::time::timeout(FFMPEG_KILL_TIMEOUT, child.wait()).await;
+    }
+    // Remove the transient frame file (best-effort — the host is left clean).
+    let _ = tokio::fs::remove_file(&frame_path).await;
+    let size_bytes = tokio::fs::metadata(&output_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    StopRecordingResult {
+        path: output_path,
+        name,
+        codec,
+        size_bytes,
+        duration_ms,
+    }
+}
+
 /// Standard (RFC 4648) base64-decode; the inverse of [`base64_encode`]. Whitespace/newlines
 /// are ignored; invalid characters or trailing junk after padding are rejected so a bad
 /// `write_serial` payload surfaces a clear error instead of typing garbage into the guest.
@@ -1664,6 +2359,15 @@ mod tests {
             allow_serial_write: false,
             serial_backend: SerialBackend::Ringbuf,
             serial_spool_dir: None,
+            // Display recording OFF by default in tests (no ffmpeg, no output dir); the encoder
+            // probe is a deterministic stub so no ffmpeg is ever spawned (ADR-0017).
+            ffmpeg_binary: None,
+            recording_dir: None,
+            recording_codec: "libx264".to_string(),
+            recording_crf: 22,
+            recording_max_fps: 15,
+            recording_pixfmt: "yuv420p".to_string(),
+            recording_encoder_available: Box::new(|_| true),
             hostfwd_port_range: None,
             allow_host_net: false,
             auto_start: false,
@@ -2807,6 +3511,339 @@ mod tests {
         teardown_serial_bridge(bridge).await;
         assert!(!std::path::Path::new(&serial_path).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_ffmpeg_args_wires_wallclock_vfr_and_tunes_only_libx264() {
+        // ADR-0017: libx264 gets the screen-content `-tune stillimage`; the frame source is stdin
+        // via image2pipe with wallclock timestamps + VFR (no input -framerate), and CRF/pixfmt/-y
+        // are threaded through in order.
+        let args = build_ffmpeg_args("libx264", 22, 15, "yuv420p", "/out/rec.mkv");
+        assert_eq!(
+            args,
+            vec![
+                "-f",
+                "image2pipe",
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "libx264",
+                "-tune",
+                "stillimage",
+                "-crf",
+                "22",
+                "-pix_fmt",
+                "yuv420p",
+                "-fps_mode",
+                "vfr",
+                "-y",
+                "/out/rec.mkv",
+            ]
+        );
+
+        // A non-libx264 codec omits `-tune stillimage` but keeps everything else.
+        let args = build_ffmpeg_args("libx265", 28, 30, "yuv444p", "/out/rec.mkv");
+        assert!(!args.iter().any(|a| a == "stillimage"));
+        assert_eq!(
+            args,
+            vec![
+                "-f",
+                "image2pipe",
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "libx265",
+                "-crf",
+                "28",
+                "-pix_fmt",
+                "yuv444p",
+                "-fps_mode",
+                "vfr",
+                "-y",
+                "/out/rec.mkv",
+            ]
+        );
+
+        // max_fps never leaks into the argv (wallclock + VFR make it a pacing cap only); CRF 0 is
+        // accepted by the builder (range is enforced at config load, not here).
+        let a = build_ffmpeg_args("libx264", 0, 5, "yuv420p", "/out/x.mkv");
+        let b = build_ffmpeg_args("libx264", 0, 60, "yuv420p", "/out/x.mkv");
+        assert_eq!(a, b);
+        assert!(!a.iter().any(|arg| arg == "-framerate"));
+    }
+
+    #[test]
+    fn recording_capability_reason_precedence_and_availability() {
+        // No ffmpeg → unavailable, naming QMP_MCP_FFMPEG_BINARY (checked before the dir/codec).
+        let (available, reason) = recording_capability(None, Some("/out"), "libx264", || true);
+        assert!(!available);
+        assert!(reason.contains("QMP_MCP_FFMPEG_BINARY"), "got: {reason}");
+
+        // ffmpeg present but no output dir → names QMP_MCP_RECORDING_DIR.
+        let (available, reason) =
+            recording_capability(Some("/usr/bin/ffmpeg"), None, "libx264", || true);
+        assert!(!available);
+        assert!(reason.contains("QMP_MCP_RECORDING_DIR"), "got: {reason}");
+
+        // ffmpeg + dir present but the codec is absent → names the codec + QMP_MCP_RECORDING_CODEC.
+        let (available, reason) =
+            recording_capability(Some("/usr/bin/ffmpeg"), Some("/out"), "libx265", || false);
+        assert!(!available);
+        assert!(reason.contains("libx265"), "got: {reason}");
+        assert!(reason.contains("QMP_MCP_RECORDING_CODEC"), "got: {reason}");
+
+        // All three satisfied → available.
+        let (available, reason) =
+            recording_capability(Some("/usr/bin/ffmpeg"), Some("/out"), "libx264", || true);
+        assert!(available);
+        assert!(reason.contains("available"), "got: {reason}");
+    }
+
+    #[test]
+    fn recording_capability_does_not_probe_encoder_until_ffmpeg_and_dir_present() {
+        // The encoder probe (a spawn in production) must not run when ffmpeg/dir are missing.
+        let probed = Arc::new(AtomicUsize::new(0));
+        let p = Arc::clone(&probed);
+        let _ = recording_capability(None, None, "libx264", || {
+            p.fetch_add(1, SeqCst);
+            true
+        });
+        assert_eq!(
+            probed.load(SeqCst),
+            0,
+            "encoder probe must be short-circuited"
+        );
+    }
+
+    #[test]
+    fn resolve_recording_path_validates_names_and_generates_unique_ones() {
+        // A valid name resolves under the root with the .mkv container.
+        let p = resolve_recording_path(Some("/out"), Some("demo")).unwrap();
+        assert_eq!(p, "/out/demo.mkv");
+
+        // A traversing / absolute / dotted name is refused (same allowlist as serialSpool).
+        for bad in ["../escape", "a/b", "/abs", ".hidden", "has space"] {
+            let err = resolve_recording_path(Some("/out"), Some(bad)).unwrap_err();
+            assert!(
+                err.0.contains("QMP_MCP_RECORDING_DIR"),
+                "name {bad:?} gave {:?}",
+                err.0
+            );
+        }
+
+        // No name → a unique generated file under the root; two calls differ.
+        let a = resolve_recording_path(Some("/out"), None).unwrap();
+        let b = resolve_recording_path(Some("/out"), None).unwrap();
+        assert_ne!(a, b);
+        assert!(a.starts_with("/out/recording-") && a.ends_with(".mkv"));
+
+        // No output dir → fails closed naming the variable.
+        assert!(resolve_recording_path(None, Some("demo"))
+            .unwrap_err()
+            .0
+            .contains("QMP_MCP_RECORDING_DIR"));
+    }
+
+    /// Options with recording fully configured (ffmpeg + dir + a stubbed encoder probe), so the
+    /// capability is available without a real ffmpeg.
+    fn options_with_recording(encoder_present: bool) -> OrchestratorOptions {
+        let mut options = test_options();
+        options.ffmpeg_binary = Some("/usr/bin/ffmpeg".to_string());
+        options.recording_dir = Some("/tmp/qmp-mcp-recordings-test".to_string());
+        options.recording_encoder_available = Box::new(move |_| encoder_present);
+        options
+    }
+
+    #[test]
+    fn describe_recording_reports_availability_and_config() {
+        // Unavailable when unconfigured (test_options: no ffmpeg / no dir).
+        let orch = orchestrator_with(FakeQemuDriver::new());
+        let r = orch.describe_recording();
+        assert!(!r.available);
+        assert!(!r.active);
+        assert_eq!(r.codec, "libx264");
+        assert_eq!(r.crf, 22);
+        assert_eq!(r.max_fps, 15);
+        assert_eq!(r.pixfmt, "yuv420p");
+        assert!(r.reason.contains("QMP_MCP_FFMPEG_BINARY"));
+        // Converged shape (ADR-0012): outputDir + activePath are ALWAYS present (null when unset),
+        // matching the TS report which emits null rather than omitting the keys.
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("outputDir").is_some_and(|v| v.is_null()));
+        assert!(json.get("activePath").is_some_and(|v| v.is_null()));
+        // Exactly the converged key set.
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "available",
+                "reason",
+                "codec",
+                "crf",
+                "maxFps",
+                "pixfmt",
+                "active",
+                "activePath",
+                "outputDir",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<&str>>()
+        );
+
+        // Available when ffmpeg + dir + codec present.
+        let orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_recording(true),
+        );
+        let r = orch.describe_recording();
+        assert!(r.available, "got reason: {}", r.reason);
+        assert!(!r.active);
+        assert_eq!(r.active_path, None);
+        assert_eq!(
+            r.output_dir.as_deref(),
+            Some("/tmp/qmp-mcp-recordings-test")
+        );
+
+        // Configured but the selected codec is absent from the build → unavailable, naming it.
+        let orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_recording(false),
+        );
+        let r = orch.describe_recording();
+        assert!(!r.available);
+        assert!(r.reason.contains("libx264"));
+    }
+
+    #[tokio::test]
+    async fn start_recording_requires_a_running_instance_then_a_display_adapter() {
+        // No Instance → refused (never touches ffmpeg).
+        let mut orch = Orchestrator::new(
+            Box::new(FakeQemuDriver::new()),
+            options_with_recording(true),
+        );
+        assert!(orch
+            .start_recording(None)
+            .await
+            .unwrap_err()
+            .0
+            .contains("start a display recording"));
+
+        // A headless Instance (displayDevice: none) → refused with the display-adapter message,
+        // BEFORE the capability/ffmpeg spawn.
+        orch.create_instance(json!({})).await.unwrap();
+        let err = orch.start_recording(None).await.unwrap_err();
+        assert!(err.0.contains("no display adapter"), "got: {}", err.0);
+        assert!(err.0.contains("displayDevice"), "got: {}", err.0);
+    }
+
+    #[tokio::test]
+    async fn start_recording_fails_closed_when_capability_unavailable() {
+        // A displayed Instance but no ffmpeg configured → the capability check refuses it,
+        // naming the variable, without spawning anything.
+        let mut orch = orchestrator_with(FakeQemuDriver::new()); // no ffmpeg / no dir
+        orch.create_instance(json!({ "displayDevice": "vga" }))
+            .await
+            .unwrap();
+        let err = orch.start_recording(None).await.unwrap_err();
+        assert!(err.0.contains("QMP_MCP_FFMPEG_BINARY"), "got: {}", err.0);
+        assert!(orch.recording.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_recording_surfaces_an_immediate_ffmpeg_exit() {
+        // R5: point the "ffmpeg" binary at /bin/false, which exits 1 immediately. The post-spawn
+        // liveness check must catch it and surface an actionable error instead of leaving an
+        // empty file + a dead encoder behind. Uses a real (tiny) spawn — no ffmpeg needed.
+        let dir = std::env::temp_dir().join(format!("qmp-rec-r5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut options = options_with_recording(true);
+        options.ffmpeg_binary = Some("/bin/false".to_string());
+        options.recording_dir = Some(dir.to_string_lossy().into_owned());
+        let mut orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), options);
+        orch.create_instance(json!({ "displayDevice": "vga" }))
+            .await
+            .unwrap();
+        let err = orch
+            .start_recording(Some("dead".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("exited immediately"), "got: {}", err.0);
+        // No recording is left installed, and the slot is free for a retry.
+        assert!(orch.recording.is_none());
+        assert!(!orch.describe_recording().active);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_recording_result_serializes_to_the_converged_shape() {
+        // ADR-0012: exactly { path, name, codec, sizeBytes, durationMs } in camelCase.
+        let json = serde_json::to_value(StopRecordingResult {
+            path: "/rec/run1.mkv".to_string(),
+            name: "run1.mkv".to_string(),
+            codec: "libx264".to_string(),
+            size_bytes: 4096,
+            duration_ms: 1234,
+        })
+        .unwrap();
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["path", "name", "codec", "sizeBytes", "durationMs"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>()
+        );
+        assert_eq!(json.get("durationMs").and_then(|v| v.as_u64()), Some(1234));
+
+        // start result: exactly { path, name, codec }.
+        let start = serde_json::to_value(StartRecordingResult {
+            path: "/rec/run1.mkv".to_string(),
+            name: "run1.mkv".to_string(),
+            codec: "libx264".to_string(),
+        })
+        .unwrap();
+        let start_keys: std::collections::BTreeSet<&str> = start
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            start_keys,
+            ["path", "name", "codec"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>()
+        );
+    }
+
+    #[test]
+    fn parse_ffmpeg_encoders_extracts_names_after_the_separator() {
+        // Mirrors the TS parseFfmpegEncoders corpus: names come from the second token of each
+        // post-separator line whose first token is a 6-char [A-Z.] flags column.
+        let output = "Encoders:\n V..... = Video\n ------\n \
+             V....D libx264              libx264 H.264\n \
+             V....D libx265              libx265 H.265\n \
+             A....D aac                  AAC audio\n";
+        let set = parse_ffmpeg_encoders(output);
+        assert!(set.contains("libx264"));
+        assert!(set.contains("libx265"));
+        assert!(set.contains("aac"));
+        assert_eq!(set.len(), 3);
+        // No encoder table → empty.
+        assert!(parse_ffmpeg_encoders("ffmpeg version 10\nunrelated\n").is_empty());
     }
 
     #[tokio::test]

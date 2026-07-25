@@ -33,7 +33,11 @@ FROM rust:1-trixie AS chef
 # `--locked` installs cargo-chef against its own pinned lockfile for a reproducible
 # planner/cook toolchain. cargo-chef splits dependency compilation from the app
 # build so the (slow) dependency layer caches until Cargo.toml/Cargo.lock change.
-RUN cargo install cargo-chef --locked
+# The registry/git BuildKit cache mounts persist crate downloads across builds;
+# the compiled cargo-chef binary itself lands in /usr/local/cargo/bin (a real layer).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo install cargo-chef --locked
 WORKDIR /app
 
 # ── Planner: distill the dependency graph into a recipe ──────────────────────────
@@ -46,13 +50,24 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Builder: cook dependencies (cached), then compile the binary ─────────────────
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Compile ONLY the dependencies from the recipe. This heavy layer is cached and
-# reused across builds until the recipe (i.e. the dependency set) actually changes.
-RUN cargo chef cook --release --recipe-path recipe.json
+# Compile ONLY the dependencies from the recipe. This step is layer-cached until
+# the recipe (i.e. the dependency set) changes, and the BuildKit cache mounts keep
+# the crate downloads and dep artifacts across builds even when it does — a recipe
+# bump then recompiles only the deps that actually changed, not the whole set.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --release --recipe-path recipe.json
 # Now the real source (including assets/novnc for the embedded Viewer). With deps
-# already cooked, this final step recompiles only the crate itself.
+# already cooked, this final step recompiles only the crate itself. target/ is a
+# cache mount (invisible to COPY --from), so the binary is copied out to a real
+# layer path in the same RUN.
 COPY . .
-RUN cargo build --release --bin qmp-mcp
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin qmp-mcp \
+  && cp target/release/qmp-mcp /app/qmp-mcp
 
 # ── Runtime: slim Debian + QEMU, non-root ────────────────────────────────────────
 # Debian trixie (13) ships QEMU 10.0.x, well clear of the deprecations audited in
@@ -63,14 +78,21 @@ FROM debian:trixie-slim AS runtime
 # `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,
 # sparc, riscv/s390x, ...) so QMP_MCP_QEMU_BINARY can select any guest architecture
 # the Hardware Spec supports — e.g. `qemu-system-aarch64` for the raspi* boards.
-# There is no official QEMU image (ADR-0007). Clean the apt lists in the same layer
-# to keep the image lean; ca-certificates covers any outbound TLS the runtime needs.
-RUN apt-get update \
+# There is no official QEMU image (ADR-0007); ca-certificates covers any outbound
+# TLS the runtime needs. The .deb downloads and index lists live in BuildKit cache
+# mounts (sharing=locked serializes dpkg across concurrent builds), so nothing needs
+# cleaning out of the layer and repeat builds skip the downloads. Debian's stock
+# docker-clean hook would delete the cached .debs, so it is disabled first.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
   && apt-get install -y --no-install-recommends \
        qemu-system \
        qemu-utils \
        ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+       ffmpeg
 
 # Container-specific Store paths (ADR-0006/0007). Supplied via env rather than baked
 # into the code, so the host-agnostic bare-metal defaults are preserved for non-Docker
@@ -100,8 +122,9 @@ RUN groupadd --system qmp \
   && chown -R qmp:qmp /var/lib/qmp-mcp
 
 # The compiled server — the single artifact the runtime needs (the noVNC assets are
-# embedded in it). Placed on PATH so the entrypoint is just its name.
-COPY --from=builder /app/target/release/qmp-mcp /usr/local/bin/qmp-mcp
+# embedded in it). Placed on PATH so the entrypoint is just its name. /app/qmp-mcp
+# is where the builder copied it out of the target/ cache mount.
+COPY --from=builder /app/qmp-mcp /usr/local/bin/qmp-mcp
 
 USER qmp
 

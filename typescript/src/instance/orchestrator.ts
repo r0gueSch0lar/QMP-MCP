@@ -17,8 +17,13 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
+  DEFAULT_FFMPEG_BINARY,
+  DEFAULT_RECORDING_CODEC,
+  DEFAULT_RECORDING_CRF,
+  DEFAULT_RECORDING_MAX_FPS,
+  DEFAULT_RECORDING_PIXFMT,
   DEFAULT_SERIAL_BUFFER_BYTES,
   type PortRange,
   resolveAllowHostNet,
@@ -27,6 +32,7 @@ import {
   resolveAllowShareWrite,
   resolveAutoStart,
   resolveEventBufferSize,
+  resolveFfmpegBinary,
   resolveGuestShareDir,
   resolveHostfwdPortRange,
   resolveHostShareDir,
@@ -35,6 +41,11 @@ import {
   resolveMaxMemoryMb,
   resolveMaxVcpus,
   resolveQemuBinaryOverride,
+  resolveRecordingCodec,
+  resolveRecordingCrf,
+  resolveRecordingDir,
+  resolveRecordingMaxFps,
+  resolveRecordingPixfmt,
   resolveSerialBackend,
   resolveSerialBufferBytes,
   resolveSerialSpoolDir,
@@ -81,6 +92,17 @@ import {
   VNC_LOOPBACK_HOST,
   VNC_LOOPBACK_PORT,
 } from './hardware-spec.js';
+import {
+  buildFfmpegArgs,
+  FFMPEG_LIVENESS_WINDOW_MS,
+  KNOWN_RECORDING_CODECS,
+  probeFfmpegEncoders,
+  type RecordingSink,
+  type RecordingSinkFactory,
+  recordingCapability,
+  resolveRecordingPath,
+  spawnFfmpegSink,
+} from './recording.js';
 
 /**
  * The lifecycle states an Instance moves through. `PAUSED` is entered by
@@ -127,6 +149,81 @@ export interface ScreendumpResult {
   data: string;
   /** Size of the decoded image in bytes. */
   bytes: number;
+}
+
+/**
+ * Result of a successful {@link Orchestrator.startRecording} (ADR-0017). Converged with the Rust
+ * `StartRecordingResult` to exactly `{ path, name, codec }` (ADR-0012 parity).
+ */
+export interface RecordingStartResult {
+  /** Absolute host path the recording is being written to (the operator retrieves it here). */
+  path: string;
+  /** The output file's base name (the agent-supplied or server-chosen name). */
+  name: string;
+  /** The codec the recording is encoded with. */
+  codec: string;
+}
+
+/**
+ * Result of a successful {@link Orchestrator.stopRecording} (ADR-0017). Converged with the Rust
+ * `StopRecordingResult` to exactly `{ path, name, codec, sizeBytes, durationMs }` — bytes as
+ * `sizeBytes`, duration in milliseconds as `durationMs` (ADR-0012 parity).
+ */
+export interface RecordingStopResult {
+  /** Absolute host path the finalized recording was written to. */
+  path: string;
+  /** The output file's base name. */
+  name: string;
+  /** The codec the recording was encoded with. */
+  codec: string;
+  /** Size of the finalized file in bytes (0 if it could not be stat'd). */
+  sizeBytes: number;
+  /** How long the recording ran, in milliseconds. */
+  durationMs: number;
+}
+
+/**
+ * A read-only report of the Display-recording capability and state ({@link
+ * Orchestrator.describeRecording}, the `get_recording` tool). The shape `get_serial`/`get_share`
+ * established, converged with the Rust `RecordingReport` to exactly
+ * `{ available, reason, codec, crf, maxFps, pixfmt, active, activePath, outputDir }` (ADR-0012
+ * parity). Extra diagnostics (which codecs the build carries, the resolved ffmpeg binary) are
+ * folded into `reason`.
+ */
+export interface RecordingStatus {
+  /** Whether recording is currently available (ffmpeg + recording dir + codec present). */
+  available: boolean;
+  /** Actionable reason for the availability verdict, either way (folds any extra diagnostics). */
+  reason: string;
+  /** The resolved recording codec. */
+  codec: string;
+  /** The resolved CRF. */
+  crf: number;
+  /** The resolved max fps (the capture-loop pacing cap). */
+  maxFps: number;
+  /** The resolved pixel format. */
+  pixfmt: string;
+  /** Whether a recording is currently running. */
+  active: boolean;
+  /** When active, the host path being written to; otherwise null. */
+  activePath: string | null;
+  /** The operator recording root (`QMP_MCP_RECORDING_DIR`), or null when unset. */
+  outputDir: string | null;
+}
+
+/**
+ * The single active Display recording (ADR-0017): the ffmpeg encoder sink, the frame-loop
+ * timer that polls QMP `screendump`, the output path, and metadata. Owned by the Instance and
+ * released on stop, destroy, and unexpected-exit teardown so no process or half-written file
+ * leaks — the instance-scoped discipline the serial socket bridge established.
+ */
+interface Recording {
+  sink: RecordingSink;
+  timer: NodeJS.Timeout;
+  path: string;
+  name: string;
+  codec: string;
+  startedAt: number;
 }
 
 /** Knobs the Orchestrator needs that are not part of the Hardware Spec. */
@@ -188,6 +285,37 @@ export interface OrchestratorOptions {
   serialBackend?: SerialBackend;
   /** Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or undefined. */
   serialSpoolDir?: string;
+  /**
+   * The `ffmpeg` binary used for Display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017).
+   * Optional: defaults to `ffmpeg` (resolved via `PATH`) when omitted.
+   */
+  ffmpegBinary?: string;
+  /**
+   * Operator root Display recordings are written under (`QMP_MCP_RECORDING_DIR`, ADR-0017),
+   * or undefined when unset — in which case recording is unavailable. The agent may only name
+   * the file (validated) under this root, never choose a host path (the spool trust model).
+   */
+  recordingDir?: string;
+  /** Display-recording codec / ffmpeg encoder (`QMP_MCP_RECORDING_CODEC`, default `libx264`). */
+  recordingCodec?: string;
+  /** Display-recording CRF (constant-quality) rate factor (`QMP_MCP_RECORDING_CRF`, default 22). */
+  recordingCrf?: number;
+  /** Display-recording max fps the screendump loop targets (`QMP_MCP_RECORDING_MAX_FPS`, default 15). */
+  recordingMaxFps?: number;
+  /** Display-recording output pixel format (`QMP_MCP_RECORDING_PIXFMT`, default `yuv420p`). */
+  recordingPixfmt?: string;
+  /**
+   * Probe returning the encoders compiled into the ffmpeg build, or undefined when ffmpeg is
+   * unavailable (ADR-0017). Injected for testability; the singleton wires in the real
+   * `ffmpeg -encoders` probe. The result is memoized after the first success (host-level).
+   */
+  ffmpegEncoders?: () => Promise<string[] | undefined>;
+  /**
+   * Factory that spawns the ffmpeg encoder sink for a recording (ADR-0017). Injected so the
+   * recording lifecycle is testable without a real ffmpeg; the singleton wires in the real
+   * child-process sink.
+   */
+  spawnFfmpeg?: RecordingSinkFactory;
   /**
    * Inclusive host-port range a user-mode port-forward's `hostPort` must fall
    * within (ADR-0009). Optional: defaults to {@link DEFAULT_HOSTFWD_PORT_RANGE}
@@ -298,6 +426,15 @@ export function defaultQmpSocketPath(): string {
   return join(tmpdir(), 'qmp-mcp', 'qmp.sock');
 }
 
+/**
+ * Server-controlled scratch directory for the recording frame loop's transient PNGs
+ * (ADR-0017). Each frame is captured to a fresh, unguessable file here, read back, piped to
+ * ffmpeg, and deleted — never an agent-influenced path (like {@link Orchestrator.screendump}).
+ */
+function recordingFrameDir(): string {
+  return join(tmpdir(), 'qmp-mcp', 'recordings');
+}
+
 /** Default occupied-check: the path exists (as a socket or anything else). */
 export async function defaultSocketOccupied(path: string): Promise<boolean> {
   try {
@@ -340,6 +477,30 @@ export class Orchestrator {
    * so a superseded launch cannot clobber a slot another call has since taken.
    */
   #launchToken?: symbol;
+  /** The single active Display recording (ADR-0017), or undefined when none is running. */
+  #recording?: Recording;
+  /**
+   * Set synchronously by {@link startRecording} the instant it wins the start, BEFORE any await
+   * (T4): it claims the single-recording slot so two overlapping starts can never both spawn
+   * ffmpeg — the loser sees the claim and aborts. Cleared once the recording is fully installed
+   * (or the start failed). Mirrors {@link destroyInstance}'s synchronous-claim discipline.
+   */
+  #recordingStarting = false;
+  /** Resolved recording knobs: codec/CRF/fps/pixfmt, the ffmpeg binary, and the operator root. */
+  #recordingCfg: {
+    ffmpegBinary: string;
+    recordingDir?: string;
+    codec: string;
+    crf: number;
+    maxFps: number;
+    pixfmt: string;
+  };
+  /** Probe for the ffmpeg build's encoders (injected; the real `ffmpeg -encoders` by default). */
+  #ffmpegEncoders: () => Promise<string[] | undefined>;
+  /** Memoized successful encoder probe — the build's encoders do not change at runtime. */
+  #cachedEncoders?: string[];
+  /** Factory that spawns the ffmpeg encoder sink (injected; the real child-process sink by default). */
+  #spawnFfmpeg: RecordingSinkFactory;
 
   constructor(driver: QemuDriver, options: OrchestratorOptions) {
     this.#driver = driver;
@@ -349,6 +510,20 @@ export class Orchestrator {
     this.#eventBuffer = new EventBuffer(options.eventBufferSize ?? DEFAULT_EVENT_BUFFER_SIZE);
     // Default to the real in-process Viewer; tests inject a fake factory.
     this.#startViewer = options.startViewer ?? startRealViewer;
+    // Resolve the recording knobs once, applying the ADR-0017 defaults for any omitted.
+    this.#recordingCfg = {
+      ffmpegBinary: options.ffmpegBinary ?? DEFAULT_FFMPEG_BINARY,
+      recordingDir: options.recordingDir,
+      codec: options.recordingCodec ?? DEFAULT_RECORDING_CODEC,
+      crf: options.recordingCrf ?? DEFAULT_RECORDING_CRF,
+      maxFps: options.recordingMaxFps ?? DEFAULT_RECORDING_MAX_FPS,
+      pixfmt: options.recordingPixfmt ?? DEFAULT_RECORDING_PIXFMT,
+    };
+    // Default to the real ffmpeg spawn + `-encoders` probe; tests inject fakes so the
+    // recording lifecycle is exercisable without a real ffmpeg.
+    this.#spawnFfmpeg = options.spawnFfmpeg ?? spawnFfmpegSink;
+    this.#ffmpegEncoders =
+      options.ffmpegEncoders ?? (() => probeFfmpegEncoders(this.#recordingCfg.ffmpegBinary));
   }
 
   /** Return the current Instance view. Reports `NONE` when nothing is running. */
@@ -695,6 +870,9 @@ export class Orchestrator {
     this.#eventBuffer.reset();
     logger.info('destroying Instance');
     try {
+      // Stop any active recording FIRST (ADR-0017): abort the frame loop and finalize the
+      // ffmpeg output so nothing leaks a process or a half-written file.
+      await this.#teardownRecording();
       // Stop the Viewer alongside qemu — its lifetime equals the Instance's (ADR-0010).
       await viewer?.stop().catch(() => undefined);
       await process.close();
@@ -835,6 +1013,221 @@ export class Orchestrator {
   }
 
   /**
+   * Start recording the Instance's Display to a video file (ADR-0017), using the documented
+   * `screendump`-loop → ffmpeg FALLBACK: a frame loop polls QMP `screendump` at ~`maxFps` and
+   * pipes the PNG frames to a co-located ffmpeg encoding them under the operator recording root.
+   *
+   * Validates, fail-closed, in order: an Instance is running, it has a display device (a
+   * framebuffer screendump can capture), recording is available (ffmpeg + recording dir + codec),
+   * and no recording is already active. The agent may only NAME the file (validated with the same
+   * allowlist as `serialSpool`), resolved under `QMP_MCP_RECORDING_DIR`; it can never choose a
+   * host path. Returns the host path the operator retrieves the finished file from.
+   */
+  async startRecording(name?: string): Promise<RecordingStartResult> {
+    const process = this.#requireInstance('start a Display recording');
+    // QMP screendump captures a framebuffer, so a display device must be present (ADR-0017).
+    if (this.#spec?.displayDevice === undefined || this.#spec.displayDevice === 'none') {
+      throw new LifecycleError(
+        'This Instance has no display device, so there is no framebuffer to record. Recreate it ' +
+          'with a displayDevice (e.g. "virtio-gpu", "vga", or "ramfb") — screendump-based ' +
+          'recording needs a display adapter.',
+      );
+    }
+    // T4: reject if a recording is running OR another start already won the race. Both checks
+    // are synchronous; the claim below happens before the first await so two overlapping starts
+    // can never both spawn ffmpeg — the loser hits this guard.
+    if (this.#recording || this.#recordingStarting) {
+      throw new LifecycleError(
+        'A recording is already running. Stop it with stop_recording before starting another.',
+      );
+    }
+    // Claim the single-recording slot SYNCHRONOUSLY (T4), then release it in finally — either the
+    // recording is installed (#recording set) or the start failed.
+    this.#recordingStarting = true;
+    try {
+      const cfg = this.#recordingCfg;
+      const encoders = await this.#resolveEncoders();
+      const cap = recordingCapability({
+        recordingDir: cfg.recordingDir,
+        codec: cfg.codec,
+        encoders,
+      });
+      if (!cap.available) {
+        throw new LifecycleError(cap.reason);
+      }
+      // Resolve the agent-named (or server-chosen) output under the operator root; a validated
+      // single-segment name can never escape it. Ensure the output and frame-scratch dirs exist.
+      const path = resolveRecordingPath(cfg.recordingDir, name);
+      try {
+        await mkdir(dirname(path), { recursive: true });
+        await mkdir(recordingFrameDir(), { recursive: true });
+      } catch (err) {
+        // T6: surface a directory-creation failure as an actionable message (parity with Rust).
+        throw new LifecycleError(
+          `Failed to create the recording directory under QMP_MCP_RECORDING_DIR (${cfg.recordingDir}): ` +
+            `${err instanceof Error ? err.message : String(err)}. Check the path exists and is writable.`,
+        );
+      }
+
+      // Spawn ffmpeg reading the PNG frame pipe (image2pipe).
+      const args = buildFfmpegArgs(cfg.codec, cfg.crf, cfg.maxFps, cfg.pixfmt, path);
+      const sink = this.#spawnFfmpeg(cfg.ffmpegBinary, args);
+
+      // Post-spawn liveness (T5, parity with Rust R5): an ffmpeg that dies immediately (bad
+      // codec/pixfmt/output) must surface as an actionable start error, not a silent empty file.
+      const liveness = await sink.checkAlive(FFMPEG_LIVENESS_WINDOW_MS);
+      if (!liveness.alive) {
+        await sink.abort().catch(() => undefined);
+        await rm(path, { force: true }).catch(() => undefined);
+        throw new LifecycleError(
+          `ffmpeg exited immediately after starting the recording (${cfg.ffmpegBinary}, codec ` +
+            `"${cfg.codec}", pixfmt "${cfg.pixfmt}"). Check the codec/pixel-format/output path. ` +
+            `ffmpeg stderr: ${liveness.stderr || '(none)'}`,
+        );
+      }
+
+      const startedAt = Date.now();
+      const intervalMs = Math.max(1, Math.round(1000 / cfg.maxFps));
+      // Serialize captures: a slow screendump must never overlap the next tick.
+      let capturing = false;
+      const captureOnce = async (): Promise<void> => {
+        if (capturing) return;
+        capturing = true;
+        try {
+          const frame = await this.#captureFrame(process);
+          // Only write while THIS recording is still the active one (a stop/teardown
+          // between the screendump and here must not write to a finished sink).
+          if (this.#recording?.sink === sink) {
+            // T3: honour backpressure — if the encoder's pipe is full, pause the loop until it
+            // drains so a slow encoder can never grow the heap unbounded.
+            const ok = sink.writeFrame(frame);
+            if (!ok) await sink.drain();
+          }
+        } catch (err) {
+          logger.warning(
+            `recording frame capture failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } finally {
+          capturing = false;
+        }
+      };
+      const timer = setInterval(() => void captureOnce(), intervalMs);
+      const rec: Recording = {
+        sink,
+        timer,
+        path,
+        name: basename(path),
+        codec: cfg.codec,
+        startedAt,
+      };
+      this.#recording = rec;
+      // Best-effort initial frame so even an immediately-stopped recording holds content.
+      await captureOnce();
+      logger.info(`recording started: ${path} (codec=${cfg.codec}, maxFps=${cfg.maxFps})`);
+      return { path, name: rec.name, codec: cfg.codec };
+    } finally {
+      this.#recordingStarting = false;
+    }
+  }
+
+  /**
+   * Stop the active Display recording (ADR-0017): abort the frame loop, end the ffmpeg input,
+   * and await the encoder finalizing the container so the file on disk is valid. Returns the
+   * host path, size, and duration. Rejects when no recording is running.
+   */
+  async stopRecording(): Promise<RecordingStopResult> {
+    const rec = this.#recording;
+    if (!rec) {
+      throw new LifecycleError('No recording is running. Start one with start_recording first.');
+    }
+    // Claim the stop synchronously so a concurrent stop hits the guard above.
+    this.#recording = undefined;
+    clearInterval(rec.timer);
+    // Bounded (T1): finish() force-kills ffmpeg if it overruns the finalize window, so stop
+    // never hangs on a wedged encoder.
+    await rec.sink.finish();
+    const durationMs = Date.now() - rec.startedAt;
+    const sizeBytes = await stat(rec.path)
+      .then((s) => s.size)
+      .catch(() => 0);
+    logger.info(`recording stopped: ${rec.path} (${sizeBytes} bytes, ${durationMs} ms)`);
+    return { path: rec.path, name: rec.name, codec: rec.codec, sizeBytes, durationMs };
+  }
+
+  /**
+   * Report the Display-recording capability and state (the `get_recording` tool, ADR-0017).
+   * Advisory and read-only — like {@link describeShare}/{@link describeSerial} it reports config
+   * even with no Instance running. Converged with the Rust `describe_recording` to exactly
+   * `{ available, reason, codec, crf, maxFps, pixfmt, active, activePath, outputDir }` (ADR-0012);
+   * extra diagnostics (which known codecs the build carries) are folded into `reason`. Async
+   * because the capability probe runs `ffmpeg -encoders`.
+   */
+  async describeRecording(): Promise<RecordingStatus> {
+    const cfg = this.#recordingCfg;
+    const encoders = await this.#resolveEncoders();
+    const cap = recordingCapability({ recordingDir: cfg.recordingDir, codec: cfg.codec, encoders });
+    // Fold the extra "which known codecs this build carries" diagnostic into the reason so no
+    // useful signal is lost when the schema is trimmed to the converged shape.
+    let reason = cap.reason;
+    if (encoders !== undefined) {
+      const present = KNOWN_RECORDING_CODECS.filter((codec) => encoders.includes(codec));
+      reason += ` Known codecs in this ffmpeg build: ${present.length > 0 ? present.join(', ') : 'none'}.`;
+    }
+    return {
+      available: cap.available,
+      reason,
+      codec: cfg.codec,
+      crf: cfg.crf,
+      maxFps: cfg.maxFps,
+      pixfmt: cfg.pixfmt,
+      active: this.#recording !== undefined,
+      activePath: this.#recording?.path ?? null,
+      outputDir: cfg.recordingDir ?? null,
+    };
+  }
+
+  /**
+   * Capture one Display frame via QMP `screendump` to a server-chosen temp PNG, read it back,
+   * and delete it — the per-frame unit of the fallback pipeline (ADR-0017). Like
+   * {@link screendump}, the path is ALWAYS server-chosen and never agent-influenced.
+   */
+  async #captureFrame(process: InstanceProcess): Promise<Buffer> {
+    const filename = join(recordingFrameDir(), `frame-${randomUUID()}.png`);
+    try {
+      await process.execute('screendump', { filename, format: 'png' });
+      return await readFile(filename);
+    } finally {
+      await rm(filename, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Resolve the ffmpeg build's encoders, memoizing the first successful probe (the build's
+   * encoders do not change at runtime). A failed probe (undefined) is not cached, so a later
+   * call retries — e.g. after the operator installs ffmpeg.
+   */
+  async #resolveEncoders(): Promise<string[] | undefined> {
+    if (this.#cachedEncoders) return this.#cachedEncoders;
+    const encoders = await this.#ffmpegEncoders();
+    if (encoders) this.#cachedEncoders = encoders;
+    return encoders;
+  }
+
+  /**
+   * Stop any active recording as part of Instance teardown (destroy AND unexpected exit): abort
+   * the frame loop and FINISH (not kill) the ffmpeg child so the partial recording is finalized
+   * into a valid file. Reuses the instance-scoped discipline the serial socket bridge established
+   * so recording never leaks a process or a half-written file (ADR-0017).
+   */
+  async #teardownRecording(): Promise<void> {
+    const rec = this.#recording;
+    if (!rec) return;
+    this.#recording = undefined;
+    clearInterval(rec.timer);
+    await rec.sink.finish().catch(() => undefined);
+  }
+
+  /**
    * Run a generic QMP command against the running Instance, gated by the Command
    * Policy (ADR-0003). The command name is checked FIRST: a denied command throws
    * a {@link CommandPolicyError} and never reaches the QMP Session — fail-closed,
@@ -926,12 +1319,21 @@ export class Orchestrator {
     logger.warning('Instance process exited unexpectedly; resetting state to NONE');
     const process = this.#process;
     const viewer = this.#viewer;
+    // Claim any active recording synchronously alongside the rest of the teardown, then
+    // finalize the ffmpeg output off-tick (ADR-0017) so an unexpected qemu exit leaves a
+    // valid partial file behind rather than leaking the encoder process.
+    const recording = this.#recording;
+    this.#recording = undefined;
     this.#process = undefined;
     this.#viewer = undefined;
     this.#spec = undefined;
     this.#accel = undefined;
     this.#launchToken = undefined;
     this.#state = 'NONE';
+    if (recording) {
+      clearInterval(recording.timer);
+      void recording.sink.finish().catch(() => undefined);
+    }
     // The Instance is gone: stop capturing and clear the buffer (settling any
     // pending wait_for_event), so no events bleed into the next Instance.
     this.#unsubscribeEvents?.();
@@ -981,6 +1383,15 @@ export const orchestrator = new Orchestrator(new RealQemuDriver(), {
   serialBackend: resolveSerialBackend(process.env),
   serialSpoolDir: resolveSerialSpoolDir(process.env),
   allowSerialWrite: resolveAllowSerialWrite(process.env),
+  // Display recording (ADR-0017): the ffmpeg binary, operator output root, and the
+  // codec/CRF/fps/pixfmt knobs. Capability-gated on ffmpeg + the codec being present; the
+  // real ffmpeg spawn + `-encoders` probe default in unless a test injects fakes.
+  ffmpegBinary: resolveFfmpegBinary(process.env),
+  recordingDir: resolveRecordingDir(process.env),
+  recordingCodec: resolveRecordingCodec(process.env),
+  recordingCrf: resolveRecordingCrf(process.env),
+  recordingMaxFps: resolveRecordingMaxFps(process.env),
+  recordingPixfmt: resolveRecordingPixfmt(process.env),
   // Bound user-mode port-forwards and gate host networking (ADR-0009).
   hostfwdPortRange: resolveHostfwdPortRange(process.env),
   allowHostNet: resolveAllowHostNet(process.env),

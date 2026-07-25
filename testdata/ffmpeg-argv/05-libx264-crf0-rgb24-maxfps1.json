@@ -1,0 +1,28 @@
+{
+  "description": "libx264 lossless (CRF 0) with -tune stillimage, rgb24 pixels, and the minimum maxFps 1; wallclock + VFR.",
+  "codec": "libx264",
+  "crf": 0,
+  "maxFps": 1,
+  "pixfmt": "rgb24",
+  "out": "/rec/ll.mkv",
+  "expectedArgv": [
+    "-f",
+    "image2pipe",
+    "-use_wallclock_as_timestamps",
+    "1",
+    "-i",
+    "pipe:0",
+    "-c:v",
+    "libx264",
+    "-tune",
+    "stillimage",
+    "-crf",
+    "0",
+    "-pix_fmt",
+    "rgb24",
+    "-fps_mode",
+    "vfr",
+    "-y",
+    "/rec/ll.mkv"
+  ]
+}

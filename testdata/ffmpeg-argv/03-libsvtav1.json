@@ -1,0 +1,26 @@
+{
+  "description": "libsvtav1 carries no -tune stillimage; standard CRF + VFR + wallclock timestamps.",
+  "codec": "libsvtav1",
+  "crf": 35,
+  "maxFps": 15,
+  "pixfmt": "yuv420p",
+  "out": "/rec/a.mkv",
+  "expectedArgv": [
+    "-f",
+    "image2pipe",
+    "-use_wallclock_as_timestamps",
+    "1",
+    "-i",
+    "pipe:0",
+    "-c:v",
+    "libsvtav1",
+    "-crf",
+    "35",
+    "-pix_fmt",
+    "yuv420p",
+    "-fps_mode",
+    "vfr",
+    "-y",
+    "/rec/a.mkv"
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "description": "libx264 default: gets the screen-content -tune stillimage; wallclock timestamps + VFR (no input -framerate) so duration matches real time.",
+  "codec": "libx264",
+  "crf": 22,
+  "maxFps": 15,
+  "pixfmt": "yuv420p",
+  "out": "/rec/out.mkv",
+  "expectedArgv": [
+    "-f",
+    "image2pipe",
+    "-use_wallclock_as_timestamps",
+    "1",
+    "-i",
+    "pipe:0",
+    "-c:v",
+    "libx264",
+    "-tune",
+    "stillimage",
+    "-crf",
+    "22",
+    "-pix_fmt",
+    "yuv420p",
+    "-fps_mode",
+    "vfr",
+    "-y",
+    "/rec/out.mkv"
+  ]
+}
