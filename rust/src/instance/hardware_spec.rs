@@ -1107,6 +1107,14 @@ fn build_serial_args(
                 spec.serial_spool.as_deref(),
             )?)
         ),
+        // A server-owned UNIX socket QEMU listens on (`server=on,wait=off` so it never
+        // blocks boot); the Orchestrator dials it and pumps bytes both ways. The path is
+        // derived from the managed QMP socket dir — never agent/operator input — so it
+        // cannot inject an extra chardev property.
+        SerialBackend::Socket => format!(
+            "socket,id={SERIAL_CHARDEV_ID},path={},server=on,wait=off",
+            escape_qemu_opts_value(&serial_socket_path(&options.qmp_socket_path))
+        ),
     };
     Ok(vec![
         "-chardev".to_string(),
@@ -1141,6 +1149,21 @@ pub fn resolve_serial_spool_path(
     }
     path.push("serial.log");
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// The server-owned UNIX socket path for the socket-backend Serial Port (ADR-0015): a
+/// `serial.sock` sibling of the managed QMP socket, so it lives in the same server-owned
+/// runtime directory. Derived purely from the QMP socket path — never agent- or operator-
+/// supplied — so it can never inject an extra chardev property. Used by both the argv
+/// generator (the `socket` chardev's `path=`) and the Orchestrator (which dials it).
+pub fn serial_socket_path(qmp_socket_path: &str) -> String {
+    let p = std::path::Path::new(qmp_socket_path);
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join("serial.sock").to_string_lossy().into_owned()
+        }
+        _ => "serial.sock".to_string(),
+    }
 }
 
 /// Validate a `serialSpool` subdirectory name (ADR-0015): the same charset as Image/ISO Store
@@ -1947,6 +1970,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.0.contains("serialSpool"));
+    }
+
+    #[test]
+    fn socket_backend_emits_listening_socket_chardev_beside_the_qmp_socket() {
+        // The socket backend emits a server-mode UNIX socket chardev (never blocking boot),
+        // at a serial.sock sibling of the managed QMP socket, bound to the first UART.
+        let mut o = opts();
+        o.serial_backend = SerialBackend::Socket;
+        o.qmp_socket_path = "/run/qmp-mcp/qmp.sock".to_string();
+        let argv = build_argv(&spec(json!({ "serial": true })), &o).unwrap();
+        assert_eq!(
+            value_after(&argv, "-chardev"),
+            "socket,id=serialbuf,path=/run/qmp-mcp/serial.sock,server=on,wait=off"
+        );
+        assert_eq!(value_after(&argv, "-serial"), "chardev:serialbuf");
+        assert_eq!(
+            serial_socket_path("/run/qmp-mcp/qmp.sock"),
+            "/run/qmp-mcp/serial.sock"
+        );
     }
 
     #[test]

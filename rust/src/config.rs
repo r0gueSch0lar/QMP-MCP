@@ -134,15 +134,21 @@ pub enum SerialBackend {
     Ringbuf,
     /// Host file under the operator's `QMP_MCP_SERIAL_SPOOL_DIR`; read non-destructively (tail).
     Spool,
+    /// A server-owned UNIX-domain `socket` chardev bridged onto the Serial Port: QEMU listens,
+    /// the server connects and pumps bytes both ways. Unlike ringbuf, input reaches the guest as
+    /// a real connected serial line (interactive `write_serial`); output is captured in a bounded
+    /// in-server ring that `read_serial` drains.
+    Socket,
 }
 
 impl SerialBackend {
-    const ALLOWED: &'static str = "ringbuf, spool";
+    const ALLOWED: &'static str = "ringbuf, spool, socket";
 
     fn parse(raw: &str) -> Option<Self> {
         match raw.to_lowercase().as_str() {
             "ringbuf" => Some(Self::Ringbuf),
             "spool" => Some(Self::Spool),
+            "socket" => Some(Self::Socket),
             _ => None,
         }
     }
@@ -152,12 +158,18 @@ impl SerialBackend {
         match self {
             Self::Ringbuf => "ringbuf",
             Self::Spool => "spool",
+            Self::Socket => "socket",
         }
     }
 
     /// Whether this backend writes to a host file and thus needs `QMP_MCP_SERIAL_SPOOL_DIR`.
     pub fn is_spool(self) -> bool {
         matches!(self, Self::Spool)
+    }
+
+    /// Whether this backend bridges the Serial Port over a server-owned UNIX socket.
+    pub fn is_socket(self) -> bool {
+        matches!(self, Self::Socket)
     }
 }
 
@@ -1347,6 +1359,16 @@ mod tests {
         assert_eq!(c.serial_spool_dir.as_deref(), Some("/var/log/qmp-serial"));
         let e = load_config(&env(&[("QMP_MCP_SERIAL_BACKEND", "spool")])).unwrap_err();
         assert!(e.0.contains("QMP_MCP_SERIAL_SPOOL_DIR"));
+    }
+
+    #[test]
+    fn serial_backend_parses_socket_and_needs_no_spool_dir() {
+        // The socket backend derives its UNIX socket from the server-owned QMP socket dir,
+        // so it needs no extra operator config (unlike spool).
+        let c = load_config(&env(&[("QMP_MCP_SERIAL_BACKEND", "socket")])).unwrap();
+        assert_eq!(c.serial_backend, SerialBackend::Socket);
+        assert!(c.serial_backend.is_socket() && !c.serial_backend.is_spool());
+        assert_eq!(SerialBackend::Socket.as_str(), "socket");
     }
 
     #[test]
