@@ -79,6 +79,13 @@ bytes = "1"
 # TS orchestrator's `crypto.randomInt`. Already in the tree transitively; used
 # directly here for the one password draw. No modulo bias.
 getrandom = "0.4"
+# The ISO downloader's HTTP client (ADR-0018): streams distro images to disk over the
+# network for the `download_iso` tool. `rustls-tls` (with webpki-roots) keeps TLS pure-Rust
+# — no OpenSSL/native-tls in the build — and redirects are followed by default (distros
+# redirect heavily). `stream` gives `Response::bytes_stream()` for bounded-memory streaming
+# to the temp file; `charset`/`http2`/native-tls defaults are off (unused here). Only the
+# real `Fetcher` touches it; the manager's state machine is tested against a fake.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 # JWT verification for the HTTP transport's `QMP_MCP_AUTH=jwt` middleware (slice #29,
 # ADR-0005/0011), mirroring the TS `JWTAuthProvider` (which wraps npm `jsonwebtoken`).
 # The `jsonwebtoken` crate is the well-maintained Rust equivalent. The middleware pins
