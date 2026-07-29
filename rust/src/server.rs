@@ -21,6 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::instance::catalog::CatalogEntry;
+use crate::instance::download::{DownloadManager, DownloadReport, DownloadStatus};
 use crate::instance::event_buffer::{ReadResult, WaitForEventResult};
 use crate::instance::hardware_spec::{AccelMode, DisplayMode, HardwareSpec, HardwareSpecParams};
 use crate::instance::image_store::{
@@ -236,6 +238,28 @@ pub struct CreateImageParams {
     pub format: ImageFormat,
 }
 
+/// Validated input for `download_iso`: the catalog id to fetch. Mirrors the TS `download_iso`
+/// zod schema (a single required `id` string).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DownloadIsoParams {
+    /// The catalog id of the OS image to download (e.g. `ubuntu`, `debian`, `archlinux`). Use
+    /// list_iso_catalog to see the available ids.
+    pub id: String,
+}
+
+/// The result reported by `list_iso_catalog`: the catalog's provenance and its entries (each with
+/// id, name, the save filename, and the mirror URLs).
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogReport {
+    /// Where the catalog came from (`built-in` or a configured file path).
+    pub source: String,
+    /// Number of entries.
+    pub count: usize,
+    /// The available OS images.
+    pub isos: Vec<CatalogEntry>,
+}
+
 /// The result reported by `get_instance` and `destroy_instance`: the lifecycle
 /// state, plus the spec/accel when an Instance exists.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -259,6 +283,7 @@ pub struct QmpMcpServer {
     orchestrator: Arc<Mutex<Orchestrator>>,
     image_store: ImageStore,
     iso_store: IsoStore,
+    downloader: DownloadManager,
     tool_router: ToolRouter<Self>,
 }
 
@@ -304,6 +329,7 @@ impl QmpMcpServer {
         orchestrator: Arc<Mutex<Orchestrator>>,
         image_store: ImageStore,
         iso_store: IsoStore,
+        downloader: DownloadManager,
     ) -> Self {
         // schemars tags integer fields with non-standard JSON-Schema `format` hints
         // (uint32/int64/…); strip them from every tool schema so strict clients don't
@@ -323,6 +349,7 @@ impl QmpMcpServer {
             orchestrator,
             image_store,
             iso_store,
+            downloader,
             tool_router,
         }
     }
@@ -772,6 +799,63 @@ impl QmpMcpServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(Json(listing))
     }
+
+    /// Read-only. List the OS images the downloader can fetch into the ISO Store (ADR-0018): each
+    /// entry's `id` (what download_iso selects), name, the filename it is saved as, and its mirror
+    /// URLs. The list is the built-in catalog unless QMP_MCP_ISO_CATALOG points at a custom one.
+    #[tool(
+        description = "List the OS installation images available to download into the ISO Store, \
+                       from the download catalog. Each entry has an id (pass it to download_iso), a \
+                       name, the filename it will be saved as, and one or more mirror URLs. The \
+                       catalog is the built-in list unless QMP_MCP_ISO_CATALOG overrides it. \
+                       Read-only."
+    )]
+    async fn list_iso_catalog(&self) -> Json<CatalogReport> {
+        let catalog = self.downloader.catalog();
+        Json(CatalogReport {
+            source: catalog.source.clone(),
+            count: catalog.entries.len(),
+            isos: catalog.entries.clone(),
+        })
+    }
+
+    /// Start downloading a catalog entry into the ISO Store (ADR-0018). Returns immediately with the
+    /// initial (downloading) status; the fetch runs in the background — poll get_download for
+    /// progress. Fails closed when downloading is disabled (QMP_MCP_ALLOW_DOWNLOAD), the id is
+    /// unknown, the target already exists, or a download is already in progress.
+    #[tool(
+        description = "Start downloading an OS image (by catalog id) into the ISO Store. DISABLED by \
+                       default: the server must run with QMP_MCP_ALLOW_DOWNLOAD=true, else this \
+                       fails closed. Returns immediately — the multi-GB fetch runs in the \
+                       background; poll get_download for progress. Mirrors are tried in order and \
+                       the file is atomically renamed into place on success. Fails if the id is \
+                       unknown (see list_iso_catalog), the file already exists, or a download is \
+                       already running (only one at a time)."
+    )]
+    async fn download_iso(
+        &self,
+        Parameters(params): Parameters<DownloadIsoParams>,
+    ) -> Result<Json<DownloadStatus>, McpError> {
+        let status = self
+            .downloader
+            .start(&params.id)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(Json(status))
+    }
+
+    /// Read-only. Report the downloader's capability (whether QMP_MCP_ALLOW_DOWNLOAD is set) and the
+    /// current or most recent download's progress: state, bytes/total/percent, the mirror in use,
+    /// and the final path once complete (ADR-0018). Infallible.
+    #[tool(
+        description = "Report the ISO downloader status: whether downloading is enabled, the \
+                       catalog source and size, whether a download is active, and the current or \
+                       most recent download's progress (state, bytesDownloaded/totalBytes/percent, \
+                       the mirror being tried, and the final path on completion). Read-only."
+    )]
+    async fn get_download(&self) -> Json<DownloadReport> {
+        Json(self.downloader.describe().await)
+    }
 }
 
 #[tool_handler]
@@ -854,8 +938,16 @@ mod tests {
             run: None,
         });
         let iso_store = IsoStore::new("/nonexistent/qmp-mcp-iso-store".to_string());
+        // A downloader over the built-in catalog with downloading DISABLED (allow_download=false),
+        // so the download tools' wiring is exercised while the gate stays fail-closed.
+        let downloader = DownloadManager::new(crate::instance::download::DownloadManagerOptions {
+            iso_dir: "/nonexistent/qmp-mcp-iso-store".to_string(),
+            allow_download: false,
+            catalog: crate::instance::catalog::load_catalog(None).unwrap(),
+            fetcher: Arc::new(crate::instance::download::ReqwestFetcher::new()),
+        });
         (
-            QmpMcpServer::new(orchestrator, image_store, iso_store),
+            QmpMcpServer::new(orchestrator, image_store, iso_store, downloader),
             events,
         )
     }
@@ -951,6 +1043,10 @@ mod tests {
             "create_image",
             "list_images",
             "list_isos",
+            // ISO download catalog (ADR-0018).
+            "list_iso_catalog",
+            "download_iso",
+            "get_download",
         ] {
             assert!(
                 server.tool_router.has_route(name),
@@ -988,6 +1084,32 @@ mod tests {
             panic!("create_image must reject a traversing name");
         };
         assert!(err.to_string().contains("path separator"));
+    }
+
+    /// The download tools round-trip through the server surface: the catalog lists the built-in
+    /// entries, and — with downloading disabled in the test server — get_download reports
+    /// unavailable and download_iso fails closed naming the gate.
+    #[tokio::test]
+    async fn download_tools_surface_capability_and_gate() {
+        let server = test_server();
+
+        let catalog = server.list_iso_catalog().await.0;
+        assert_eq!(catalog.count, 24);
+        assert!(catalog.isos.iter().any(|e| e.id == "ubuntu"));
+
+        let report = server.get_download().await.0;
+        assert!(!report.available);
+        assert!(!report.active);
+
+        let Err(err) = server
+            .download_iso(Parameters(DownloadIsoParams {
+                id: "ubuntu".to_string(),
+            }))
+            .await
+        else {
+            panic!("download_iso must fail closed when QMP_MCP_ALLOW_DOWNLOAD is not set");
+        };
+        assert!(err.to_string().contains("QMP_MCP_ALLOW_DOWNLOAD"));
     }
 
     #[tokio::test]

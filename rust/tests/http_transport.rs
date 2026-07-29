@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use qmp_mcp::config::{load_config, Config};
 use qmp_mcp::http::build_router;
+use qmp_mcp::instance::catalog::load_catalog;
+use qmp_mcp::instance::download::{DownloadManager, DownloadManagerOptions, ReqwestFetcher};
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
 use qmp_mcp::instance::orchestrator::{Orchestrator, OrchestratorOptions};
@@ -96,7 +98,13 @@ fn test_server() -> QmpMcpServer {
         run: None,
     });
     let iso_store = IsoStore::new("/nonexistent/qmp-mcp-iso-store".to_string());
-    QmpMcpServer::new(orchestrator, image_store, iso_store)
+    let downloader = DownloadManager::new(DownloadManagerOptions {
+        iso_dir: "/nonexistent/qmp-mcp-iso-store".to_string(),
+        allow_download: false,
+        catalog: load_catalog(None).unwrap(),
+        fetcher: Arc::new(ReqwestFetcher::new()),
+    });
+    QmpMcpServer::new(orchestrator, image_store, iso_store, downloader)
 }
 
 /// Serve the production router on an ephemeral loopback port, returning its address.

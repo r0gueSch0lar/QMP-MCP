@@ -219,6 +219,14 @@ pub struct Config {
     pub image_dir: String,
     /// Absolute path of the read-only ISO Store directory (ADR-0006).
     pub iso_dir: String,
+    /// Path to a custom ISO download catalog JSON (`QMP_MCP_ISO_CATALOG`), or `None` when unset —
+    /// in which case the built-in bundled catalog (the 24-distro list embedded at build time) is
+    /// used. When set it must be an absolute path to a readable JSON file (ADR-0018).
+    pub iso_catalog: Option<String>,
+    /// Whether the ISO downloader is enabled (`QMP_MCP_ALLOW_DOWNLOAD`, ADR-0018; default false ⇒
+    /// disabled). It is outbound network egress that writes files into the ISO Store, so it is an
+    /// operator opt-in the agent can never grant itself — `download_iso` fails closed until true.
+    pub allow_download: bool,
     /// Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`), or `None` when
     /// unset — in which case the binary is DERIVED per-instance from the spec's
     /// `machine` (`qemu-system-x86_64` for q35/pc, `qemu-system-aarch64` for
@@ -531,6 +539,24 @@ pub fn resolve_iso_dir(env: &EnvMap) -> String {
     join(&tmp_dir(env), &["qmp-mcp", "isos"])
 }
 
+/// Resolve `QMP_MCP_ISO_CATALOG` — the path to a custom ISO download catalog JSON (ADR-0018), or
+/// `None` when unset/blank (⇒ the built-in bundled catalog is used). When set it must be an
+/// ABSOLUTE path (a relative one resolves against an ambient CWD); the file's readability and
+/// validity are checked where the catalog is loaded, not here. Mirrors the TS `resolveIsoCatalog`.
+pub fn resolve_iso_catalog(env: &EnvMap) -> Result<Option<String>, ConfigError> {
+    let value = match trimmed_non_empty(env, "QMP_MCP_ISO_CATALOG") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if !value.starts_with('/') {
+        return Err(ConfigError(format!(
+            "QMP_MCP_ISO_CATALOG must be an absolute path (got \"{value}\"). It is the path to a \
+             custom ISO download catalog JSON; leave it unset to use the built-in list."
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Resolve and validate an EXPLICIT `qemu-system-*` binary override
 /// (`QMP_MCP_QEMU_BINARY`), or `None` when unset or blank/whitespace-only. An explicit
 /// value is trimmed and must be a **bare command name** (resolved via `PATH`) or an
@@ -715,6 +741,12 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         allow_insecure,
         image_dir: resolve_image_dir(env),
         iso_dir: resolve_iso_dir(env),
+        iso_catalog: resolve_iso_catalog(env)?,
+        allow_download: parse_boolean(
+            "QMP_MCP_ALLOW_DOWNLOAD",
+            get(env, "QMP_MCP_ALLOW_DOWNLOAD"),
+            false,
+        )?,
         qemu_binary_override: qemu_binary_override(env)?,
         max_disk_gb: parse_positive_int(
             "QMP_MCP_MAX_DISK_GB",
@@ -811,6 +843,8 @@ mod tests {
             allow_insecure: false,
             image_dir: DEFAULT_IMAGE_DIR.into(),
             iso_dir: DEFAULT_ISO_DIR.into(),
+            iso_catalog: None,
+            allow_download: false,
             qemu_binary_override: None,
             max_disk_gb: 64,
             max_memory_mb: 4096,
@@ -1044,6 +1078,46 @@ mod tests {
         assert!(err
             .0
             .contains("QMP_MCP_ALLOW_INSECURE must be \"true\" or \"false\""));
+    }
+
+    #[test]
+    fn iso_catalog_defaults_none_and_requires_absolute() {
+        assert_eq!(load_config(&env(&[])).unwrap().iso_catalog, None);
+        // Blank/whitespace reads as unset (⇒ built-in list).
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_ISO_CATALOG", "  ")]))
+                .unwrap()
+                .iso_catalog,
+            None
+        );
+        let cfg = load_config(&env(&[(
+            "QMP_MCP_ISO_CATALOG",
+            "/etc/qmp-mcp/catalog.json",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.iso_catalog.as_deref(),
+            Some("/etc/qmp-mcp/catalog.json")
+        );
+        // A relative path is rejected (it would resolve against an ambient CWD).
+        let err = load_config(&env(&[("QMP_MCP_ISO_CATALOG", "catalog.json")])).unwrap_err();
+        assert!(err
+            .0
+            .contains("QMP_MCP_ISO_CATALOG must be an absolute path"));
+    }
+
+    #[test]
+    fn allow_download_defaults_false_and_parses_bool() {
+        assert!(!load_config(&env(&[])).unwrap().allow_download);
+        assert!(
+            load_config(&env(&[("QMP_MCP_ALLOW_DOWNLOAD", "true")]))
+                .unwrap()
+                .allow_download
+        );
+        let err = load_config(&env(&[("QMP_MCP_ALLOW_DOWNLOAD", "yes")])).unwrap_err();
+        assert!(err
+            .0
+            .contains("QMP_MCP_ALLOW_DOWNLOAD must be \"true\" or \"false\""));
     }
 
     #[test]

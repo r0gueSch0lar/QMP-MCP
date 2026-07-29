@@ -216,6 +216,7 @@ The agent's vocabulary — the actions it can take:
 | `get_events` / `wait_for_event` | recent QEMU events / block until a named one arrives |
 | `qmp_execute` | a raw QMP command, gated by the Command Policy |
 | `create_image` / `list_images` / `list_isos` | make a disk image / list disks / list boot ISOs |
+| `list_iso_catalog` / `download_iso` / `get_download` | list the OS-image download catalog / fetch one into the ISO Store (gated by `QMP_MCP_ALLOW_DOWNLOAD`) / poll download progress |
 
 For the exact per-implementation tool tables, see the
 [TypeScript](typescript/README.md#the-tools) and [Rust](rust/README.md#the-tools) READMEs.
@@ -378,6 +379,8 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | `QMP_MCP_API_KEYS` | _(unset)_ | API keys for the HTTP transport (required unless insecure) |
 | `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | usually unset — the emulator is derived from the `machine` (q35→x86_64, virt/raspi*→aarch64, ADR-0013); set it to force one emulator for every Instance |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
+| `QMP_MCP_ALLOW_DOWNLOAD` | `false` | enable `download_iso` to fetch OS images into the ISO Store (default off; the agent can never enable it) |
+| `QMP_MCP_ISO_CATALOG` | _(built-in)_ | path to a custom download-catalog JSON (unset ⇒ the bundled 24-distro list) |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced on the Viewer's HTTP Basic auth (default: username ignored, password-only) |
 | `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ sharing off; ADR-0014) |

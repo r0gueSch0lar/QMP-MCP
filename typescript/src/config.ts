@@ -95,6 +95,19 @@ export interface Config {
    */
   isoDir: string;
   /**
+   * Path to a custom ISO download catalog JSON (`QMP_MCP_ISO_CATALOG`, ADR-0018), or
+   * `undefined` when unset — in which case the built-in bundled catalog (the 24-distro list
+   * shipped with the server) is used. When set it must be an absolute path to a readable JSON
+   * file (validated where the catalog is loaded, not here).
+   */
+  isoCatalog?: string;
+  /**
+   * Whether the ISO downloader is enabled (`QMP_MCP_ALLOW_DOWNLOAD`, ADR-0018; default false ⇒
+   * disabled). Outbound network egress that writes files into the ISO Store, so it is an
+   * operator opt-in the agent can never grant itself — `download_iso` fails closed until true.
+   */
+  allowDownload: boolean;
+  /**
    * Explicit `qemu-system-*` binary override (`QMP_MCP_QEMU_BINARY`), or `undefined`
    * when unset — in which case the Orchestrator DERIVES the binary from each Instance's
    * `machine` (q35/pc → x86_64, virt/raspi* → aarch64; ADR-0013). Set it only to force a
@@ -368,6 +381,34 @@ export function resolveIsoDir(env: NodeJS.ProcessEnv): string {
   const home = env.HOME?.trim();
   if (home) return join(home, '.local', 'share', 'qmp-mcp', 'isos');
   return join(tmpdir(), 'qmp-mcp', 'isos');
+}
+
+/**
+ * Resolve `QMP_MCP_ISO_CATALOG` — the path to a custom ISO download catalog JSON (ADR-0018),
+ * or undefined when unset/blank (⇒ the built-in bundled catalog). When set it must be an
+ * ABSOLUTE path (a relative one resolves against an ambient CWD); the file's readability and
+ * validity are checked where the catalog is loaded, not here. Mirrors the Rust `resolve_iso_catalog`.
+ */
+export function resolveIsoCatalog(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_ISO_CATALOG?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  if (!raw.startsWith('/')) {
+    throw new ConfigError(
+      `QMP_MCP_ISO_CATALOG must be an absolute path (got "${raw}"). It is the path to a custom ` +
+        'ISO download catalog JSON; leave it unset to use the built-in list.',
+    );
+  }
+  return raw;
+}
+
+/**
+ * Resolve whether the ISO downloader is enabled (`QMP_MCP_ALLOW_DOWNLOAD`, default false —
+ * ADR-0018). Fail-closed: downloading (network egress that writes into the ISO Store) is off
+ * unless the operator explicitly enables it, mirroring `QMP_MCP_ALLOW_SERIAL_WRITE`. Exported
+ * so the download manager and {@link loadConfig} share one source of truth.
+ */
+export function resolveAllowDownload(env: NodeJS.ProcessEnv): boolean {
+  return parseBoolean('QMP_MCP_ALLOW_DOWNLOAD', env.QMP_MCP_ALLOW_DOWNLOAD, false);
 }
 
 /**
@@ -716,6 +757,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     allowInsecure,
     imageDir: resolveImageDir(env),
     isoDir: resolveIsoDir(env),
+    isoCatalog: resolveIsoCatalog(env),
+    allowDownload: resolveAllowDownload(env),
     qemuBinaryOverride: resolveQemuBinaryOverride(env),
     maxDiskGb: resolveMaxDiskGb(env),
     maxMemoryMb: resolveMaxMemoryMb(env),
