@@ -1,10 +1,12 @@
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildPolicy, CommandPolicyError } from '../policy/command-policy.js';
 import { FakeQemuDriver } from '../qemu/fake-driver.js';
-import { HardwareSpecError } from './hardware-spec.js';
+import { HardwareSpecError, serialSocketPath } from './hardware-spec.js';
 import {
   defaultSocketOccupied,
   LifecycleError,
@@ -793,5 +795,73 @@ describe('defaultSocketOccupied', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Orchestrator socket serial backend (ADR-0015)', () => {
+  it('captures boot output (drain), writes input, reports socket, and tears down', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'qmp-orch-sock-'));
+    const qmpSock = join(dir, 'qmp.sock');
+    const serialSock = serialSocketPath(qmpSock);
+    const received: Buffer[] = [];
+    // A fake-QEMU UNIX server on the serial socket: greet on connect, record what is written.
+    const server = createServer((conn) => {
+      conn.on('data', (c: Buffer) => received.push(c));
+      conn.write(Buffer.from('BOOTLOG'));
+    });
+    await new Promise<void>((resolve) => server.listen(serialSock, resolve));
+    const orch = makeOrchestrator(new FakeQemuDriver(), {
+      qmpSocketPath: qmpSock,
+      serialBackend: 'socket',
+      allowSerialWrite: true,
+      autoStart: true,
+    });
+    try {
+      await orch.createInstance({ serial: true });
+      expect(orch.describeSerial()).toMatchObject({
+        backend: 'socket',
+        readSemantics: 'drain',
+        writable: true,
+        enabled: true,
+      });
+      // read_serial drains the captured greeting (destructive).
+      let out = '';
+      for (let i = 0; i < 50 && out.length === 0; i++) {
+        out = (await orch.readSerial(undefined, 'utf8')).output;
+        if (out.length === 0) await tick();
+      }
+      expect(out).toBe('BOOTLOG');
+      // write_serial reaches the fake QEMU over the connected line.
+      await orch.writeSerial('login\n', 'utf8');
+      let got = '';
+      for (let i = 0; i < 50 && got !== 'login\n'; i++) {
+        got = Buffer.concat(received).toString();
+        if (got !== 'login\n') await tick();
+      }
+      expect(got).toBe('login\n');
+      // Teardown stops the reader and unlinks the server-owned socket.
+      await orch.destroyInstance();
+      expect(existsSync(serialSock)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses when the serial socket path is already occupied (stale/foreign)', async () => {
+    const orch = makeOrchestrator(new FakeQemuDriver(), {
+      serialBackend: 'socket',
+      // The QMP socket is free, but serial.sock is occupied → refuse (mirrors the QMP guard).
+      socketOccupied: async (p) => p.endsWith('serial.sock'),
+    });
+    await expect(orch.createInstance({ serial: true })).rejects.toThrow(
+      /Serial Port socket path .* already occupied/s,
+    );
+  });
+
+  it('read_serial on the socket backend fails closed when no bridge is attached', async () => {
+    // Socket backend but no Instance → the "no Instance" guard fires first.
+    const orch = makeOrchestrator(new FakeQemuDriver(), { serialBackend: 'socket' });
+    await expect(orch.readSerial(undefined, 'utf8')).rejects.toThrow(/no Instance/i);
   });
 });
