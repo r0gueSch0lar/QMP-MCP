@@ -1,0 +1,264 @@
+{
+  "$comment": "Built-in qmp-mcp ISO download catalog (ADR-0018). The downloader (download_iso / get_download / list_iso_catalog) resolves an entry by `id` and fetches it into the ISO Store, trying each URL in `mirrors` in order. `filename` is the bare name the image is saved as inside the ISO Store (it is validated against the store name allowlist and is deliberately decoupled from the URL basename, so the stored name stays stable and clean). URLs are BEST-EFFORT starting points captured at authoring time and WILL go stale as distros publish new releases (rolling distros especially) — override the whole file with QMP_MCP_ISO_CATALOG to point at your own maintained catalog. Some entries (e.g. rhel) require authentication/entitlement and will not download from a public URL without it.",
+  "version": 1,
+  "isos": [
+    {
+      "id": "ubuntu",
+      "name": "Ubuntu",
+      "edition": "24.04 LTS Desktop",
+      "arch": "x86_64",
+      "filename": "ubuntu-24.04-desktop-amd64.iso",
+      "mirrors": [
+        "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-desktop-amd64.iso",
+        "https://mirror.us.leaseweb.net/ubuntu-releases/24.04/ubuntu-24.04.4-desktop-amd64.iso",
+        "https://mirrors.kernel.org/ubuntu-releases/24.04/ubuntu-24.04.4-desktop-amd64.iso"
+      ]
+    },
+    {
+      "id": "linuxmint",
+      "name": "Linux Mint",
+      "edition": "22 Cinnamon",
+      "arch": "x86_64",
+      "filename": "linuxmint-22-cinnamon.iso",
+      "mirrors": [
+        "https://mirrors.edge.kernel.org/linuxmint/stable/22/linuxmint-22-cinnamon-64bit.iso",
+        "https://mirror.rackspace.com/linuxmint/iso/stable/22/linuxmint-22-cinnamon-64bit.iso"
+      ]
+    },
+    {
+      "id": "zorinos",
+      "name": "Zorin OS",
+      "edition": "17.2 Core",
+      "arch": "x86_64",
+      "filename": "zorin-os-17-core.iso",
+      "mirrors": [
+        "https://mirrors.dotsrc.org/zorinos/17/Zorin-OS-17.2-Core-64-bit.iso"
+      ]
+    },
+    {
+      "id": "popos",
+      "name": "Pop!_OS",
+      "edition": "22.04 LTS (Intel/AMD)",
+      "arch": "x86_64",
+      "filename": "pop-os-22.04-amd64.iso",
+      "mirrors": [
+        "https://iso.pop-os.org/22.04/amd64/intel/57/pop-os_22.04_amd64_intel_57.iso"
+      ]
+    },
+    {
+      "id": "elementaryos",
+      "name": "elementary OS",
+      "edition": "8.0 (no stable public direct URL — override with your download link)",
+      "arch": "x86_64",
+      "filename": "elementaryos-8.iso",
+      "mirrors": [
+        "https://mirror.fcix.net/elementaryOS/isos/stable/elementaryos-8.0-stable.20250125.iso"
+      ]
+    },
+    {
+      "id": "fedora",
+      "name": "Fedora",
+      "edition": "44 Workstation",
+      "arch": "x86_64",
+      "filename": "fedora-44-workstation.iso",
+      "mirrors": [
+        "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso",
+        "https://mirrors.kernel.org/fedora/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso"
+      ]
+    },
+    {
+      "id": "opensuse",
+      "name": "openSUSE",
+      "edition": "Leap 15.6 DVD",
+      "arch": "x86_64",
+      "filename": "opensuse-leap-15.6.iso",
+      "mirrors": [
+        "https://download.opensuse.org/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso",
+        "https://mirrors.kernel.org/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso"
+      ]
+    },
+    {
+      "id": "archlinux",
+      "name": "Arch Linux",
+      "edition": "Latest monthly ISO",
+      "arch": "x86_64",
+      "filename": "archlinux-x86_64.iso",
+      "mirrors": [
+        "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso",
+        "https://mirror.rackspace.com/archlinux/iso/latest/archlinux-x86_64.iso",
+        "https://mirrors.kernel.org/archlinux/iso/latest/archlinux-x86_64.iso"
+      ]
+    },
+    {
+      "id": "manjaro",
+      "name": "Manjaro",
+      "edition": "24.2 KDE Plasma",
+      "arch": "x86_64",
+      "filename": "manjaro-kde-24.2.iso",
+      "mirrors": [
+        "https://download.manjaro.org/kde/24.2.1/manjaro-kde-24.2.1-241216-linux612.iso"
+      ]
+    },
+    {
+      "id": "endeavouros",
+      "name": "EndeavourOS",
+      "edition": "Endeavour neo 2024.09.22",
+      "arch": "x86_64",
+      "filename": "endeavouros.iso",
+      "mirrors": [
+        "https://mirror.alpix.eu/endeavouros/iso/EndeavourOS_Endeavour_neo-2024.09.22.iso",
+        "https://mirror.fcix.net/endeavouros/iso/EndeavourOS_Endeavour_neo-2024.09.22.iso"
+      ]
+    },
+    {
+      "id": "gentoo",
+      "name": "Gentoo",
+      "edition": "amd64 minimal install CD",
+      "arch": "x86_64",
+      "filename": "gentoo-amd64-minimal.iso",
+      "mirrors": [
+        "https://distfiles.gentoo.org/releases/amd64/autobuilds/current-install-amd64-minimal/install-amd64-minimal-20260712T170110Z.iso",
+        "https://mirror.rackspace.com/gentoo/releases/amd64/autobuilds/current-install-amd64-minimal/install-amd64-minimal-20260712T170110Z.iso"
+      ]
+    },
+    {
+      "id": "nixos",
+      "name": "NixOS",
+      "edition": "24.11 minimal",
+      "arch": "x86_64",
+      "filename": "nixos-24.11-minimal.iso",
+      "mirrors": [
+        "https://channels.nixos.org/nixos-24.11/latest-nixos-minimal-x86_64-linux.iso"
+      ]
+    },
+    {
+      "id": "voidlinux",
+      "name": "Void Linux",
+      "edition": "x86_64 glibc base live",
+      "arch": "x86_64",
+      "filename": "void-live-x86_64.iso",
+      "mirrors": [
+        "https://repo-default.voidlinux.org/live/current/void-live-x86_64-20250202-base.iso",
+        "https://mirrors.servercentral.com/voidlinux/live/current/void-live-x86_64-20250202-base.iso"
+      ]
+    },
+    {
+      "id": "slackware",
+      "name": "Slackware",
+      "edition": "15.0 install DVD",
+      "arch": "x86_64",
+      "filename": "slackware64-15.0-install-dvd.iso",
+      "mirrors": [
+        "https://mirrors.slackware.com/slackware/slackware-iso/slackware64-15.0-iso/slackware64-15.0-install-dvd.iso",
+        "https://mirror.rackspace.com/slackware/slackware-iso/slackware64-15.0-iso/slackware64-15.0-install-dvd.iso"
+      ]
+    },
+    {
+      "id": "debian",
+      "name": "Debian",
+      "edition": "13 (trixie) netinst",
+      "arch": "x86_64",
+      "filename": "debian-13-netinst.iso",
+      "mirrors": [
+        "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso",
+        "https://mirrors.kernel.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso"
+      ]
+    },
+    {
+      "id": "rhel",
+      "name": "Red Hat Enterprise Linux",
+      "edition": "9 (x86_64 DVD — requires a Red Hat subscription; override with your entitled URL)",
+      "arch": "x86_64",
+      "filename": "rhel-9-x86_64-dvd.iso",
+      "mirrors": [
+        "https://developers.redhat.com/products/rhel/download"
+      ]
+    },
+    {
+      "id": "cachyos",
+      "name": "CachyOS",
+      "edition": "Desktop",
+      "arch": "x86_64",
+      "filename": "cachyos-desktop.iso",
+      "mirrors": [
+        "https://mirror.cachyos.org/ISO/desktop/241221/cachyos-desktop-linux-241221.iso",
+        "https://iso.cachyos.org/desktop/241221/cachyos-desktop-linux-241221.iso"
+      ]
+    },
+    {
+      "id": "rockylinux",
+      "name": "Rocky Linux",
+      "edition": "9 minimal",
+      "arch": "x86_64",
+      "filename": "rocky-9-minimal.iso",
+      "mirrors": [
+        "https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso",
+        "https://mirrors.kernel.org/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
+      ]
+    },
+    {
+      "id": "alpine",
+      "name": "Alpine Linux",
+      "edition": "3.21 virt (VM-optimized)",
+      "arch": "x86_64",
+      "filename": "alpine-virt-3.21-x86_64.iso",
+      "mirrors": [
+        "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-virt-3.21.0-x86_64.iso",
+        "https://mirrors.edge.kernel.org/alpine/v3.21/releases/x86_64/alpine-virt-3.21.0-x86_64.iso"
+      ]
+    },
+    {
+      "id": "lubuntu",
+      "name": "Lubuntu",
+      "edition": "24.04 LTS Desktop",
+      "arch": "x86_64",
+      "filename": "lubuntu-24.04-desktop-amd64.iso",
+      "mirrors": [
+        "https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/lubuntu-24.04.4-desktop-amd64.iso",
+        "https://mirror.us.leaseweb.net/ubuntu-cdimage/lubuntu/releases/24.04/release/lubuntu-24.04.4-desktop-amd64.iso"
+      ]
+    },
+    {
+      "id": "xubuntu",
+      "name": "Xubuntu",
+      "edition": "24.04 LTS Desktop",
+      "arch": "x86_64",
+      "filename": "xubuntu-24.04-desktop-amd64.iso",
+      "mirrors": [
+        "https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/xubuntu-24.04.4-desktop-amd64.iso"
+      ]
+    },
+    {
+      "id": "bodhi",
+      "name": "Bodhi Linux",
+      "edition": "7.0.0 (64-bit)",
+      "arch": "x86_64",
+      "filename": "bodhi-7.0.0-64.iso",
+      "mirrors": [
+        "https://sourceforge.net/projects/bodhilinux/files/7.0.0/bodhi-7.0.0-64.iso/download",
+        "https://cytranet.dl.sourceforge.net/project/bodhilinux/7.0.0/bodhi-7.0.0-64.iso"
+      ]
+    },
+    {
+      "id": "tails",
+      "name": "Tails",
+      "edition": "7.10 (amd64 ISO)",
+      "arch": "x86_64",
+      "filename": "tails-amd64-7.10.iso",
+      "mirrors": [
+        "https://download.tails.net/tails/stable/tails-amd64-7.10/tails-amd64-7.10.iso"
+      ]
+    },
+    {
+      "id": "qubesos",
+      "name": "Qubes OS",
+      "edition": "R4.2.3",
+      "arch": "x86_64",
+      "filename": "qubes-r4.2.3-x86_64.iso",
+      "mirrors": [
+        "https://ftp.qubes-os.org/iso/Qubes-R4.2.3-x86_64.iso",
+        "https://mirrors.edge.kernel.org/qubes/iso/Qubes-R4.2.3-x86_64.iso"
+      ]
+    }
+  ]
+}

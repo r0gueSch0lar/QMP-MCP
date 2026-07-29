@@ -4,6 +4,8 @@
 //! `../../typescript/src/instance/*` so the two servers can be cross-validated against the
 //! same domain ADRs and the shared golden fixtures (ADR-0012).
 
+pub mod catalog;
+pub mod download;
 pub mod event_buffer;
 pub mod hardware_spec;
 pub mod image_store;
