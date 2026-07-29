@@ -191,6 +191,27 @@ export interface Config {
   /** Operator root for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`), or undefined. */
   serialSpoolDir?: string;
   /**
+   * The `ffmpeg` binary used for Display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017),
+   * default `ffmpeg` (resolved via `PATH`). An explicit value must be a bare command name
+   * or an absolute path over `[A-Za-z0-9._/+-]`. Recording is capability-gated on this
+   * binary being runnable AND carrying the selected codec (`ffmpeg -encoders`).
+   */
+  ffmpegBinary: string;
+  /**
+   * Operator root directory Display recordings are written under (`QMP_MCP_RECORDING_DIR`,
+   * ADR-0017), or undefined when unset (recording then unavailable). Like the serial spool
+   * dir, it is operator-owned: the agent may only name the file (validated) under this root.
+   */
+  recordingDir?: string;
+  /** Display-recording video codec / ffmpeg encoder (`QMP_MCP_RECORDING_CODEC`, default `libx264`). */
+  recordingCodec: string;
+  /** Display-recording CRF (constant-quality) rate factor (`QMP_MCP_RECORDING_CRF`, default 22). */
+  recordingCrf: number;
+  /** Display-recording max frames per second the screendump loop targets (`QMP_MCP_RECORDING_MAX_FPS`, default 15). */
+  recordingMaxFps: number;
+  /** Display-recording output pixel format (`QMP_MCP_RECORDING_PIXFMT`, default `yuv420p`). */
+  recordingPixfmt: string;
+  /**
    * When true, a Hardware Spec's `extraArgs` (raw QEMU arguments) are appended to
    * the generated argv (`QMP_MCP_ALLOW_RAW_ARGS`). Default false: raw args are
    * host-compromise-equivalent, so a spec carrying `extraArgs` is REFUSED unless
@@ -305,6 +326,28 @@ function parsePositiveInt(varName: string, raw: string | undefined, fallback: nu
     throw new ConfigError(`${varName} must be a positive integer >= 1 (got "${raw}").`);
   }
   return Number(value);
+}
+
+/**
+ * Parse an integer env var constrained to an inclusive `[min, max]` range. Treats
+ * undefined or empty as unset and returns the fallback; otherwise requires a base-10
+ * integer within the range and fails closed on anything else (garbage, out-of-range)
+ * rather than silently coercing or clamping.
+ */
+function parseIntInRange(
+  varName: string,
+  raw: string | undefined,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim();
+  const n = Number(value);
+  if (!/^\d+$/.test(value) || n < min || n > max) {
+    throw new ConfigError(`${varName} must be an integer in ${min}..${max} (got "${raw}").`);
+  }
+  return n;
 }
 
 /**
@@ -629,6 +672,123 @@ export function resolveSerialSpoolDir(env: NodeJS.ProcessEnv): string | undefine
   return raw;
 }
 
+/** Default `ffmpeg` binary for Display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017): resolved via `PATH`. */
+export const DEFAULT_FFMPEG_BINARY = 'ffmpeg';
+/** Default Display-recording codec (`QMP_MCP_RECORDING_CODEC`, ADR-0017): the always-present `libx264`. */
+export const DEFAULT_RECORDING_CODEC = 'libx264';
+/** Default Display-recording CRF (`QMP_MCP_RECORDING_CRF`, ADR-0017). */
+export const DEFAULT_RECORDING_CRF = 22;
+/** Default Display-recording max fps the screendump loop targets (`QMP_MCP_RECORDING_MAX_FPS`, ADR-0017). */
+export const DEFAULT_RECORDING_MAX_FPS = 15;
+/** Default Display-recording output pixel format (`QMP_MCP_RECORDING_PIXFMT`, ADR-0017). */
+export const DEFAULT_RECORDING_PIXFMT = 'yuv420p';
+
+/**
+ * Resolve the `ffmpeg` binary used for Display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017),
+ * defaulting to `ffmpeg` (resolved via `PATH`). An explicit value is validated exactly like
+ * {@link resolveQemuBinaryOverride}: a bare command name (resolved via `PATH`) or an absolute
+ * path over `[A-Za-z0-9._/+-]`, failing closed on whitespace, shell metacharacters, control
+ * characters, or a relative path so a foot-gun never reaches the spawn. Exported so the
+ * Orchestrator singleton and {@link loadConfig} share one source of truth.
+ */
+export function resolveFfmpegBinary(env: NodeJS.ProcessEnv): string {
+  const raw = env.QMP_MCP_FFMPEG_BINARY;
+  if (raw === undefined) return DEFAULT_FFMPEG_BINARY;
+  const value = raw.trim();
+  if (value === '') return DEFAULT_FFMPEG_BINARY;
+  const charsetOk = /^[A-Za-z0-9._/+-]+$/.test(value);
+  const shapeOk = !value.includes('/') || value.startsWith('/');
+  if (!charsetOk || !shapeOk) {
+    throw new ConfigError(
+      `QMP_MCP_FFMPEG_BINARY must be a bare command name or an absolute path over ` +
+        `[A-Za-z0-9._/+-] (no whitespace, shell metacharacters, or control ` +
+        `characters) (got "${value}").`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Resolve `QMP_MCP_RECORDING_DIR` — the operator's absolute root directory Display recordings
+ * are written under (ADR-0017). Blank reads as unset; a relative path is rejected. Mirrors
+ * {@link resolveSerialSpoolDir}: it is operator-owned, and the agent may only name the file
+ * (validated) under this root.
+ */
+export function resolveRecordingDir(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.QMP_MCP_RECORDING_DIR?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  if (!raw.startsWith('/')) {
+    throw new ConfigError(
+      `QMP_MCP_RECORDING_DIR must be an absolute path (got "${raw}"). It is the host directory ` +
+        'Display recordings are written under.',
+    );
+  }
+  return raw;
+}
+
+/**
+ * Resolve the Display-recording codec / ffmpeg encoder (`QMP_MCP_RECORDING_CODEC`, default
+ * `libx264`). Restricted to a safe charset so the value can never inject extra ffmpeg
+ * arguments; the capability probe separately confirms the encoder is compiled into the build.
+ */
+export function resolveRecordingCodec(env: NodeJS.ProcessEnv): string {
+  const raw = env.QMP_MCP_RECORDING_CODEC?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_RECORDING_CODEC;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(raw)) {
+    throw new ConfigError(
+      `QMP_MCP_RECORDING_CODEC must match ^[A-Za-z0-9][A-Za-z0-9._+-]* — a single ffmpeg encoder ` +
+        `name such as libx264, libx265, libvpx-vp9, or libsvtav1 (got "${raw}").`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Resolve the Display-recording CRF (constant-quality) rate factor (`QMP_MCP_RECORDING_CRF`,
+ * default 22). Integer in 0..63 (0 = lossless; the useful range spans x264's 0..51 and
+ * vp9/av1's 0..63), fail-closed on garbage or out-of-range.
+ */
+export function resolveRecordingCrf(env: NodeJS.ProcessEnv): number {
+  return parseIntInRange(
+    'QMP_MCP_RECORDING_CRF',
+    env.QMP_MCP_RECORDING_CRF,
+    0,
+    63,
+    DEFAULT_RECORDING_CRF,
+  );
+}
+
+/**
+ * Resolve the Display-recording max fps the screendump loop targets (`QMP_MCP_RECORDING_MAX_FPS`,
+ * default 15). Integer in 1..60, fail-closed on garbage or out-of-range.
+ */
+export function resolveRecordingMaxFps(env: NodeJS.ProcessEnv): number {
+  return parseIntInRange(
+    'QMP_MCP_RECORDING_MAX_FPS',
+    env.QMP_MCP_RECORDING_MAX_FPS,
+    1,
+    60,
+    DEFAULT_RECORDING_MAX_FPS,
+  );
+}
+
+/**
+ * Resolve the Display-recording output pixel format (`QMP_MCP_RECORDING_PIXFMT`, default
+ * `yuv420p`). Restricted to an alphanumeric charset (ffmpeg pixel-format tokens such as
+ * yuv420p, yuv444p, rgb24) so the value can never inject extra ffmpeg arguments.
+ */
+export function resolveRecordingPixfmt(env: NodeJS.ProcessEnv): string {
+  const raw = env.QMP_MCP_RECORDING_PIXFMT?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_RECORDING_PIXFMT;
+  if (!/^[A-Za-z0-9]+$/.test(raw)) {
+    throw new ConfigError(
+      `QMP_MCP_RECORDING_PIXFMT must match ^[A-Za-z0-9]+ — an ffmpeg pixel-format token such as ` +
+        `yuv420p, yuv444p, or rgb24 (got "${raw}").`,
+    );
+  }
+  return raw;
+}
+
 /**
  * Resolve the noVNC Viewer password (`QMP_MCP_VIEWER_PASSWORD`, ADR-0010), or
  * undefined when unset. A whitespace-only value is treated as unset (mirroring
@@ -774,6 +934,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     serialBufferBytes: resolveSerialBufferBytes(env),
     serialBackend,
     serialSpoolDir,
+    ffmpegBinary: resolveFfmpegBinary(env),
+    recordingDir: resolveRecordingDir(env),
+    recordingCodec: resolveRecordingCodec(env),
+    recordingCrf: resolveRecordingCrf(env),
+    recordingMaxFps: resolveRecordingMaxFps(env),
+    recordingPixfmt: resolveRecordingPixfmt(env),
     allowRawArgs: resolveAllowRawArgs(env),
     viewerPassword: resolveViewerPassword(env),
     viewerUser: resolveViewerUser(env),
