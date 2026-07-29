@@ -103,6 +103,11 @@ RUN groupadd --system qmp \
 # embedded in it). Placed on PATH so the entrypoint is just its name.
 COPY --from=builder /app/target/release/qmp-mcp /usr/local/bin/qmp-mcp
 
+# The built-in ISO download catalog (ADR-0018) is EMBEDDED in the binary, so the server needs
+# no runtime file; this copy is a convenience so an operator can inspect/copy the shipped list
+# (it is also the path QMP_MCP_ISO_CATALOG points at in .env.example).
+COPY --from=builder /app/assets/iso-catalog.json /usr/local/share/qmp-mcp/iso-catalog.json
+
 USER qmp
 
 # 8080: the MCP HTTP transport. 6080: the optional noVNC Viewer (ADR-0010), served

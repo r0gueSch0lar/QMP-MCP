@@ -5,9 +5,11 @@ import {
   type Config,
   ConfigError,
   loadConfig,
+  resolveAllowDownload,
   resolveAllowShareWrite,
   resolveGuestShareDir,
   resolveHostShareDir,
+  resolveIsoCatalog,
   resolveQemuBinaryOverride,
 } from './config.js';
 
@@ -31,6 +33,8 @@ const DEFAULTS: Config = {
   allowInsecure: false,
   imageDir: DEFAULT_IMAGE_DIR,
   isoDir: DEFAULT_ISO_DIR,
+  isoCatalog: undefined,
+  allowDownload: false,
   qemuBinaryOverride: undefined,
   maxDiskGb: 64,
   maxMemoryMb: 4096,
@@ -512,5 +516,28 @@ describe('loadConfig', () => {
     // stdio never exposes a network port, so missing http auth must not throw.
     expect(() => loadConfig({ QMP_MCP_TRANSPORT: 'stdio' })).not.toThrow();
     expect(loadConfig({ QMP_MCP_AUTH: 'jwt' }).authMode).toBe('jwt');
+  });
+
+  describe('ISO download catalog + gate (ADR-0018)', () => {
+    it('defaults the catalog to unset (built-in) and requires an absolute path when set', () => {
+      expect(resolveIsoCatalog({})).toBeUndefined();
+      // Blank/whitespace reads as unset (⇒ built-in list).
+      expect(resolveIsoCatalog({ QMP_MCP_ISO_CATALOG: '   ' })).toBeUndefined();
+      expect(resolveIsoCatalog({ QMP_MCP_ISO_CATALOG: '/etc/qmp-mcp/catalog.json' })).toBe(
+        '/etc/qmp-mcp/catalog.json',
+      );
+      // A relative path is rejected (it would resolve against an ambient CWD).
+      expect(() => resolveIsoCatalog({ QMP_MCP_ISO_CATALOG: 'catalog.json' })).toThrowError(
+        /QMP_MCP_ISO_CATALOG must be an absolute path/,
+      );
+    });
+
+    it('defaults the download gate to false and parses the boolean fail-closed', () => {
+      expect(resolveAllowDownload({})).toBe(false);
+      expect(resolveAllowDownload({ QMP_MCP_ALLOW_DOWNLOAD: 'true' })).toBe(true);
+      expect(() => resolveAllowDownload({ QMP_MCP_ALLOW_DOWNLOAD: 'yes' })).toThrowError(
+        /QMP_MCP_ALLOW_DOWNLOAD must be "true" or "false"/,
+      );
+    });
   });
 });
