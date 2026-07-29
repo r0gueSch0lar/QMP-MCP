@@ -39,7 +39,7 @@ interface FixtureOptions {
   shareReadonly?: boolean;
   // Serial Port ring-buffer size (ADR-0015); omitted fixtures default to 1 MiB.
   serialBufferBytes?: number;
-  serialBackend?: 'ringbuf' | 'spool';
+  serialBackend?: 'ringbuf' | 'spool' | 'socket';
   serialSpoolDir?: string;
 }
 

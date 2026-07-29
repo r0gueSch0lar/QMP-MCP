@@ -107,6 +107,8 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ QMP_MCP_SERIAL_BACKEND: 'spool' })).toThrowError(
       /QMP_MCP_SERIAL_SPOOL_DIR/,
     );
+    // socket is a valid backend and needs no extra directory (the interactive bridge).
+    expect(loadConfig({ QMP_MCP_SERIAL_BACKEND: 'socket' }).serialBackend).toBe('socket');
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

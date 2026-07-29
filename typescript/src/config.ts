@@ -22,9 +22,14 @@ export type AuthMode = 'apikey' | 'jwt';
 
 export const TRANSPORT_MODES: readonly TransportMode[] = ['stdio', 'http', 'both'];
 
-/** The Serial Port backend (ADR-0015): in-QEMU `ringbuf` or a host `spool` file. */
-export type SerialBackend = 'ringbuf' | 'spool';
-export const SERIAL_BACKENDS: readonly SerialBackend[] = ['ringbuf', 'spool'];
+/**
+ * The Serial Port backend (ADR-0015): in-QEMU `ringbuf` (drain-on-read), a host `spool` file
+ * (non-destructive tail), or a server-owned `socket` bridge onto the Serial Port — QEMU listens
+ * on a UNIX socket, the server connects and pumps bytes both ways, so `write_serial` reaches the
+ * guest as a real connected serial line while output is captured in a bounded in-server ring.
+ */
+export type SerialBackend = 'ringbuf' | 'spool' | 'socket';
+export const SERIAL_BACKENDS: readonly SerialBackend[] = ['ringbuf', 'spool', 'socket'];
 export const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warning', 'error'];
 export const AUTH_MODES: readonly AuthMode[] = ['apikey', 'jwt'];
 
