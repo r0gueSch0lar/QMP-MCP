@@ -34,6 +34,9 @@ jobs:
               - 'testdata/**'
               - '.env.example'
               - 'policy.example.yaml'
+              # The TS suite asserts byte-parity of the two bundled ISO catalogs
+              # (catalog-parity.test.ts), so a rust-assets-only PR must run it too.
+              - 'rust/assets/**'
               - '.github/workflows/**'
             rust:
               - 'rust/**'

@@ -1,0 +1,5 @@
+{
+  "description": "Empty probe output (ffmpeg printed nothing) parses to no encoders rather than an error — the capability layer treats an empty set as 'codec not present', failing closed.",
+  "output": "",
+  "expectedEncoders": []
+}

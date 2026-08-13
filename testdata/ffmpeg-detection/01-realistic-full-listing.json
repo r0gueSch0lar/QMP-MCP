@@ -1,0 +1,14 @@
+{
+  "description": "A realistic `ffmpeg -encoders` listing: banner + flag legend before the ------ separator (all skipped), then entries whose 6-char [A-Z.] flags column precedes the encoder name. Video, audio, and subtitle rows all parse; the description column is ignored.",
+  "output": "Encoders:\n V..... = Video\n A..... = Audio\n S..... = Subtitle\n .F.... = Frame-level multithreading\n ..S... = Slice-level multithreading\n ...X.. = Codec is experimental\n ....B. = Supports draw_horiz_band\n .....D = Supports direct rendering method 1\n ------\n V....D a64multi             Multicolor charset for Commodore 64 (codec a64_multi)\n V..... libsvtav1            SVT-AV1(Scalable Video Technology for AV1) encoder (codec av1)\n V..... libvpx-vp9           libvpx VP9 (codec vp9)\n V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n V..... libx265              libx265 H.265 / HEVC (codec hevc)\n V...B. mpeg4                MPEG-4 part 2\n A....D aac                  AAC (Advanced Audio Coding)\n S..... srt                  SubRip subtitle\n",
+  "expectedEncoders": [
+    "a64multi",
+    "aac",
+    "libsvtav1",
+    "libvpx-vp9",
+    "libx264",
+    "libx265",
+    "mpeg4",
+    "srt"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "description": "displayDevice vga emits -device VGA — the adapter for live-ISO/boot-menu visibility: firmware and bootloaders draw on it immediately, unlike virtio-gpu which shows nothing until the guest loads a DRM driver.",
+  "spec": { "display": "vnc", "displayDevice": "vga" },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-device", "VGA",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

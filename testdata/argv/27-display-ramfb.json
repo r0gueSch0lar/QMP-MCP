@@ -1,0 +1,19 @@
+{
+  "description": "displayDevice ramfb emits -device ramfb — the minimal RAM-backed framebuffer, useful for early-boot output on machines where a full GPU model is unwanted.",
+  "spec": { "display": "vnc", "displayDevice": "ramfb" },
+  "options": { "accel": "tcg" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-vnc", "127.0.0.1:0,password=on",
+    "-device", "ramfb",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}
