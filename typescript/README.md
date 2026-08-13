@@ -13,6 +13,9 @@ TypeScript variant.
 - **QEMU** on your `PATH` at runtime — the emulator is picked from the spec's `machine`
   (`qemu-system-x86_64`, `qemu-system-aarch64` for ARM/raspi, …; override with
   `QMP_MCP_QEMU_BINARY`), plus `qemu-img`.
+- **ffmpeg** (optional) — only needed for Display recording (`start_recording`); without
+  it the recording tools report themselves unavailable and everything else works. The
+  Docker image bundles it.
 
 ## Run it
 
@@ -61,8 +64,8 @@ the `X-API-Key` header.
 
 ## Docker
 
-The image bundles QEMU and runs the server as a non-root user, defaulting to the HTTP
-transport bound to all interfaces:
+The image bundles QEMU and ffmpeg (so Display recording works out of the box) and runs
+the server as a non-root user, defaulting to the HTTP transport bound to all interfaces:
 
 ```bash
 # from the repo root:
@@ -95,9 +98,11 @@ loopback, and it's off entirely until you set the password.
 | `reset_instance` / `powerdown_instance` | hard reset / graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks / per-CPU info |
 | `screendump` | a PNG screenshot of the display |
+| `start_recording` / `stop_recording` / `get_recording` | record the display to a video file under `QMP_MCP_RECORDING_DIR` / finalize it / the recording capability + encoder settings |
 | `get_events` / `wait_for_event` | recent QEMU events / block until a named one arrives |
 | `qmp_execute` | a raw QMP command, gated by the command policy |
 | `create_image` / `list_images` / `list_isos` | make a disk image / list disks / list boot ISOs |
+| `list_iso_catalog` / `download_iso` / `get_download` | list the OS-image download catalog / fetch one into the ISO Store (gated by `QMP_MCP_ALLOW_DOWNLOAD`) / poll download progress |
 
 ## Configuration
 
@@ -106,6 +111,8 @@ Rust variant. The full, commented list is in [`../.env.example`](../.env.example
 the command-policy file format in [`../policy.example.yaml`](../policy.example.yaml)).
 The ones you'll reach for: `QMP_MCP_TRANSPORT`, `QMP_MCP_API_KEYS`, `QMP_MCP_QEMU_BINARY`
 (usually unset — the emulator is derived from `machine`; ADR-0013), `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR`,
+`QMP_MCP_ALLOW_DOWNLOAD` (lets `download_iso` fetch catalog OS images into the ISO Store),
+`QMP_MCP_RECORDING_DIR` (enables Display recording; `QMP_MCP_FFMPEG_BINARY` picks the ffmpeg),
 `QMP_MCP_VIEWER_PASSWORD`, plus caps on disk/memory/vCPUs and the command-policy
 allow/deny lists.
 
