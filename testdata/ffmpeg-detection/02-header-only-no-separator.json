@@ -1,0 +1,5 @@
+{
+  "description": "A listing that never reaches the ------ separator yields no encoders: everything before the separator is legend/banner, even lines that look like entries.",
+  "output": "Encoders:\n V..... = Video\n A..... = Audio\n V....D libx264              libx264 H.264 (this is still pre-separator and must be ignored)\n",
+  "expectedEncoders": []
+}

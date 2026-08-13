@@ -1,0 +1,5 @@
+{
+  "description": "The parse is set-semantics: duplicate rows collapse to one name, and encoder names with hyphens, underscores, and digits survive intact. Experimental-flagged rows (X in the flags) still parse.",
+  "output": " ------\n V..... libvpx-vp9           duplicate row one\n V..... libvpx-vp9           duplicate row two\n V..... h264_nvenc           NVIDIA NVENC H.264 encoder\n V..... msmpeg4v2            MS MPEG4 V2\n A..X.. opus                 experimental-flagged rows still parse\n",
+  "expectedEncoders": ["h264_nvenc", "libvpx-vp9", "msmpeg4v2", "opus"]
+}

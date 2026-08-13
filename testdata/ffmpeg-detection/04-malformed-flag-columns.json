@@ -1,0 +1,5 @@
+{
+  "description": "Only rows whose flags column is exactly six [A-Z.] characters count as entries: five-char, seven-char, and lowercase flag columns are rejected, a flags-only line has no name to take, and prose lines never match.",
+  "output": " ------\n V.... short5               five-char flags must not match\n V.....X sevenchar           seven-char flags must not match\n v....D lowercase            lowercase flags must not match\n V.....\n V....D validname            the only well-formed row\nrandom prose that is not an encoder row\n",
+  "expectedEncoders": ["validname"]
+}
