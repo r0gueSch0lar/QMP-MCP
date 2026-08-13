@@ -47,8 +47,19 @@ _Avoid_: disk pool, volume dir
 
 **ISO Store**:
 The separate, read-only directory that holds installation/boot ISO media, referenced
-by name. Kept distinct from the Image Store so install media cannot be written.
+by name. Read-only on the agent's side — kept distinct from the Image Store so install
+media cannot be written by a Guest — with one server-side writer: `download_iso`
+fetching Download Catalog entries into it, behind the operator's
+`QMP_MCP_ALLOW_DOWNLOAD` gate (ADR-0018).
 _Avoid_: cdrom dir, media pool
+
+**Download Catalog**:
+The operator-curated list of OS installation images `download_iso` may fetch into the
+ISO Store (ADR-0018). Data, not code: a bundled JSON list (kept byte-identical across
+both variants by a parity test), replaceable via `QMP_MCP_ISO_CATALOG`. The agent
+selects an entry by its short `id` — it never supplies a URL — and downloading stays
+disabled until the operator opts in.
+_Avoid_: mirror list, app store, image registry
 
 **Event Buffer**:
 The bounded, server-side ring buffer of recent QMP async events for the current
@@ -68,13 +79,26 @@ the server for the lifetime of a `display: vnc` Instance. Reads the Display only
 never the QMP Session — and is fail-closed behind its own password.
 _Avoid_: console, GUI, web UI, VNC server
 
+**Recording**:
+The on-demand capture of a `display: vnc` Guest's Display to a video file
+(`start_recording` / `stop_recording` / `get_recording`, ADR-0017): a screendump loop
+piped into a co-located ffmpeg. Capability-gated, not permission-gated — it is capture,
+not input — available only when ffmpeg is runnable, the selected codec is compiled into
+it, and the operator set `QMP_MCP_RECORDING_DIR`. The agent only *names* the output,
+saved as `<name>.mkv` under that operator root and never returned inline. One Recording
+runs per Instance and is finalized on destroy or unexpected exit.
+_Avoid_: screencast, screen capture (as a term), video (bare)
+
 **Serial Port**:
-The Guest's emulated serial line, attached on demand (`serial: true`). One of two
-operator-selected backends (`QMP_MCP_SERIAL_BACKEND`) carries its output: **ringbuf** — a
+The Guest's emulated serial line, attached on demand (`serial: true`). One of three
+operator-selected backends (`QMP_MCP_SERIAL_BACKEND`) carries it: **ringbuf** — a
 bounded QEMU `ringbuf` chardev the server drains over QMP with `ringbuf-read` (ephemeral;
-deliberately QEMU's own buffer, not a server-side one — contrast the Event Buffer); or
+deliberately QEMU's own buffer, not a server-side one — contrast the Event Buffer);
 **spool** — a host file under the operator's `QMP_MCP_SERIAL_SPOOL_DIR` root, placed in a
 per-Instance subdirectory the spec may name (validated like an Image/ISO Store name, never a
-raw host path). Its content is the Guest's serial console output; read-only by default,
-writable (ringbuf only) behind an operator env gate. Portable: a plain QEMU feature.
+raw host path); or **socket** — a server-owned UNIX socket bridged onto the line (ADR-0015),
+the interactive backend: output drains from a bounded in-server ring and `write_serial`
+reaches the Guest as a real connected serial line. Its content is the Guest's serial console
+output; read-only by default, writable (ringbuf and socket) behind an operator env gate.
+Portable: a plain QEMU feature.
 _Avoid_: serial console (as a standalone term), COM port, tty, ring buffer (that is the Event Buffer)
