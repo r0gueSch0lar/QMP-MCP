@@ -14,6 +14,7 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_EVENT_BUFFER_SIZE } from './instance/event-buffer.js';
+import { LOG_SUBSYSTEMS, type LogSubsystem } from './logger.js';
 
 export type TransportMode = 'stdio' | 'http' | 'both';
 export type LogLevel = 'debug' | 'info' | 'warning' | 'error';
@@ -67,6 +68,10 @@ export interface Config {
   transport: TransportMode;
   /** Minimum severity emitted by the server's own logger. */
   logLevel: LogLevel;
+  /** Per-subsystem overrides of `logLevel` (`QMP_MCP_LOG_FILTER`); empty when unset. */
+  logFilter: Partial<Record<LogSubsystem, LogLevel>>;
+  /** Optional file the logger also appends every emitted line to (`QMP_MCP_LOG_FILE`). */
+  logFile: string | undefined;
   /** Address the HTTP transport binds to. */
   httpHost: string;
   /** TCP port the HTTP transport listens on. */
@@ -855,9 +860,51 @@ function parseList(raw: string | undefined): string[] {
  * transport is selected without configured auth and without an explicit insecure
  * override.
  */
+/**
+ * Parse `QMP_MCP_LOG_FILTER`: comma-separated `subsystem=level` entries overriding the global
+ * `QMP_MCP_LOG_LEVEL` per subsystem. Case-insensitive, whitespace-tolerant, later entries win,
+ * empty segments are skipped; an unknown subsystem or level fails closed naming the variable.
+ * Mirrors the Rust `parse_log_filter` — the shared corpus in `testdata/log-filter/` pins both.
+ */
+export function parseLogFilter(
+  varName: string,
+  raw: string | undefined,
+): Partial<Record<LogSubsystem, LogLevel>> {
+  const out: Partial<Record<LogSubsystem, LogLevel>> = {};
+  if (raw === undefined || raw.trim() === '') return out;
+  for (const segment of raw.split(',')) {
+    const entry = segment.trim();
+    if (entry === '') continue;
+    const eq = entry.indexOf('=');
+    if (eq === -1) {
+      throw new ConfigError(`${varName}: invalid entry "${entry}" (expected subsystem=level).`);
+    }
+    const subsystem = entry.slice(0, eq).trim().toLowerCase();
+    const level = entry
+      .slice(eq + 1)
+      .trim()
+      .toLowerCase();
+    if (!(LOG_SUBSYSTEMS as readonly string[]).includes(subsystem)) {
+      throw new ConfigError(
+        `${varName}: unknown subsystem "${subsystem}" (expected one of: ${LOG_SUBSYSTEMS.join(', ')}).`,
+      );
+    }
+    if (!(LOG_LEVELS as readonly string[]).includes(level)) {
+      throw new ConfigError(
+        `${varName}: invalid level "${level}" for "${subsystem}" (expected one of: ${LOG_LEVELS.join(', ')}).`,
+      );
+    }
+    out[subsystem as LogSubsystem] = level as LogLevel;
+  }
+  return out;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const transport = parseEnum('QMP_MCP_TRANSPORT', env.QMP_MCP_TRANSPORT, TRANSPORT_MODES, 'stdio');
   const logLevel = parseEnum('QMP_MCP_LOG_LEVEL', env.QMP_MCP_LOG_LEVEL, LOG_LEVELS, 'info');
+  const logFilter = parseLogFilter('QMP_MCP_LOG_FILTER', env.QMP_MCP_LOG_FILTER);
+  const rawLogFile = env.QMP_MCP_LOG_FILE?.trim();
+  const logFile = rawLogFile ? rawLogFile : undefined;
   const httpHost = parseString(env.QMP_MCP_HTTP_HOST, '127.0.0.1');
   const httpPort = parsePort('QMP_MCP_HTTP_PORT', env.QMP_MCP_HTTP_PORT, 8080);
   const httpEndpoint = parseString(env.QMP_MCP_HTTP_ENDPOINT, '/mcp');
@@ -912,6 +959,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   return {
     transport,
     logLevel,
+    logFilter,
+    logFile,
     httpHost,
     httpPort,
     httpEndpoint,

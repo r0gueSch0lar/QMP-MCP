@@ -1,0 +1,6 @@
+{
+  "description": "An unknown level fails closed, naming the variable and listing the levels.",
+  "filter": "qmp=verbose",
+  "expectError": true,
+  "errorContains": ["QMP_MCP_LOG_FILTER", "invalid level \"verbose\"", "debug, info, warning, error"]
+}

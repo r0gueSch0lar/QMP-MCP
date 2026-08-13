@@ -23,9 +23,11 @@ import { createWriteStream } from 'node:fs';
 import { rename, rm, stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { resolveAllowDownload, resolveIsoCatalog, resolveIsoDir } from '../config.js';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
 import { type Catalog, findEntry, idsHint, loadCatalog } from './catalog.js';
 import { resolveInStore, type StoreLabels } from './store-path.js';
+
+const logger = getLogger('download');
 
 /**
  * Raised for a `download_iso` request that cannot be started (disabled, unknown id, target

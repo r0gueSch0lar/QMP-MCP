@@ -1,0 +1,5 @@
+{
+  "description": "Entries tolerate surrounding whitespace and are case-insensitive, normalising to lowercase.",
+  "filter": " Orchestrator = DEBUG , qmp=Error ",
+  "expected": {"orchestrator":"debug","qmp":"error"}
+}

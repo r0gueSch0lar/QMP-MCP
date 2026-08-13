@@ -55,7 +55,7 @@ import {
   resolveViewerUser,
   type SerialBackend,
 } from '../config.js';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
 import {
   buildPolicy,
   CommandPolicyError,
@@ -111,6 +111,8 @@ import {
   SerialWriteTimeoutError,
   teardownSerialBridge,
 } from './serial-bridge.js';
+
+const logger = getLogger('orchestrator');
 
 /**
  * The lifecycle states an Instance moves through. `PAUSED` is entered by

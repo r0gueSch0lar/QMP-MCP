@@ -1,0 +1,6 @@
+{
+  "description": "An unknown subsystem fails closed, naming the variable and listing the vocabulary.",
+  "filter": "downloads=debug",
+  "expectError": true,
+  "errorContains": ["QMP_MCP_LOG_FILTER", "unknown subsystem \"downloads\"", "server, orchestrator, qmp, viewer, download, policy"]
+}

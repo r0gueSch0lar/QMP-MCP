@@ -14,7 +14,7 @@
 //! surface, defaults, and error wording track the TypeScript server so the two can
 //! be cross-validated against the same inputs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// An environment map: variable name to raw value. Absent keys read as unset; a
@@ -120,6 +120,61 @@ impl LogLevel {
     }
 }
 
+/// The fixed vocabulary of logging subsystems, shared verbatim with the TypeScript variant:
+/// the keys `QMP_MCP_LOG_FILTER` may override per-subsystem. This logger maps tracing targets
+/// (Rust module paths) onto these names in `crate::logging::subsystem_for_target`.
+pub const LOG_SUBSYSTEMS: [&str; 6] = [
+    "server",
+    "orchestrator",
+    "qmp",
+    "viewer",
+    "download",
+    "policy",
+];
+
+/// Parse `QMP_MCP_LOG_FILTER`: comma-separated `subsystem=level` entries overriding the global
+/// `QMP_MCP_LOG_LEVEL` per subsystem. Case-insensitive, whitespace-tolerant, later entries win,
+/// and empty segments are skipped; an unknown subsystem or level fails closed naming the
+/// variable. Mirrors the TS `parseLogFilter` — the shared corpus in `testdata/log-filter/`
+/// pins both.
+pub fn parse_log_filter(
+    var: &str,
+    raw: Option<&str>,
+) -> Result<BTreeMap<String, LogLevel>, ConfigError> {
+    let mut out = BTreeMap::new();
+    let Some(raw) = raw else { return Ok(out) };
+    if raw.trim().is_empty() {
+        return Ok(out);
+    }
+    for segment in raw.split(',') {
+        let entry = segment.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(eq) = entry.find('=') else {
+            return Err(ConfigError(format!(
+                "{var}: invalid entry \"{entry}\" (expected subsystem=level)."
+            )));
+        };
+        let subsystem = entry[..eq].trim().to_lowercase();
+        let level_raw = entry[eq + 1..].trim().to_lowercase();
+        if !LOG_SUBSYSTEMS.contains(&subsystem.as_str()) {
+            return Err(ConfigError(format!(
+                "{var}: unknown subsystem \"{subsystem}\" (expected one of: {}).",
+                LOG_SUBSYSTEMS.join(", ")
+            )));
+        }
+        let Some(level) = LogLevel::parse(&level_raw) else {
+            return Err(ConfigError(format!(
+                "{var}: invalid level \"{level_raw}\" for \"{subsystem}\" (expected one of: {}).",
+                LogLevel::ALLOWED
+            )));
+        };
+        out.insert(subsystem, level);
+    }
+    Ok(out)
+}
+
 /// Which provider guards the HTTP transport when auth is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -213,6 +268,10 @@ pub struct Config {
     pub transport: TransportMode,
     /// Minimum severity emitted by the server's own logger.
     pub log_level: LogLevel,
+    /// Per-subsystem overrides of `log_level` (`QMP_MCP_LOG_FILTER`); empty when unset.
+    pub log_filter: BTreeMap<String, LogLevel>,
+    /// Optional file the logger also appends every emitted line to (`QMP_MCP_LOG_FILE`).
+    pub log_file: Option<String>,
     /// Address the HTTP transport binds to.
     pub http_host: String,
     /// TCP port the HTTP transport listens on.
@@ -811,6 +870,11 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         LogLevel::Info,
         LogLevel::parse,
     )?;
+    let log_filter = parse_log_filter("QMP_MCP_LOG_FILTER", get(env, "QMP_MCP_LOG_FILTER"))?;
+    let log_file = get(env, "QMP_MCP_LOG_FILE")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let http_host = parse_string(get(env, "QMP_MCP_HTTP_HOST"), "127.0.0.1");
     let http_port = parse_port("QMP_MCP_HTTP_PORT", get(env, "QMP_MCP_HTTP_PORT"), 8080)?;
     let http_endpoint = parse_string(get(env, "QMP_MCP_HTTP_ENDPOINT"), "/mcp");
@@ -883,6 +947,8 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
     Ok(Config {
         transport,
         log_level,
+        log_filter,
+        log_file,
         http_host,
         http_port,
         http_endpoint,
@@ -1003,6 +1069,8 @@ mod tests {
         Config {
             transport: TransportMode::Stdio,
             log_level: LogLevel::Info,
+            log_filter: BTreeMap::new(),
+            log_file: None,
             http_host: "127.0.0.1".into(),
             http_port: 8080,
             http_endpoint: "/mcp".into(),
@@ -1090,6 +1158,40 @@ mod tests {
         let err = load_config(&env(&[("QMP_MCP_LOG_LEVEL", "verbose")])).unwrap_err();
         assert!(err.0.contains("QMP_MCP_LOG_LEVEL"));
         assert!(err.0.contains("debug, info, warning, error"));
+    }
+
+    #[test]
+    fn parses_log_filter_normalising_case_and_whitespace() {
+        let cfg = load_config(&env(&[(
+            "QMP_MCP_LOG_FILTER",
+            " Orchestrator = DEBUG , qmp=Error ",
+        )]))
+        .unwrap();
+        let expected: BTreeMap<String, LogLevel> = [
+            ("orchestrator".to_string(), LogLevel::Debug),
+            ("qmp".to_string(), LogLevel::Error),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(cfg.log_filter, expected);
+    }
+
+    #[test]
+    fn rejects_unknown_log_filter_subsystem_naming_variable() {
+        let err = load_config(&env(&[("QMP_MCP_LOG_FILTER", "downloads=debug")])).unwrap_err();
+        assert!(err.0.contains("QMP_MCP_LOG_FILTER"));
+        assert!(err.0.contains("unknown subsystem \"downloads\""));
+        assert!(err
+            .0
+            .contains("server, orchestrator, qmp, viewer, download, policy"));
+    }
+
+    #[test]
+    fn log_file_is_trimmed_and_blank_reads_as_unset() {
+        let cfg = load_config(&env(&[("QMP_MCP_LOG_FILE", "  /var/log/qmp.log  ")])).unwrap();
+        assert_eq!(cfg.log_file.as_deref(), Some("/var/log/qmp.log"));
+        let cfg = load_config(&env(&[("QMP_MCP_LOG_FILE", "   ")])).unwrap();
+        assert_eq!(cfg.log_file, None);
     }
 
     #[test]

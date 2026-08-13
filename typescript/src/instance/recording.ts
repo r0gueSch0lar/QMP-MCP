@@ -21,7 +21,11 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
+
+// Recording is Instance-lifecycle machinery, so it logs under `orchestrator` —
+// mirroring the Rust variant, where this code lives inside the orchestrator module.
+const logger = getLogger('orchestrator');
 
 /**
  * Video encoders this server knows how to advertise as recording codecs (ADR-0017).

@@ -1,0 +1,5 @@
+{
+  "description": "A subsystem repeated later in the list wins over an earlier entry.",
+  "filter": "qmp=debug,qmp=error",
+  "expected": {"qmp":"error"}
+}
