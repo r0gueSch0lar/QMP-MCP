@@ -22,6 +22,7 @@ use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
 use qmp_mcp::instance::orchestrator::{
     probe_ffmpeg_encoders, InstanceState, Orchestrator, OrchestratorOptions,
+    POST_SPAWN_LIVENESS_WINDOW,
 };
 use qmp_mcp::logging;
 use qmp_mcp::policy::{self, ResolvedPolicy};
@@ -292,6 +293,7 @@ fn orchestrator_options(
         recording_crf: config.recording_crf,
         recording_max_fps: config.recording_max_fps,
         recording_pixfmt: config.recording_pixfmt.clone(),
+        post_spawn_liveness_window: POST_SPAWN_LIVENESS_WINDOW,
         recording_encoder_available: Box::new(move |codec: &str| {
             recording_encoders.contains(codec)
         }),
