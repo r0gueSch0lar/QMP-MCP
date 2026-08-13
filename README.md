@@ -169,9 +169,9 @@ bounded: only ports in a non-privileged range, bound to loopback.
 Host-level networking (`tap`/`bridge`) exists but is gated off unless you turn it on — it
 needs privileges that don't fit the server's unprivileged posture.
 
-### Watching what happens: events, the Display, and the Viewer
+### Watching what happens: events, the Display, the Viewer — and recording it
 
-Two ways to see what the VM is doing:
+Three ways to see what the VM is doing:
 
 - **Events.** QEMU emits async events — a reset, a shutdown, a device change. The server
   keeps a bounded ring buffer of the recent ones for the current Instance, and the agent
@@ -189,6 +189,18 @@ Two ways to see what the VM is doing:
   driver, so an ISO's bootloader can't draw on it. The `raspi*` boards render over their
   built-in framebuffer, so they stay `displayDevice: none`. (Booting a distro this way
   also takes `initrd` alongside `kernel` — the usual kernel + initramfs + rootfs.)
+- **Recording.** With a `vnc` Display up, `start_recording` captures the screen to a
+  video file: a loop of QMP screendumps piped into a co-located **ffmpeg**, encoded for
+  screen content at a capped frame rate with constant-quality CRF (ADR-0017). It's
+  capability-gated, not permission-gated — recording is capture, nothing is typed into
+  the Guest — and it's available only when ffmpeg is runnable and you've set
+  `QMP_MCP_RECORDING_DIR`. The agent only ever *names* the output; the file lands as
+  `<name>.mkv` under that operator-owned root, never at a host path, and videos aren't
+  returned inline — you collect them from the host. `stop_recording` finalizes the file;
+  `get_recording` reports whether recording is available (and exactly why not when it
+  isn't) plus the active codec, CRF, fps cap, and pixel format. The Docker images bundle
+  ffmpeg, so recording works out of the box in-container; on bare metal it's an optional
+  install.
 
 ### Talking to the server: transports and authentication
 
@@ -213,6 +225,7 @@ The agent's vocabulary — the actions it can take:
 | `reset_instance` / `powerdown_instance` | hard reset / request a graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks & backing media / per-CPU info |
 | `screendump` | a PNG screenshot of the Display |
+| `start_recording` / `stop_recording` / `get_recording` | record the Display to a video file under the operator's recording root (needs `QMP_MCP_RECORDING_DIR` + a runnable ffmpeg) / finalize the file / report the recording capability + encoder settings |
 | `get_events` / `wait_for_event` | recent QEMU events / block until a named one arrives |
 | `qmp_execute` | a raw QMP command, gated by the Command Policy |
 | `create_image` / `list_images` / `list_isos` | make a disk image / list disks / list boot ISOs |
@@ -381,6 +394,8 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the Image Store / ISO Store folders |
 | `QMP_MCP_ALLOW_DOWNLOAD` | `false` | enable `download_iso` to fetch OS images into the ISO Store (default off; the agent can never enable it) |
 | `QMP_MCP_ISO_CATALOG` | _(built-in)_ | path to a custom download-catalog JSON (unset ⇒ the bundled 24-distro list) |
+| `QMP_MCP_RECORDING_DIR` | _(unset)_ | enables Display recording: the absolute host root `<name>.mkv` files are written under (unset ⇒ `start_recording` unavailable) |
+| `QMP_MCP_FFMPEG_BINARY` | `ffmpeg` | the ffmpeg recording encodes with — a `PATH` name or absolute path (bundled in the Docker images; optional on bare metal) |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the browser Viewer |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced on the Viewer's HTTP Basic auth (default: username ignored, password-only) |
 | `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ sharing off; ADR-0014) |
@@ -388,8 +403,9 @@ Both implementations are configured entirely through `QMP_MCP_*` environment var
 | `QMP_MCP_ALLOW_SHARE_WRITE` | `false` | mount the share read-write (default read-only; the agent can never escalate) |
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | allow a spec's `extraArgs` (the escape hatch) |
 
-…plus caps on disk/memory/vCPUs, the host-forward port range, the Command Policy allow/deny
-lists and policy file, and the Event Buffer size. See [`.env.example`](.env.example) for
+…plus caps on disk/memory/vCPUs, the host-forward port range, the recording encoder knobs
+(codec, CRF, max-fps, pixel format), the Command Policy allow/deny lists and policy file,
+and the Event Buffer size. See [`.env.example`](.env.example) for
 the full list, or each variant's Configuration section in context
 ([TypeScript](typescript/README.md#configuration) · [Rust](rust/README.md#configuration)).
 
