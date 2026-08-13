@@ -35,12 +35,12 @@
   "author": "foo",
   "repository": {
     "type": "git",
-    "url": "git+http://gitlab/foo/qmp-mcp.git"
+    "url": "git+https://github.com/r0gueSch0lar/QMP-MCP.git"
   },
   "bugs": {
-    "url": "http://gitlab/foo/qmp-mcp/-/issues"
+    "url": "https://github.com/r0gueSch0lar/QMP-MCP/issues"
   },
-  "homepage": "http://gitlab/foo/qmp-mcp#readme",
+  "homepage": "https://github.com/r0gueSch0lar/QMP-MCP#readme",
   "dependencies": {
     "@novnc/novnc": "^1.7.0",
     "mcp-framework": "^0.2.22",
