@@ -361,6 +361,11 @@ pub struct OrchestratorOptions {
     /// no blocking call under the lock; tests force a deterministic value so no ffmpeg is spawned.
     /// Only consulted when ffmpeg + output dir are set.
     pub recording_encoder_available: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// How long a freshly-spawned ffmpeg is watched for an immediate exit before it is declared
+    /// live (R5). Production wires [`POST_SPAWN_LIVENESS_WINDOW`]; the immediate-exit test widens
+    /// it so detection never races process scheduling on a loaded CI runner — safe because the
+    /// check exits early the moment the child dies, so a wide window costs nothing there.
+    pub post_spawn_liveness_window: Duration,
     /// Inclusive host-port range a user-mode forward's `hostPort` must fall within
     /// (ADR-0009); `None` uses the argv builder's default.
     pub hostfwd_port_range: Option<PortRange>,
@@ -1517,8 +1522,23 @@ impl Orchestrator {
 
         // Post-spawn liveness (R5, parity with the TS T5): ffmpeg that dies immediately (bad
         // codec/pixfmt/output) must surface as an actionable start error, not a silent empty file.
-        tokio::time::sleep(POST_SPAWN_LIVENESS_WINDOW).await;
-        if let Ok(Some(status)) = child.try_wait() {
+        // Polled with early exit rather than one sleep+check: the death is detected as soon as
+        // the child is reaped, so a wide window (as the immediate-exit test uses) costs nothing
+        // in the failure path — a single sleep+check raced process scheduling on loaded runners.
+        let deadline = tokio::time::Instant::now() + self.options.post_spawn_liveness_window;
+        let mut early_exit: Option<std::process::ExitStatus> = None;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                early_exit = Some(status);
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(deadline - now)).await;
+        }
+        if let Some(status) = early_exit {
             let captured = if let Some(mut e) = stderr.take() {
                 let mut buf = Vec::new();
                 let _ = e.read_to_end(&mut buf).await;
@@ -1897,8 +1917,9 @@ const FFMPEG_KILL_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 /// How long a freshly-spawned ffmpeg is watched for an immediate exit before it is declared live
 /// (R5, post-spawn liveness). Long enough to catch an instant failure (bad codec/pixfmt), short
-/// enough not to delay a healthy start.
-const POST_SPAWN_LIVENESS_WINDOW: Duration = Duration::from_millis(150);
+/// enough not to delay a healthy start. The production default for
+/// [`OrchestratorOptions::post_spawn_liveness_window`].
+pub const POST_SPAWN_LIVENESS_WINDOW: Duration = Duration::from_millis(150);
 
 /// Bound on the one-shot startup encoder probe (`ffmpeg -encoders`, R1), so a hung ffmpeg at
 /// startup can never wedge server boot.
@@ -2367,6 +2388,7 @@ mod tests {
             recording_crf: 22,
             recording_max_fps: 15,
             recording_pixfmt: "yuv420p".to_string(),
+            post_spawn_liveness_window: POST_SPAWN_LIVENESS_WINDOW,
             recording_encoder_available: Box::new(|_| true),
             hostfwd_port_range: None,
             allow_host_net: false,
@@ -3768,6 +3790,9 @@ mod tests {
         let mut options = options_with_recording(true);
         options.ffmpeg_binary = Some("/bin/false".to_string());
         options.recording_dir = Some(dir.to_string_lossy().into_owned());
+        // A generous window so detection never races process scheduling on a loaded CI runner;
+        // the liveness poll exits the moment the child dies, so this stays fast in practice.
+        options.post_spawn_liveness_window = Duration::from_secs(2);
         let mut orch = Orchestrator::new(Box::new(FakeQemuDriver::new()), options);
         orch.create_instance(json!({ "displayDevice": "vga" }))
             .await

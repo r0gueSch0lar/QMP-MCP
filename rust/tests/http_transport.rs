@@ -22,7 +22,9 @@ use qmp_mcp::instance::catalog::load_catalog;
 use qmp_mcp::instance::download::{DownloadManager, DownloadManagerOptions, ReqwestFetcher};
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
-use qmp_mcp::instance::orchestrator::{Orchestrator, OrchestratorOptions};
+use qmp_mcp::instance::orchestrator::{
+    Orchestrator, OrchestratorOptions, POST_SPAWN_LIVENESS_WINDOW,
+};
 use qmp_mcp::qemu::real_driver::RealQemuDriver;
 use qmp_mcp::server::QmpMcpServer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -78,6 +80,7 @@ fn test_server() -> QmpMcpServer {
         recording_crf: 22,
         recording_max_fps: 15,
         recording_pixfmt: "yuv420p".to_string(),
+        post_spawn_liveness_window: POST_SPAWN_LIVENESS_WINDOW,
         recording_encoder_available: Box::new(|_| false),
         hostfwd_port_range: None,
         allow_host_net: false,

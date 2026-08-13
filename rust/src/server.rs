@@ -950,7 +950,7 @@ impl ServerHandler for QmpMcpServer {
 mod tests {
     use super::*;
     use crate::instance::image_store::ImageStoreOptions;
-    use crate::instance::orchestrator::OrchestratorOptions;
+    use crate::instance::orchestrator::{OrchestratorOptions, POST_SPAWN_LIVENESS_WINDOW};
     use crate::qemu::driver::FakeQemuDriver;
     use crate::qemu::qmp_client::QmpEvent;
     use tokio::sync::broadcast;
@@ -986,6 +986,7 @@ mod tests {
             recording_crf: 22,
             recording_max_fps: 15,
             recording_pixfmt: "yuv420p".to_string(),
+            post_spawn_liveness_window: POST_SPAWN_LIVENESS_WINDOW,
             recording_encoder_available: Box::new(|_| true),
             hostfwd_port_range: None,
             allow_host_net: false,
