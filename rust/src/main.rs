@@ -47,7 +47,16 @@ async fn main() -> ExitCode {
         }
     };
 
-    logging::init(config.log_level);
+    if let Err(err) = logging::init(
+        config.log_level,
+        &config.log_filter,
+        config.log_file.as_deref(),
+    ) {
+        // Same fail-closed posture as a config error: an unusable log destination
+        // must be surfaced at startup, not discovered as silently missing logs.
+        eprintln!("[qmp-mcp] error: {err}");
+        return ExitCode::FAILURE;
+    }
 
     // Resolve the Command Policy for the generic qmp_execute tool: the default-safe
     // allowlist plus QMP_MCP_ALLOW/DENY and the optional QMP_MCP_POLICY_FILE overrides,

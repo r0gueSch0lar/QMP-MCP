@@ -1,0 +1,5 @@
+{
+  "description": "A single subsystem=level entry overrides just that subsystem.",
+  "filter": "orchestrator=debug",
+  "expected": {"orchestrator":"debug"}
+}

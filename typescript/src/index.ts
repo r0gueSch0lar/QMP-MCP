@@ -13,7 +13,9 @@ import {
 } from 'mcp-framework';
 import { type Config, ConfigError, loadConfig } from './config.js';
 import { orchestrator } from './instance/orchestrator.js';
-import { logger, setLogLevel } from './logger.js';
+import { getLogger, openLogFile, setLogFilter, setLogLevel } from './logger.js';
+
+const logger = getLogger('server');
 
 /** Directory of the compiled entrypoint (i.e. `dist`). */
 const here = dirname(fileURLToPath(import.meta.url));
@@ -123,6 +125,18 @@ async function main(): Promise<void> {
     throw err;
   }
   setLogLevel(config.logLevel);
+  setLogFilter(config.logFilter);
+  if (config.logFile !== undefined) {
+    try {
+      openLogFile(config.logFile);
+    } catch (err) {
+      // Same fail-closed posture as a config error: an unusable log destination
+      // must be surfaced at startup, not discovered as silently missing logs.
+      logger.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   // Pin discovery to the compiled directory so tools load from `dist/tools`
   // regardless of cwd (the default basePath is `cwd/dist`, wrong under npx).

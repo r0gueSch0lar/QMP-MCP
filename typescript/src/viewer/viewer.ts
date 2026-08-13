@@ -32,7 +32,9 @@ import { connect } from 'node:net';
 import { dirname, extname, resolve, sep } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { type RawData, WebSocket, WebSocketServer } from 'ws';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('viewer');
 
 /** The HTTP Basic realm shown to the browser when it prompts for credentials. */
 const REALM = 'qmp-mcp viewer';

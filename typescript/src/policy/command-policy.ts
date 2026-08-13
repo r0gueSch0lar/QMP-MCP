@@ -23,7 +23,9 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('policy');
 
 /**
  * Raised when the Command Policy cannot be resolved — a missing or unreadable

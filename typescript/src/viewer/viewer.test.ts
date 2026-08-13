@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
 import {
   MAX_VIEWER_CONNECTIONS,
   resolveAsset,
@@ -12,6 +12,8 @@ import {
   type Viewer,
   type ViewerOptions,
 } from './viewer.js';
+
+const logger = getLogger('viewer');
 
 const PASSWORD = 'test-viewer-secret';
 

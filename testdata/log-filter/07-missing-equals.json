@@ -1,0 +1,6 @@
+{
+  "description": "An entry without = is rejected with the expected shape in the message.",
+  "filter": "orchestrator",
+  "expectError": true,
+  "errorContains": ["QMP_MCP_LOG_FILTER", "invalid entry \"orchestrator\"", "expected subsystem=level"]
+}

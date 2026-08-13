@@ -23,6 +23,8 @@ const DEFAULT_ISO_DIR = join(tmpdir(), 'qmp-mcp', 'isos');
 const DEFAULTS: Config = {
   transport: 'stdio',
   logLevel: 'info',
+  logFilter: {},
+  logFile: undefined,
   httpHost: '127.0.0.1',
   httpPort: 8080,
   httpEndpoint: '/mcp',
@@ -187,6 +189,38 @@ describe('loadConfig', () => {
     expect(thrown).toBeInstanceOf(ConfigError);
     expect((thrown as Error).message).toContain('QMP_MCP_LOG_LEVEL');
     expect((thrown as Error).message).toContain('debug, info, warning, error');
+  });
+
+  describe('log filter and log file', () => {
+    it('defaults to no per-subsystem overrides and no log file', () => {
+      const config = loadConfig({});
+      expect(config.logFilter).toEqual({});
+      expect(config.logFile).toBeUndefined();
+    });
+
+    it('parses QMP_MCP_LOG_FILTER entries, normalising case and whitespace', () => {
+      const config = loadConfig({ QMP_MCP_LOG_FILTER: ' Orchestrator = DEBUG , qmp=Error ' });
+      expect(config.logFilter).toEqual({ orchestrator: 'debug', qmp: 'error' });
+    });
+
+    it('rejects an unknown subsystem naming the variable and the vocabulary', () => {
+      let thrown: unknown;
+      try {
+        loadConfig({ QMP_MCP_LOG_FILTER: 'downloads=debug' });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message).toContain('QMP_MCP_LOG_FILTER');
+      expect((thrown as Error).message).toContain('unknown subsystem "downloads"');
+    });
+
+    it('trims QMP_MCP_LOG_FILE and treats blank as unset', () => {
+      expect(loadConfig({ QMP_MCP_LOG_FILE: '  /var/log/qmp.log  ' }).logFile).toBe(
+        '/var/log/qmp.log',
+      );
+      expect(loadConfig({ QMP_MCP_LOG_FILE: '   ' }).logFile).toBeUndefined();
+    });
   });
 
   describe('HTTP host/port/endpoint', () => {

@@ -10,9 +10,11 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { mkdir, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { logger } from '../logger.js';
+import { getLogger } from '../logger.js';
 import type { InstanceProcess, LaunchRequest, QemuDriver } from './driver.js';
 import { QmpClient, type QmpEvent } from './qmp-client.js';
+
+const logger = getLogger('qmp');
 
 /** How long to wait for QEMU to create and accept on the QMP socket. */
 const SOCKET_DIAL_TIMEOUT_MS = 10_000;

@@ -1,0 +1,5 @@
+{
+  "description": "Stray commas produce empty segments, which are skipped rather than rejected.",
+  "filter": ",orchestrator=warning,,",
+  "expected": {"orchestrator":"warning"}
+}
