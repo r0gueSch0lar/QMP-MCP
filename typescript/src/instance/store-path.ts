@@ -22,6 +22,12 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, sep } from 'node:path';
 
+import { getLogger } from '../logger.js';
+
+// The store boundary is Instance-lifecycle machinery, so it logs under
+// `orchestrator` (mirrors the Rust variant, where it lives in the instance module tree).
+const logger = getLogger('orchestrator');
+
 /**
  * Per-store wording (and error type) that turns this generic boundary's messages
  * into actionable, store-specific ones. The `error` constructor lets each store
@@ -108,16 +114,22 @@ export function resolveInStore(name: string, storeDir: string, labels: StoreLabe
   // / fd plumbing) is out of the agent threat model — the agent cannot plant
   // symlinks/hardlinks; it only writes via `qemu-img create` (Image Store only).
   const Err = labels.error;
-  assertValidStoreName(name, labels);
+  try {
+    assertValidStoreName(name, labels);
+  } catch (err) {
+    logger.warning(`${labels.store} name rejected: ${err instanceof Error ? err.message : err}`);
+    throw err;
+  }
 
   let realStore: string;
   try {
     realStore = realpathSync(storeDir);
   } catch {
-    throw new Err(
+    const message =
       `${labels.store} directory "${storeDir}" does not exist or is not accessible. ` +
-        `Create it or set ${labels.envVar} to an existing directory.`,
-    );
+      `Create it or set ${labels.envVar} to an existing directory.`;
+    logger.warning(message);
+    throw new Err(message);
   }
 
   const candidate = join(realStore, name);
@@ -135,14 +147,14 @@ export function resolveInStore(name: string, storeDir: string, labels: StoreLabe
     try {
       real = realpathSync(candidate);
     } catch {
-      throw new Err(
-        `${labels.entry} "${name}" is a dangling symlink; refusing to follow it out of the ${labels.store}.`,
-      );
+      const message = `${labels.entry} "${name}" is a dangling symlink; refusing to follow it out of the ${labels.store}.`;
+      logger.warning(message);
+      throw new Err(message);
     }
     if (real !== candidate && !real.startsWith(realStore + sep)) {
-      throw new Err(
-        `${labels.entry} "${name}" resolves outside the ${labels.store} (symlink escape); refusing.`,
-      );
+      const message = `${labels.entry} "${name}" resolves outside the ${labels.store} (symlink escape); refusing.`;
+      logger.warning(message);
+      throw new Err(message);
     }
   }
 

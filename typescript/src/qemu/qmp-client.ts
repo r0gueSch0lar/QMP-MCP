@@ -18,6 +18,10 @@
 import { EventEmitter } from 'node:events';
 import { connect, type Socket } from 'node:net';
 
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('qmp');
+
 /** An asynchronous QMP event (e.g. SHUTDOWN, STOP, RESUME). */
 export interface QmpEvent {
   event: string;
@@ -145,6 +149,7 @@ export class QmpClient extends EventEmitter {
       );
     }
     const id = this.#nextId++;
+    logger.debug(`sending QMP command "${command}" (id ${id})`);
     const message: Record<string, unknown> = { execute: command, id };
     if (args !== undefined) message.arguments = args;
     return new Promise<unknown>((resolve, reject) => {
@@ -154,6 +159,9 @@ export class QmpClient extends EventEmitter {
           // Only act if this command is still outstanding.
           if (this.#pending.get(id) !== pending) return;
           this.#pending.delete(id);
+          logger.warning(
+            `QMP command "${command}" timed out after ${timeoutMs}ms with no response from QEMU.`,
+          );
           reject(
             new QmpConnectionError(
               `QMP command "${command}" timed out after ${timeoutMs}ms with no response from QEMU.`,
@@ -169,6 +177,7 @@ export class QmpClient extends EventEmitter {
         if (err) {
           if (this.#pending.get(id) === pending) this.#pending.delete(id);
           if (pending.timer) clearTimeout(pending.timer);
+          logger.warning(`Failed to write QMP command "${command}" to the socket: ${err.message}`);
           reject(err);
         }
       });
@@ -232,6 +241,7 @@ export class QmpClient extends EventEmitter {
       message = JSON.parse(line) as Record<string, unknown>;
     } catch {
       // A malformed line is unexpected from QEMU; surface it but keep going.
+      logger.warning(`Could not parse QMP message: ${line}`);
       this.emit('parseError', new QmpConnectionError(`Could not parse QMP message: ${line}`));
       return;
     }
@@ -239,12 +249,14 @@ export class QmpClient extends EventEmitter {
     if ('QMP' in message) {
       const qmp = message.QMP as { version?: unknown; capabilities?: unknown[] };
       this.#greeting = { version: qmp.version, capabilities: qmp.capabilities ?? [] };
+      logger.debug(`QMP greeting received: version=${JSON.stringify(qmp.version ?? null)}`);
       this.#onGreeting?.(this.#greeting);
       this.#onGreeting = undefined;
       return;
     }
 
     if ('event' in message) {
+      logger.debug(`QMP event ${String(message.event)}`);
       this.emit('event', message as unknown as QmpEvent);
       return;
     }
@@ -252,12 +264,19 @@ export class QmpClient extends EventEmitter {
     const id = typeof message.id === 'number' ? message.id : undefined;
     if (id === undefined) return;
     const pending = this.#pending.get(id);
-    if (!pending) return;
+    if (!pending) {
+      // Typically a late reply to a command that already timed out.
+      logger.debug(`ignoring QMP reply with no matching request (id ${id})`);
+      return;
+    }
     this.#pending.delete(id);
     if (pending.timer) clearTimeout(pending.timer);
 
     if ('error' in message) {
       const error = message.error as { class?: string; desc?: string };
+      logger.debug(
+        `QMP command "${pending.command}" failed [${error.class ?? 'GenericError'}]: ${error.desc ?? ''}`,
+      );
       pending.reject(
         new QmpCommandError(pending.command, error.class ?? 'GenericError', error.desc ?? ''),
       );
@@ -271,6 +290,14 @@ export class QmpClient extends EventEmitter {
     if (this.#closed) return;
     this.#closed = true;
     this.#closeError = error ?? new QmpConnectionError('QMP connection closed.');
+    const outstanding = this.#pending.size;
+    if (outstanding > 0) {
+      logger.warning(
+        `QMP connection closed with ${outstanding} pending command(s): ${this.#closeError.message}`,
+      );
+    } else {
+      logger.debug(`QMP connection closed: ${this.#closeError.message}`);
+    }
     for (const pending of this.#pending.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       pending.reject(this.#closeError);

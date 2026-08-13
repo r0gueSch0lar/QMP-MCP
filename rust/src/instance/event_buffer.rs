@@ -203,7 +203,14 @@ impl EventBuffer {
         inner.events.push_back(buffered.clone());
         // Bound memory: evict oldest beyond capacity (FIFO ring).
         while inner.events.len() > self.capacity {
-            inner.events.pop_front();
+            if let Some(evicted) = inner.events.pop_front() {
+                tracing::debug!(
+                    "event buffer full (capacity {}); evicting seq {} ({})",
+                    self.capacity,
+                    evicted.seq,
+                    evicted.event
+                );
+            }
         }
         // Wake ALL matching waiters (e.g. several agents awaiting SHUTDOWN). Remove
         // each matched waiter as it settles; `send` consumes its sender.
@@ -326,9 +333,14 @@ impl EventBuffer {
     /// deliberately NOT reset.
     pub fn reset(&self) {
         let mut inner = self.lock();
+        let dropped = inner.events.len();
+        let settled = inner.waiters.len();
         inner.events.clear();
         // Dropping each waiter's sender wakes its future as a clean timeout.
         inner.waiters.clear();
+        tracing::debug!(
+            "event buffer reset (dropped {dropped} buffered event(s), settled {settled} pending wait(s))"
+        );
     }
 
     /// Lock the inner state. The guard is never held across an `.await`, so a poisoned

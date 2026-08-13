@@ -15,7 +15,12 @@
 
 import { rm } from 'node:fs/promises';
 import { createConnection, type Socket } from 'node:net';
+import { getLogger } from '../logger.js';
 import { serialSocketPath } from './hardware-spec.js';
+
+// The Serial Port bridge is Instance-lifecycle machinery, so it logs under
+// `orchestrator` (in Rust it lives inside the orchestrator module).
+const logger = getLogger('orchestrator');
 
 /** How long {@link attachSerialBridge} retries dialing QEMU's serial socket before failing. */
 export const SERIAL_DIAL_TIMEOUT_MS = 2_000;
@@ -69,9 +74,10 @@ export class SerialBridge {
     socket.on('data', (chunk: Buffer) => {
       this.#ring = pushBounded(this.#ring, chunk, this.#cap);
     });
+    socket.on('end', () => logger.debug('serial socket closed by peer'));
     // A mid-session socket error must never surface as an unhandled 'error' that crashes the
     // server: teardown owns the connection, and read/write report their own failures.
-    socket.on('error', () => {});
+    socket.on('error', (err: Error) => logger.debug(`serial socket read error: ${err.message}`));
   }
 
   /**
@@ -118,6 +124,7 @@ export class SerialBridge {
   async teardown(): Promise<void> {
     this.#socket.destroy();
     await rm(this.socketPath, { force: true }).catch(() => {});
+    logger.debug(`serial bridge torn down (${this.socketPath})`);
   }
 }
 
@@ -166,14 +173,16 @@ export async function attachSerialBridge(
   for (;;) {
     try {
       const socket = await connect(socketPath);
+      logger.debug(`serial bridge attached (${socketPath})`);
       return new SerialBridge(socket, bufferBytes, socketPath);
     } catch (err) {
       if (Date.now() >= deadline) {
-        throw new Error(
+        const message =
           `Failed to connect to the Serial Port socket at ${socketPath} within ${timeoutMs}ms: ` +
-            `${err instanceof Error ? err.message : String(err)}. The socket backend needs QEMU's ` +
-            'server chardev to be listening.',
-        );
+          `${err instanceof Error ? err.message : String(err)}. The socket backend needs QEMU's ` +
+          'server chardev to be listening.';
+        logger.warning(message);
+        throw new Error(message);
       }
       await delay(intervalMs);
     }

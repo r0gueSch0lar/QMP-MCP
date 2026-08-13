@@ -13,7 +13,12 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { getLogger } from '../logger.js';
 import { assertValidStoreName, type StoreLabels } from './store-path.js';
+
+// The catalog feeds the downloader, so it logs under `download` (mirrors the Rust
+// variant, whose logging maps `instance::catalog` onto the download subsystem).
+const logger = getLogger('download');
 
 /**
  * Raised when a catalog file cannot be read or fails validation (malformed JSON, empty,
@@ -157,6 +162,7 @@ export function parseCatalog(json: string, source: string): Catalog {
       mirrors: e.mirrors,
     });
   }
+  logger.debug(`ISO catalog loaded (${source}): ${entries.length} entries`);
   return { source, entries };
 }
 

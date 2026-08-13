@@ -25,7 +25,12 @@
  * running Instance.
  */
 
+import { getLogger } from '../logger.js';
 import type { QmpEvent } from '../qemu/driver.js';
+
+// The Event Buffer is Instance-lifecycle machinery, so it logs under `orchestrator`
+// (mirrors the Rust variant, where it lives inside the instance module tree).
+const logger = getLogger('orchestrator');
 
 /** A captured QMP async event, stamped with its buffer sequence number. */
 export interface BufferedEvent {
@@ -135,7 +140,14 @@ export class EventBuffer {
     };
     this.#events.push(buffered);
     // Bound memory: evict oldest beyond capacity (FIFO ring).
-    while (this.#events.length > this.capacity) this.#events.shift();
+    while (this.#events.length > this.capacity) {
+      const evicted = this.#events.shift();
+      if (evicted) {
+        logger.debug(
+          `event buffer full (capacity ${this.capacity}); evicting seq ${evicted.seq} (${evicted.event})`,
+        );
+      }
+    }
     // Wake ALL matching waiters (e.g. several agents awaiting SHUTDOWN). Snapshot
     // first: fulfill() mutates the set as each waiter settles.
     for (const waiter of [...this.#waiters]) {
@@ -210,7 +222,12 @@ export class EventBuffer {
    * deliberately NOT reset.
    */
   reset(): void {
+    const dropped = this.#events.length;
+    const settled = this.#waiters.size;
     this.#events = [];
     for (const waiter of [...this.#waiters]) waiter.expire();
+    logger.debug(
+      `event buffer reset (dropped ${dropped} buffered event(s), settled ${settled} pending wait(s))`,
+    );
   }
 }

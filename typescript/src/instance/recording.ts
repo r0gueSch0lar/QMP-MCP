@@ -388,7 +388,12 @@ export const spawnFfmpegSink: RecordingSinkFactory = (binary, args) => {
       ]);
       if (timer) clearTimeout(timer);
       // T1: ffmpeg overran the finalize window — force-kill it so teardown never blocks.
-      if (timedOut) await abort();
+      if (timedOut) {
+        logger.warning(
+          `ffmpeg did not finalize within ${FFMPEG_FINALIZE_TIMEOUT_MS}ms; killing it`,
+        );
+        await abort();
+      }
     },
     abort,
   };

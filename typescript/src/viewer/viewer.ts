@@ -228,6 +228,19 @@ function isAuthenticated(req: IncomingMessage, password: string, user?: string):
   return passwordOk && userOk;
 }
 
+/**
+ * Log a failed auth check: a credential-less 401 is the normal HTTP Basic challenge
+ * flow (every browser session starts with one), while wrong credentials are a failed
+ * login attempt worth an operator's attention.
+ */
+function logAuthFailure(req: IncomingMessage): void {
+  if (req.headers.authorization !== undefined) {
+    logger.warning('Viewer authentication failed (wrong credentials); sending 401');
+  } else {
+    logger.debug('Viewer request without credentials; sending 401 challenge');
+  }
+}
+
 /** Build the (post-auth) noVNC page with the server-generated VNC password embedded. */
 function renderPage(vncPassword: string): string {
   // JSON.stringify safely embeds the (server-generated, alphanumeric) secret into a
@@ -361,6 +374,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, options: Viewe
   // with each writeHead below (including the 401 and error responses).
   setAntiFramingHeaders(res);
   if (!isAuthenticated(req, options.password, options.user)) {
+    logAuthFailure(req);
     sendUnauthorized(res);
     return;
   }
@@ -391,13 +405,28 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, options: Viewe
  */
 function proxyToVnc(ws: WebSocket, vncHost: string, vncPort: number): void {
   const tcp = connect(vncPort, vncHost);
+  let connected = false;
   let closed = false;
   const closeBoth = (): void => {
     if (closed) return;
     closed = true;
+    if (connected) logger.debug('Viewer client disconnected');
     tcp.destroy();
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
   };
+  tcp.once('connect', () => {
+    connected = true;
+    logger.debug(`Viewer client connected; relaying to VNC at ${vncHost}:${vncPort}`);
+  });
+  tcp.on('error', (err: Error) => {
+    if (!connected) {
+      logger.warning(
+        `Viewer could not reach the VNC Display at ${vncHost}:${vncPort}: ${err.message}`,
+      );
+    } else {
+      logger.debug(`Viewer VNC relay error: ${err.message}`);
+    }
+  });
 
   // VNC -> browser. Honor ws backpressure: if the browser is slow and the ws send
   // buffer fills, stop reading from VNC until it drains, so the relay never buffers
@@ -458,6 +487,7 @@ export function startViewer(options: ViewerOptions): Promise<Viewer> {
   // within the concurrent-connection cap (F5) — else it is refused and the socket closed.
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     if (!isAuthenticated(req, options.password, options.user)) {
+      logAuthFailure(req);
       socket.write(
         `HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\n` +
           'Connection: close\r\n\r\n',
@@ -468,6 +498,7 @@ export function startViewer(options: ViewerOptions): Promise<Viewer> {
     // Same-origin only for browser callers (F2): a cross-origin page must not be
     // able to drive an authenticated upgrade off a cached/leaked credential.
     if (!originAllowed(req)) {
+      logger.warning('Viewer websocket upgrade refused: cross-origin request');
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -475,12 +506,16 @@ export function startViewer(options: ViewerOptions): Promise<Viewer> {
     // Only the path the served page connects on is a valid upgrade target (F6).
     const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
     if (pathname !== WEBSOCKET_PATH) {
+      logger.debug(`Viewer websocket upgrade refused: unexpected path ${pathname}`);
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
     // Cap concurrent authenticated relays (F5): refuse the N+1th with 503.
     if (wss.clients.size >= MAX_VIEWER_CONNECTIONS) {
+      logger.warning(
+        `Viewer websocket upgrade refused: too many concurrent connections (${MAX_VIEWER_CONNECTIONS})`,
+      );
       socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -495,6 +530,11 @@ export function startViewer(options: ViewerOptions): Promise<Viewer> {
     httpServer.once('error', onError);
     httpServer.listen(options.port, options.host, () => {
       httpServer.removeListener('error', onError);
+      // A post-listen server error must be visible (and must not surface as an
+      // unhandled 'error' event); mirrors the Rust serve-error warning.
+      httpServer.on('error', (err: Error) =>
+        logger.warning(`Viewer HTTP server error: ${err.message}`),
+      );
       const address = httpServer.address();
       const boundPort =
         typeof address === 'object' && address !== null ? address.port : options.port;

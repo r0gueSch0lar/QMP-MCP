@@ -134,6 +134,7 @@ async fn require_api_key(
     if api_key_ok(request.headers(), &state.api_keys) {
         next.run(request).await
     } else {
+        tracing::warn!("HTTP request rejected: missing or invalid X-API-Key");
         (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: a valid X-API-Key header is required.\n",
@@ -150,6 +151,7 @@ async fn require_jwt(State(state): State<GuardState>, request: Request, next: Ne
     if jwt_ok(request.headers(), &state.jwt_secret) {
         next.run(request).await
     } else {
+        tracing::warn!("HTTP request rejected: missing or invalid Bearer JWT");
         (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: a valid Authorization: Bearer <JWT> is required.\n",
@@ -165,6 +167,14 @@ async fn guard_origin(State(state): State<GuardState>, request: Request, next: N
     if origin_ok(request.headers(), &state.allowed_origins) {
         next.run(request).await
     } else {
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<non-ascii>");
+        tracing::warn!(
+            "HTTP request rejected: Origin \"{origin}\" is not permitted (DNS-rebinding guard)"
+        );
         (
             StatusCode::FORBIDDEN,
             "Forbidden: this Origin is not permitted.\n",

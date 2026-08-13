@@ -28,8 +28,12 @@ use crate::config::LogLevel;
 /// log under `orchestrator`. Targets outside the crate (dependency logs) return `None` and
 /// follow the global `QMP_MCP_LOG_LEVEL` only.
 pub fn subsystem_for_target(target: &str) -> Option<&'static str> {
-    // The bin crate root (`main.rs`) logs under the crate name itself.
-    if target == "qmp_mcp" || target.starts_with("qmp_mcp::server") {
+    // The bin crate root (`main.rs`) logs under the crate name itself. The HTTP
+    // transport is the server's edge, so it logs under `server` too.
+    if target == "qmp_mcp"
+        || target.starts_with("qmp_mcp::server")
+        || target.starts_with("qmp_mcp::http")
+    {
         return Some("server");
     }
     if target.starts_with("qmp_mcp::instance::download")
@@ -186,6 +190,7 @@ mod tests {
     #[test]
     fn targets_map_onto_the_shared_subsystem_vocabulary() {
         assert_eq!(subsystem_for_target("qmp_mcp"), Some("server"));
+        assert_eq!(subsystem_for_target("qmp_mcp::http"), Some("server"));
         assert_eq!(
             subsystem_for_target("qmp_mcp::instance::orchestrator"),
             Some("orchestrator")

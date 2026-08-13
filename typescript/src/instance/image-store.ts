@@ -22,7 +22,12 @@ import { type Dirent, lstatSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { resolveImageDir, resolveMaxDiskGb } from '../config.js';
+import { getLogger } from '../logger.js';
 import { assertValidStoreName, resolveInStore, type StoreLabels } from './store-path.js';
+
+// The Image Store is Instance-lifecycle machinery, so it logs under `orchestrator`
+// (mirrors the Rust variant, where it lives in the instance module tree).
+const logger = getLogger('orchestrator');
 
 /** Disk image formats this server will create and pin explicitly into argv. */
 export const IMAGE_FORMATS = ['qcow2', 'raw'] as const;
@@ -121,6 +126,7 @@ export interface ImageStoreOptions {
  */
 function spawnQemuImg(binary: string, args: string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
+    logger.debug(`spawning ${binary} ${args.join(' ')}`);
     const child: ChildProcess = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr?.setEncoding('utf8');
@@ -173,10 +179,11 @@ export class ImageStore {
     try {
       entries = await readdir(this.dir, { withFileTypes: true });
     } catch {
-      throw new ImageStoreError(
+      const message =
         `Image Store directory "${this.dir}" does not exist or is not accessible. ` +
-          `Create it or set QMP_MCP_IMAGE_DIR to an existing directory.`,
-      );
+        `Create it or set QMP_MCP_IMAGE_DIR to an existing directory.`;
+      logger.warning(message);
+      throw new ImageStoreError(message);
     }
     const images: ImageInfo[] = [];
     for (const entry of entries) {
@@ -241,11 +248,12 @@ export class ImageStore {
     try {
       await this.#run(this.#binary, ['create', '-f', format, path, `${sizeGb}G`]);
     } catch (err) {
-      throw new ImageStoreError(
-        `Failed to create image "${name}": ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const message = `Failed to create image "${name}": ${err instanceof Error ? err.message : String(err)}`;
+      logger.warning(message);
+      throw new ImageStoreError(message);
     }
 
+    logger.info(`disk image created: ${name} -> ${path} (${format}, ${sizeGb} GiB)`);
     return { name, path, format, sizeGb };
   }
 }

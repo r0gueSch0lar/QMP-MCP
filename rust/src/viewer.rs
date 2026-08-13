@@ -470,6 +470,13 @@ async fn require_basic_auth(
     if is_authenticated(request.headers(), &state.password, state.user.as_deref()) {
         next.run(request).await
     } else {
+        // A credential-less 401 is the normal HTTP Basic challenge flow (every browser
+        // session starts with one); wrong credentials are a failed login attempt.
+        if request.headers().contains_key(header::AUTHORIZATION) {
+            tracing::warn!("Viewer authentication failed (wrong credentials); sending 401");
+        } else {
+            tracing::debug!("Viewer request without credentials; sending 401 challenge");
+        }
         unauthorized()
     }
 }
@@ -569,6 +576,7 @@ async fn websockify(
     // Same-origin only for browser callers (F2): a cross-origin page must not drive an
     // authenticated upgrade off a cached/leaked credential.
     if !origin_allowed(&headers) {
+        tracing::warn!("Viewer websocket upgrade refused: cross-origin request");
         return (
             StatusCode::FORBIDDEN,
             [(
@@ -584,6 +592,10 @@ async fn websockify(
     let permit = match Arc::clone(&state.connections).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            tracing::warn!(
+                "Viewer websocket upgrade refused: too many concurrent connections \
+                 ({MAX_VIEWER_CONNECTIONS})"
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [(
@@ -622,6 +634,7 @@ async fn proxy_to_vnc(socket: WebSocket, vnc_host: &str, vnc_port: u16) {
             return;
         }
     };
+    tracing::debug!("Viewer client connected; relaying to VNC at {vnc_host}:{vnc_port}");
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let (mut ws_sink, mut ws_stream) = socket.split();
 
@@ -673,6 +686,7 @@ async fn proxy_to_vnc(socket: WebSocket, vnc_host: &str, vnc_port: u16) {
         _ = client_to_vnc => {}
         _ = vnc_to_client => {}
     }
+    tracing::debug!("Viewer client disconnected");
 }
 
 /// Assemble the Viewer's axum application. The auth layer is inner (closest to the
