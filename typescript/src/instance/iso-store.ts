@@ -17,7 +17,12 @@ import type { Dirent } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { resolveIsoDir } from '../config.js';
+import { getLogger } from '../logger.js';
 import { assertValidStoreName, resolveInStore, type StoreLabels } from './store-path.js';
+
+// The ISO Store is Instance-lifecycle machinery, so it logs under `orchestrator`
+// (mirrors the Rust variant, where it lives in the instance module tree).
+const logger = getLogger('orchestrator');
 
 /**
  * Raised for any ISO Store violation: an invalid/traversing ISO name, a symlink
@@ -103,10 +108,11 @@ export class IsoStore {
     try {
       entries = await readdir(this.dir, { withFileTypes: true });
     } catch {
-      throw new IsoStoreError(
+      const message =
         `ISO Store directory "${this.dir}" does not exist or is not accessible. ` +
-          `Create it or set QMP_MCP_ISO_DIR to an existing directory.`,
-      );
+        `Create it or set QMP_MCP_ISO_DIR to an existing directory.`;
+      logger.warning(message);
+      throw new IsoStoreError(message);
     }
     const isos: IsoInfo[] = [];
     for (const entry of entries) {

@@ -81,10 +81,12 @@ export class RealQemuDriver implements QemuDriver {
       child.on('error', (err: Error) =>
         logger.warning(`qemu child emitted an error after launch: ${err.message}`),
       );
+      logger.info(`QMP session established for ${binary}`);
       return new RealInstanceProcess(child, client, exited, qmpSocketPath);
     } catch (err) {
       // Ensure we never leak a half-started child, a live QMP client, or a stale
       // socket. `client?.` guards the case where dial itself failed.
+      logger.warning(`qemu launch failed: ${err instanceof Error ? err.message : String(err)}`);
       await client?.close().catch(() => undefined);
       await terminate(child, exited);
       await rm(qmpSocketPath, { force: true }).catch(() => undefined);
@@ -181,6 +183,7 @@ async function terminate(child: ChildProcess, exited: Promise<void>): Promise<vo
     ac.abort();
   }
   if (race === timedOut) {
+    logger.warning(`qemu did not exit within ${TERMINATE_GRACE_MS}ms of SIGTERM; sending SIGKILL`);
     child.kill('SIGKILL');
     await exited;
   }

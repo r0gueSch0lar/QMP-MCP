@@ -113,6 +113,8 @@ import {
 } from './serial-bridge.js';
 
 const logger = getLogger('orchestrator');
+// Command Policy denials log under `policy` — the subsystem that made the decision.
+const policyLogger = getLogger('policy');
 
 /**
  * The lifecycle states an Instance moves through. `PAUSED` is entered by
@@ -945,6 +947,7 @@ export class Orchestrator {
       };
     } catch (err) {
       release();
+      logger.warning(`Instance create failed: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
   }
@@ -1352,6 +1355,11 @@ export class Orchestrator {
   async executeCommand(command: string, args?: Record<string, unknown>): Promise<unknown> {
     const verdict = decideCommand(this.#commandPolicy, command);
     if (!verdict.allowed) {
+      // Logged under `policy` (the subsystem that made the decision) rather than the
+      // orchestrator that enforces it — mirrors the Rust policy-targeted warning.
+      policyLogger.warning(
+        `Command Policy denied QMP command "${verdict.command}"${verdict.hardDenied ? ' (hard denylist)' : ''}`,
+      );
       throw new CommandPolicyError(verdict.reason, verdict.hardDenied);
     }
     const process = this.#requireInstance(`execute the QMP command "${verdict.command}"`);

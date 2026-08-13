@@ -308,6 +308,7 @@ export class DownloadManager {
     };
     this.activeStatus = status;
 
+    logger.info(`download started: ${entry.id} -> ${dest} (${entry.mirrors.length} mirror(s))`);
     // Run the fetch off the request path (fire-and-forget; progress is polled via get_download).
     void this.run(entry.mirrors, dest, status);
     return { ...status };
@@ -323,6 +324,7 @@ export class DownloadManager {
     await rm(temp, { force: true }).catch(() => {});
     let lastError = 'no mirrors were configured for this entry';
     for (const [index, url] of mirrors.entries()) {
+      logger.debug(`trying mirror ${index + 1}/${mirrors.length}: ${url}`);
       status.mirror = url;
       status.mirrorIndex = index;
       status.bytesDownloaded = 0;
@@ -361,6 +363,7 @@ export class DownloadManager {
         logger.warning(`download mirror failed (${url}): ${lastError}`);
       }
     }
+    logger.warning(`download failed: ${status.id}: ${lastError}`);
     status.state = 'failed';
     status.error = lastError;
     this.finish(status);
