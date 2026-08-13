@@ -521,11 +521,18 @@ mod tests {
     }
     impl TempDir {
         fn new() -> Self {
+            // A process-wide sequence number keeps parallel tests apart even when two land on
+            // the same clock tick: with nanos alone, colliding tests shared a directory and one
+            // test's Drop could delete it mid-download (seen as a Failed download on CI). The
+            // nanos stay for cross-run hygiene should a recycled pid meet a leftover directory.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("qmp-dl-{}-{nanos}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("qmp-dl-{}-{nanos}-{seq}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }
