@@ -50,6 +50,12 @@ const DEFAULTS: Config = {
   serialBufferBytes: 1048576,
   serialBackend: 'ringbuf',
   serialSpoolDir: undefined,
+  ffmpegBinary: 'ffmpeg',
+  recordingDir: undefined,
+  recordingCodec: 'libx264',
+  recordingCrf: 22,
+  recordingMaxFps: 15,
+  recordingPixfmt: 'yuv420p',
   allowRawArgs: false,
   viewerPassword: undefined,
   viewerUser: undefined,
@@ -109,6 +115,60 @@ describe('loadConfig', () => {
     );
     // socket is a valid backend and needs no extra directory (the interactive bridge).
     expect(loadConfig({ QMP_MCP_SERIAL_BACKEND: 'socket' }).serialBackend).toBe('socket');
+  });
+
+  it('defaults the Display-recording knobs and reads their overrides (ADR-0017)', () => {
+    const d = loadConfig({});
+    expect(d.ffmpegBinary).toBe('ffmpeg');
+    expect(d.recordingDir).toBeUndefined();
+    expect(d.recordingCodec).toBe('libx264');
+    expect(d.recordingCrf).toBe(22);
+    expect(d.recordingMaxFps).toBe(15);
+    expect(d.recordingPixfmt).toBe('yuv420p');
+
+    const c = loadConfig({
+      QMP_MCP_FFMPEG_BINARY: '/usr/bin/ffmpeg',
+      QMP_MCP_RECORDING_DIR: '/var/lib/qmp-mcp/recordings',
+      QMP_MCP_RECORDING_CODEC: 'libx265',
+      QMP_MCP_RECORDING_CRF: '30',
+      QMP_MCP_RECORDING_MAX_FPS: '24',
+      QMP_MCP_RECORDING_PIXFMT: 'yuv444p',
+    });
+    expect(c.ffmpegBinary).toBe('/usr/bin/ffmpeg');
+    expect(c.recordingDir).toBe('/var/lib/qmp-mcp/recordings');
+    expect(c.recordingCodec).toBe('libx265');
+    expect(c.recordingCrf).toBe(30);
+    expect(c.recordingMaxFps).toBe(24);
+    expect(c.recordingPixfmt).toBe('yuv444p');
+  });
+
+  it('fails closed on invalid Display-recording values, naming the variable (ADR-0017)', () => {
+    expect(() => loadConfig({ QMP_MCP_RECORDING_DIR: 'relative/path' })).toThrowError(
+      /QMP_MCP_RECORDING_DIR must be an absolute path/,
+    );
+    expect(() => loadConfig({ QMP_MCP_FFMPEG_BINARY: 'ff mpeg; rm -rf /' })).toThrowError(
+      /QMP_MCP_FFMPEG_BINARY/,
+    );
+    expect(() => loadConfig({ QMP_MCP_RECORDING_CODEC: 'libx264; rm' })).toThrowError(
+      /QMP_MCP_RECORDING_CODEC/,
+    );
+    expect(() => loadConfig({ QMP_MCP_RECORDING_CRF: '64' })).toThrowError(
+      /QMP_MCP_RECORDING_CRF must be an integer in 0\.\.63/,
+    );
+    // CRF 0 is lossless and MUST be accepted (canonical range 0..63).
+    expect(loadConfig({ QMP_MCP_RECORDING_CRF: '0' }).recordingCrf).toBe(0);
+    expect(() => loadConfig({ QMP_MCP_RECORDING_MAX_FPS: '0' })).toThrowError(
+      /QMP_MCP_RECORDING_MAX_FPS must be an integer in 1\.\.60/,
+    );
+    // 61 is just past the inclusive upper bound of 60.
+    expect(() => loadConfig({ QMP_MCP_RECORDING_MAX_FPS: '61' })).toThrowError(
+      /QMP_MCP_RECORDING_MAX_FPS must be an integer in 1\.\.60/,
+    );
+    // 60 (the inclusive max) is accepted.
+    expect(loadConfig({ QMP_MCP_RECORDING_MAX_FPS: '60' }).recordingMaxFps).toBe(60);
+    expect(() => loadConfig({ QMP_MCP_RECORDING_PIXFMT: 'yuv420p!' })).toThrowError(
+      /QMP_MCP_RECORDING_PIXFMT/,
+    );
   });
 
   it('rejects an invalid transport, naming the variable and the allowed values', () => {

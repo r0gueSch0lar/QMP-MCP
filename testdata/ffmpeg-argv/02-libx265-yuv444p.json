@@ -1,0 +1,26 @@
+{
+  "description": "libx265 omits -tune stillimage (only libx264 gets it); overrides thread through; maxFps does NOT appear in argv.",
+  "codec": "libx265",
+  "crf": 30,
+  "maxFps": 24,
+  "pixfmt": "yuv444p",
+  "out": "/rec/clip.mkv",
+  "expectedArgv": [
+    "-f",
+    "image2pipe",
+    "-use_wallclock_as_timestamps",
+    "1",
+    "-i",
+    "pipe:0",
+    "-c:v",
+    "libx265",
+    "-crf",
+    "30",
+    "-pix_fmt",
+    "yuv444p",
+    "-fps_mode",
+    "vfr",
+    "-y",
+    "/rec/clip.mkv"
+  ]
+}
