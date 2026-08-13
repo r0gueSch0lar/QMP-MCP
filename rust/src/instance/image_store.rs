@@ -125,6 +125,7 @@ pub struct SpawnQemuImg;
 #[async_trait]
 impl QemuImgRunner for SpawnQemuImg {
     async fn run(&self, binary: &str, args: &[String]) -> Result<(), String> {
+        tracing::debug!("spawning {binary} {}", args.join(" "));
         let output = tokio::process::Command::new(binary)
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -273,11 +274,16 @@ impl ImageStore {
             path.clone(),
             format!("{size_gb}G"),
         ];
-        self.run
-            .run(&self.binary, &args)
-            .await
-            .map_err(|err| StoreError(format!("Failed to create image \"{name}\": {err}")))?;
+        self.run.run(&self.binary, &args).await.map_err(|err| {
+            let err = StoreError(format!("Failed to create image \"{name}\": {err}"));
+            tracing::warn!("{}", err.0);
+            err
+        })?;
 
+        tracing::info!(
+            "disk image created: {name} -> {path} ({}, {size_gb} GiB)",
+            format.as_str()
+        );
         Ok(CreateImageResult {
             name,
             path,

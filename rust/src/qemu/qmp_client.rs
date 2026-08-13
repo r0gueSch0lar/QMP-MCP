@@ -143,6 +143,14 @@ impl Shared {
         *self.close_reason.lock().expect("close_reason mutex") = Some(reason.to_string());
         {
             let mut pending = self.pending.lock().expect("pending mutex");
+            let outstanding = pending.len();
+            if outstanding > 0 {
+                tracing::warn!(
+                    "QMP connection closed with {outstanding} pending command(s): {reason}"
+                );
+            } else {
+                tracing::debug!("QMP connection closed: {reason}");
+            }
             pending.clear(); // dropping the senders wakes each waiter with a recv error
         }
         // Fire the exit signal (latched). `send` errors only when nobody is awaiting the
@@ -311,6 +319,7 @@ impl QmpClient {
         }
 
         let id = self.shared.next_id.fetch_add(1, Ordering::SeqCst);
+        tracing::debug!("sending QMP command \"{command}\" (id {id})");
         let mut message = serde_json::Map::new();
         message.insert("execute".to_string(), Value::String(command.to_string()));
         if let Some(args) = args {
@@ -338,6 +347,7 @@ impl QmpClient {
                     .lock()
                     .expect("pending mutex")
                     .remove(&id);
+                tracing::warn!("Failed to write QMP command \"{command}\" to the socket: {e}");
                 return Err(QmpError::Connection(format!(
                     "Failed to write QMP command \"{command}\" to the socket: {e}"
                 )));
@@ -347,11 +357,14 @@ impl QmpClient {
 
         match timeout(command_timeout, rx).await {
             Ok(Ok(Reply::Return(value))) => Ok(value),
-            Ok(Ok(Reply::Error { class, desc })) => Err(QmpError::Command {
-                command: command.to_string(),
-                class,
-                desc,
-            }),
+            Ok(Ok(Reply::Error { class, desc })) => {
+                tracing::debug!("QMP command \"{command}\" failed [{class}]: {desc}");
+                Err(QmpError::Command {
+                    command: command.to_string(),
+                    class,
+                    desc,
+                })
+            }
             // The sender was dropped (connection failed/closed) before a reply.
             Ok(Err(_)) => Err(QmpError::Connection(self.shared.close_reason())),
             Err(_) => {
@@ -360,6 +373,10 @@ impl QmpClient {
                     .lock()
                     .expect("pending mutex")
                     .remove(&id);
+                tracing::warn!(
+                    "QMP command \"{command}\" timed out after {}ms with no response from QEMU.",
+                    command_timeout.as_millis()
+                );
                 Err(QmpError::Connection(format!(
                     "QMP command \"{command}\" timed out after {}ms with no response from QEMU.",
                     command_timeout.as_millis()
@@ -428,7 +445,10 @@ fn dispatch(
 ) {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
-        Err(_) => return,
+        Err(_) => {
+            tracing::warn!("Could not parse QMP message: {line}");
+            return;
+        }
     };
     let Some(object) = value.as_object() else {
         return;
@@ -443,6 +463,7 @@ fn dispatch(
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new())),
         };
+        tracing::debug!("QMP greeting received: version={}", greeting.version);
         if let Some(tx) = greeting_tx.take() {
             let _ = tx.send(greeting);
         }
@@ -452,6 +473,7 @@ fn dispatch(
     // Async event: broadcast to any subscriber (ignore if none).
     if object.contains_key("event") {
         if let Ok(event) = serde_json::from_value::<QmpEvent>(value) {
+            tracing::debug!("QMP event {}", event.event);
             let _ = shared.events_tx.send(event);
         }
         return;
@@ -462,6 +484,8 @@ fn dispatch(
         return;
     };
     let Some(tx) = shared.pending.lock().expect("pending mutex").remove(&id) else {
+        // Typically a late reply to a command that already timed out.
+        tracing::debug!("ignoring QMP reply with no matching request (id {id})");
         return;
     };
     if let Some(error) = object.get("error") {

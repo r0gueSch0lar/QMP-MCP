@@ -396,6 +396,11 @@ impl DownloadManager {
         state.active = Some(Arc::clone(&shared));
         drop(state);
 
+        tracing::info!(
+            "download started: {} -> {dest} ({} mirror(s))",
+            entry.id,
+            entry.mirrors.len()
+        );
         // Run the fetch off the request path.
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
@@ -429,6 +434,7 @@ async fn run_download(
 
     let mut last_err = "no mirrors were configured for this entry".to_string();
     for (index, url) in entry.mirrors.iter().enumerate() {
+        tracing::debug!("trying mirror {}/{}: {url}", index + 1, entry.mirrors.len());
         {
             let mut s = shared.lock().unwrap();
             s.mirror = Some(url.clone());
@@ -493,6 +499,7 @@ async fn run_download(
         }
     }
 
+    tracing::warn!("download failed: {}: {last_err}", entry.id);
     {
         let mut s = shared.lock().unwrap();
         s.state = DownloadState::Failed;

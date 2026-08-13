@@ -156,6 +156,7 @@ pub fn parse_catalog(json: &str, source: &str) -> Result<Catalog, CatalogError> 
             }
         }
     }
+    tracing::debug!("ISO catalog loaded ({source}): {} entries", raw.isos.len());
     Ok(Catalog {
         source: source.to_string(),
         entries: raw.isos,

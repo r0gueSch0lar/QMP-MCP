@@ -659,6 +659,7 @@ impl Orchestrator {
                             }
                             let _ = handle.close().await;
                             self.state = InstanceState::None;
+                            tracing::warn!("Instance create failed: {}", err.0);
                             return Err(err);
                         }
                     }
@@ -726,6 +727,7 @@ impl Orchestrator {
                 // Validation or launch failed: free the reserved slot (nothing was
                 // published, so there is no handle to tear down).
                 self.state = InstanceState::None;
+                tracing::warn!("Instance create failed: {}", err.0);
                 Err(err)
             }
         }
@@ -1641,7 +1643,19 @@ impl Orchestrator {
         let verdict = decide_command(&self.command_policy, command);
         let name = match &verdict {
             crate::policy::CommandVerdict::Allowed { command } => command.clone(),
-            crate::policy::CommandVerdict::Denied { .. } => {
+            crate::policy::CommandVerdict::Denied {
+                command,
+                hard_denied,
+                ..
+            } => {
+                // Attributed to the policy subsystem (which made the decision) rather
+                // than the orchestrator that enforces it, so QMP_MCP_LOG_FILTER's
+                // `policy` key governs it — mirrors the TS policy-scoped logger.
+                tracing::warn!(
+                    target: "qmp_mcp::policy",
+                    "Command Policy denied QMP command \"{command}\"{}",
+                    if *hard_denied { " (hard denylist)" } else { "" }
+                );
                 return Err(ExecuteCommandError::Policy(
                     CommandPolicyError::from_verdict(&verdict)
                         .expect("a denied verdict yields a CommandPolicyError"),
@@ -1830,7 +1844,14 @@ async fn run_serial_reader(
     let mut buf = [0u8; SERIAL_READ_CHUNK];
     loop {
         match read.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                tracing::debug!("serial socket closed by peer");
+                break;
+            }
+            Err(err) => {
+                tracing::debug!("serial socket read error: {err}");
+                break;
+            }
             Ok(n) => {
                 let mut ring = ring.lock().expect("serial ring mutex poisoned");
                 ring_push_bounded(&mut ring, &buf[..n], cap);
@@ -1854,11 +1875,13 @@ async fn attach_serial_bridge(
             Ok(stream) => break stream,
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(LifecycleError(format!(
+                    let err = LifecycleError(format!(
                         "Failed to connect to the Serial Port socket at {socket_path} within {}ms: \
                          {err}. The socket backend needs QEMU's server chardev to be listening.",
                         SERIAL_DIAL_TIMEOUT.as_millis()
-                    )));
+                    ));
+                    tracing::warn!("{}", err.0);
+                    return Err(err);
                 }
                 sleep(SERIAL_DIAL_INTERVAL).await;
             }
@@ -1871,6 +1894,7 @@ async fn attach_serial_bridge(
         Arc::clone(&ring),
         buffer_bytes as usize,
     ));
+    tracing::debug!("serial bridge attached ({socket_path})");
     Ok(SerialBridge {
         write: Mutex::new(write_half),
         ring,
@@ -1885,6 +1909,7 @@ async fn attach_serial_bridge(
 async fn teardown_serial_bridge(bridge: SerialBridge) {
     bridge.reader.abort();
     let _ = tokio::fs::remove_file(&bridge.socket_path).await;
+    tracing::debug!("serial bridge torn down ({})", bridge.socket_path);
 }
 
 /// The error when a socket-backend serial op finds no attached bridge — no running Instance,
@@ -2195,21 +2220,26 @@ async fn run_recording_loop(
     loop {
         let tick = Instant::now();
         // Capture one frame to the server-chosen path (mirrors `Orchestrator::screendump`).
-        if handle
+        if let Err(err) = handle
             .execute(
                 "screendump",
                 Some(serde_json::json!({ "filename": filename, "format": "png" })),
             )
             .await
-            .is_err()
         {
+            tracing::warn!("recording frame capture failed: {}", err.0);
             break;
         }
         // Read the PNG back and feed it to ffmpeg. A read error is a transient miss (skip the
         // frame); a write error means ffmpeg is gone (stop).
         if let Ok(bytes) = tokio::fs::read(&frame_path).await {
             let mut guard = stdin.lock().await;
-            if guard.write_all(&bytes).await.is_err() || guard.flush().await.is_err() {
+            let written = match guard.write_all(&bytes).await {
+                Ok(()) => guard.flush().await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = written {
+                tracing::warn!("ffmpeg recording stdin error (encoder gone?): {err}");
                 break;
             }
         }
@@ -2253,6 +2283,10 @@ async fn finalize_recording(recording: Recording) -> StopRecordingResult {
         .await
         .is_err()
     {
+        tracing::warn!(
+            "ffmpeg did not finalize within {}ms; killing it",
+            FFMPEG_FINALIZE_TIMEOUT.as_millis()
+        );
         let _ = child.start_kill();
         // R3: bound the post-kill wait too, so teardown never awaits unbounded. `kill_on_drop`
         // (R4) is the final backstop when `child` is dropped after this returns.

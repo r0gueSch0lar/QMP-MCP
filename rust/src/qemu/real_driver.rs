@@ -65,6 +65,9 @@ impl QemuDriver for RealQemuDriver {
         // process the server does not own. `symlink_metadata` does not follow links,
         // so a dangling symlink is caught too.
         if tokio::fs::symlink_metadata(&qmp_socket_path).await.is_ok() {
+            tracing::warn!(
+                "qemu launch refused: the QMP socket path {qmp_socket_path} is already occupied"
+            );
             return Err(DriverError(format!(
                 "The QMP socket path {qmp_socket_path} is already occupied — refusing to start \
                  rather than clobber or adopt a process this server did not launch. Remove the \
@@ -82,7 +85,10 @@ impl QemuDriver for RealQemuDriver {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| DriverError(format!("Failed to spawn {binary}: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!("qemu launch failed: Failed to spawn {binary}: {e}");
+                DriverError(format!("Failed to spawn {binary}: {e}"))
+            })?;
 
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         if let Some(mut stderr) = child.stderr.take() {
@@ -105,6 +111,7 @@ impl QemuDriver for RealQemuDriver {
             Err(err) => {
                 terminate(&mut child).await;
                 let _ = tokio::fs::remove_file(&qmp_socket_path).await;
+                tracing::warn!("qemu launch failed: {err}");
                 return Err(err);
             }
         };
@@ -112,9 +119,11 @@ impl QemuDriver for RealQemuDriver {
             client.close().await;
             terminate(&mut child).await;
             let _ = tokio::fs::remove_file(&qmp_socket_path).await;
-            return Err(DriverError(format!(
+            let err = DriverError(format!(
                 "Failed to negotiate the QMP session with {binary}: {err}"
-            )));
+            ));
+            tracing::warn!("qemu launch failed: {err}");
+            return Err(err);
         }
 
         tracing::info!("QMP session established for {binary}");
@@ -207,6 +216,10 @@ async fn terminate(child: &mut Child) {
         Ok(_) => {} // exited within the grace period
         Err(_) => {
             // Still alive after the grace period: SIGKILL and reap.
+            tracing::warn!(
+                "qemu did not exit within {}ms of SIGTERM; sending SIGKILL",
+                TERMINATE_GRACE.as_millis()
+            );
             let _ = child.kill().await;
         }
     }

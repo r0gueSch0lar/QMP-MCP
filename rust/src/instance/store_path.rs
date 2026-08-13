@@ -128,15 +128,20 @@ pub fn resolve_in_store(
     store_dir: &str,
     labels: &StoreLabels,
 ) -> Result<String, StoreError> {
-    assert_valid_store_name(name, labels)?;
+    if let Err(err) = assert_valid_store_name(name, labels) {
+        tracing::warn!("{store} name rejected: {err}", store = labels.store);
+        return Err(err);
+    }
 
     let real_store = std::fs::canonicalize(store_dir).map_err(|_| {
-        StoreError(format!(
+        let err = StoreError(format!(
             "{store} directory \"{store_dir}\" does not exist or is not accessible. Create it or \
              set {env} to an existing directory.",
             store = labels.store,
             env = labels.env_var
-        ))
+        ));
+        tracing::warn!("{}", err.0);
+        err
     })?;
 
     let candidate: PathBuf = real_store.join(name);
@@ -145,18 +150,22 @@ pub fn resolve_in_store(
     // by construction (single segment under the canonical store path).
     if candidate.symlink_metadata().is_ok() {
         let real = std::fs::canonicalize(&candidate).map_err(|_| {
-            StoreError(format!(
+            let err = StoreError(format!(
                 "{entry} \"{name}\" is a dangling symlink; refusing to follow it out of the {store}.",
                 entry = labels.entry,
                 store = labels.store
-            ))
+            ));
+            tracing::warn!("{}", err.0);
+            err
         })?;
         if real != candidate && !real.starts_with(&real_store) {
-            return Err(StoreError(format!(
+            let err = StoreError(format!(
                 "{entry} \"{name}\" resolves outside the {store} (symlink escape); refusing.",
                 entry = labels.entry,
                 store = labels.store
-            )));
+            ));
+            tracing::warn!("{}", err.0);
+            return Err(err);
         }
     }
 
@@ -190,12 +199,14 @@ pub async fn list_store_files(
     labels: &StoreLabels,
 ) -> Result<Vec<StoreEntry>, StoreError> {
     let missing = || {
-        StoreError(format!(
+        let err = StoreError(format!(
             "{store} directory \"{dir}\" does not exist or is not accessible. Create it or set \
              {env} to an existing directory.",
             store = labels.store,
             env = labels.env_var
-        ))
+        ));
+        tracing::warn!("{}", err.0);
+        err
     };
 
     let mut read_dir = tokio::fs::read_dir(dir).await.map_err(|_| missing())?;
