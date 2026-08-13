@@ -20,6 +20,9 @@ does in a container.
 - **QEMU** on your `PATH` at runtime — the emulator is picked from the spec's `machine`
   (`qemu-system-x86_64`, `qemu-system-aarch64` for ARM/raspi, …; override with
   `QMP_MCP_QEMU_BINARY`), plus `qemu-img`.
+- **ffmpeg** (optional) — only needed for Display recording (`start_recording`); without
+  it the recording tools report themselves unavailable and everything else works. The
+  Docker image bundles it.
 - Builds and runs on **Linux** (x86-64, ARM64) and **macOS** (Intel & Apple Silicon) —
   see [Building for other platforms](#building-for-other-platforms).
 
@@ -78,7 +81,8 @@ The HTTP transport is **fail-closed**: no credentials, no start — unless you s
 ## Docker
 
 The image is a cargo-chef multi-stage build onto a slim `debian:trixie-slim` runtime
-with QEMU, running as a non-root user and defaulting to the HTTP transport bound to all
+with QEMU and ffmpeg (so Display recording works out of the box), running as a non-root
+user and defaulting to the HTTP transport bound to all
 interfaces. Because the viewer assets are embedded in the binary, the runtime image
 copies exactly one file — the compiled server. It's tagged distinctly from the
 TypeScript image so the two never collide:
@@ -189,9 +193,11 @@ and ARM artifacts with the commands above.
 | `reset_instance` / `powerdown_instance` | hard reset / graceful ACPI shutdown |
 | `list_block_devices` / `query_cpus` | the VM's disks / per-CPU info |
 | `screendump` | a PNG screenshot of the display |
+| `start_recording` / `stop_recording` / `get_recording` | record the display to a video file under `QMP_MCP_RECORDING_DIR` / finalize it / the recording capability + encoder settings |
 | `get_events` / `wait_for_event` | recent QEMU events / block until a named one arrives |
 | `qmp_execute` | a raw QMP command, gated by the command policy |
 | `create_image` / `list_images` / `list_isos` | make a disk image / list disks / list boot ISOs |
+| `list_iso_catalog` / `download_iso` / `get_download` | list the OS-image download catalog / fetch one into the ISO Store (gated by `QMP_MCP_ALLOW_DOWNLOAD`) / poll download progress |
 
 ## Configuration
 
@@ -209,6 +215,8 @@ ones you'll reach for:
 | `QMP_MCP_ALLOW_INSECURE` | `false` | run HTTP unauthenticated (local dev only) |
 | `QMP_MCP_QEMU_BINARY` | _(derived from `machine`)_ | usually unset — the emulator is derived from the `machine` (q35→x86_64, virt/raspi*→aarch64, ADR-0013); set it to force one emulator for every Instance |
 | `QMP_MCP_IMAGE_DIR` / `QMP_MCP_ISO_DIR` | XDG paths | the read-write disk folder / read-only ISO folder |
+| `QMP_MCP_ALLOW_DOWNLOAD` | `false` | enable `download_iso` to fetch catalog OS images into the ISO Store (the agent can never enable it) |
+| `QMP_MCP_RECORDING_DIR` | _(unset)_ | enables Display recording: the absolute host root `<name>.mkv` files are written under (unset ⇒ `start_recording` unavailable) |
 | `QMP_MCP_VIEWER_PASSWORD` | _(unset)_ | enables the noVNC viewer (required to request a `vnc` display) |
 | `QMP_MCP_VIEWER_USER` | _(unset)_ | optional username enforced alongside the password on the viewer's HTTP Basic auth (default: username ignored) |
 | `QMP_MCP_HOST_SHARE_DIR` | _(unset)_ | absolute host dir shared into guests via virtio-9p when a spec sets `share: true` (unset ⇒ off; ADR-0014) |
@@ -217,8 +225,9 @@ ones you'll reach for:
 | `QMP_MCP_ALLOW_RAW_ARGS` | `false` | let a spec pass raw QEMU flags (the escape hatch) |
 
 …plus the HTTP host/port/origins, caps on disk/memory/vCPUs, the port-forward range, the
-command-policy allow/deny lists and policy file, and the event-buffer size. See
-`../.env.example` for the whole list.
+download-catalog override, the recording encoder knobs (`QMP_MCP_FFMPEG_BINARY`,
+codec/CRF/max-fps/pixel format), the command-policy allow/deny lists and policy file, and
+the event-buffer size. See `../.env.example` for the whole list.
 
 ## Developing
 
