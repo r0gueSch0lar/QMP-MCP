@@ -87,6 +87,12 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 # version lookup (`../package.json` relative to dist/index.js) resolves correctly.
 COPY --from=build /app/dist ./dist
 
+# The built-in ISO download catalog (ADR-0018). The server reads it at startup from
+# `<pkgroot>/assets/iso-catalog.json` (relative to dist/), so it must ship at /app/assets; the
+# second copy at /usr/local/share is a convenience for operators (the path .env.example shows).
+COPY assets/iso-catalog.json ./assets/iso-catalog.json
+COPY assets/iso-catalog.json /usr/local/share/qmp-mcp/iso-catalog.json
+
 # Container-specific Store paths (ADR-0006/0007). These are supplied via env rather
 # than baked into the code, so the host-agnostic bare-metal defaults are preserved
 # for non-Docker deployments. The directories are created and owned by the non-root

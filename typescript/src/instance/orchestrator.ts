@@ -89,6 +89,7 @@ import {
   resolveSerialSpoolPath,
   SERIAL_CHARDEV_ID,
   SHARE_MOUNT_TAG,
+  serialSocketPath,
   VNC_LOOPBACK_HOST,
   VNC_LOOPBACK_PORT,
 } from './hardware-spec.js';
@@ -103,6 +104,13 @@ import {
   resolveRecordingPath,
   spawnFfmpegSink,
 } from './recording.js';
+import {
+  attachSerialBridge,
+  SERIAL_WRITE_TIMEOUT_MS,
+  type SerialBridge,
+  SerialWriteTimeoutError,
+  teardownSerialBridge,
+} from './serial-bridge.js';
 
 /**
  * The lifecycle states an Instance moves through. `PAUSED` is entered by
@@ -461,6 +469,13 @@ export class Orchestrator {
   #accel?: Accel;
   /** The running noVNC Viewer for a `display: vnc` Instance, if any (ADR-0010). */
   #viewer?: Viewer;
+  /**
+   * The socket-backend Serial Port bridge (ADR-0015): a live UNIX-socket connection to QEMU's
+   * serial `socket` chardev, capturing output into a bounded ring and carrying `write_serial`
+   * input. Present only while a `serial: true` Instance runs under `serialBackend: 'socket'`; torn
+   * down with the Instance. `undefined` for the ringbuf/spool backends.
+   */
+  #serialBridge?: SerialBridge;
   /** Factory that starts the Viewer; the real in-process Viewer by default. */
   #startViewer: (options: ViewerOptions) => Promise<Viewer>;
   /**
@@ -620,6 +635,20 @@ export class Orchestrator {
   }
 
   /**
+   * The attached socket-backend {@link SerialBridge}, or throw when none is attached — no Instance,
+   * or one created without `serial: true` under the socket backend. Mirrors `serial_bridge_missing`.
+   */
+  #serialBridgeOrThrow(): SerialBridge {
+    if (this.#serialBridge === undefined) {
+      throw new LifecycleError(
+        'The Serial Port socket bridge is not attached — create an Instance with serial: true ' +
+          '(backend QMP_MCP_SERIAL_BACKEND=socket) first.',
+      );
+    }
+    return this.#serialBridge;
+  }
+
+  /**
    * Drain the Serial Port's ring buffer via QMP `ringbuf-read`: returns the guest serial
    * output produced since the last read (destructive), up to `maxBytes` (default the full
    * buffer). Rejects when no Instance is running. Mirrors the Rust `read_serial`.
@@ -636,6 +665,13 @@ export class Orchestrator {
       const buf = await readFile(path).catch(() => Buffer.alloc(0));
       const slice = buf.subarray(Math.max(0, buf.length - size));
       const output = format === 'base64' ? slice.toString('base64') : slice.toString('utf8');
+      return { output, format, bytes: output.length };
+    }
+    if (this.#options.serialBackend === 'socket') {
+      // Socket: drain (destructively, like ringbuf) the in-server ring the bridge fills from
+      // QEMU's serial socket — up to `size` bytes from the oldest.
+      const drained = this.#serialBridgeOrThrow().drain(size);
+      const output = format === 'base64' ? drained.toString('base64') : drained.toString('utf8');
       return { output, format, bytes: output.length };
     }
     const value = await process.execute('ringbuf-read', {
@@ -666,6 +702,29 @@ export class Orchestrator {
         'Writing to the Serial Port is disabled. Set QMP_MCP_ALLOW_SERIAL_WRITE=true to enable ' +
           'write_serial (it types raw input into the guest console).',
       );
+    }
+    if (this.#options.serialBackend === 'socket') {
+      // Socket backend: write raw bytes straight onto QEMU's serial socket — a real, connected
+      // serial line, so this input actually reaches the guest console (unlike ringbuf-write).
+      // Decode base64 ourselves; utf8 goes as its raw bytes.
+      this.#requireInstance('write to its Serial Port');
+      const bridge = this.#serialBridgeOrThrow();
+      const raw = format === 'base64' ? Buffer.from(data, 'base64') : Buffer.from(data, 'utf8');
+      try {
+        await bridge.write(raw, SERIAL_WRITE_TIMEOUT_MS);
+      } catch (err) {
+        if (err instanceof SerialWriteTimeoutError) {
+          throw new LifecycleError(
+            `Timed out after ${SERIAL_WRITE_TIMEOUT_MS}ms writing to the Serial Port. The guest is ` +
+              'not draining its serial input — is it paused, has it panicked, or is nothing reading ' +
+              'the console (no getty on the shown console device)?',
+          );
+        }
+        throw new LifecycleError(
+          `Failed to write to the Serial Port socket: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return { bytesWritten: raw.length };
     }
     const process = this.#requireInstance('write to its Serial Port');
     await process.execute('ringbuf-write', { device: SERIAL_CHARDEV_ID, data, format });
@@ -729,6 +788,18 @@ export class Orchestrator {
             'clobber or adopt a process this server did not launch. Remove the stale socket (or stop the ' +
             'other process), then retry.',
         );
+      }
+      // Socket-backend Serial Port (ADR-0015): the server-owned serial.sock must be free too, so a
+      // stale (SIGKILLed qemu) or foreign socket cannot be adopted — mirrors the QMP-socket guard.
+      if (spec.serial && this.#options.serialBackend === 'socket') {
+        const serialPath = serialSocketPath(qmpSocketPath);
+        if (await this.#options.socketOccupied(serialPath)) {
+          throw new LifecycleError(
+            `The Serial Port socket path ${serialPath} is already occupied — refusing to start rather ` +
+              'than adopt a socket this server did not create. Remove the stale socket (or stop the ' +
+              'other process), then retry.',
+          );
+        }
       }
 
       const argv = buildArgv(spec, {
@@ -798,8 +869,42 @@ export class Orchestrator {
         }
       }
 
+      // Socket-backend Serial Port (ADR-0015): dial QEMU's listening serial socket and start
+      // capturing NOW — before the `cont` below — so the guest's boot output is caught from the
+      // first byte. Fail-closed: a bridge that will not connect tears the just-launched qemu (and
+      // Viewer) down rather than leaving a half-wired Instance.
+      let serialBridge: SerialBridge | undefined;
+      if (spec.serial && this.#options.serialBackend === 'socket') {
+        try {
+          serialBridge = await attachSerialBridge(
+            qmpSocketPath,
+            this.#options.serialBufferBytes ?? DEFAULT_SERIAL_BUFFER_BYTES,
+          );
+        } catch (err) {
+          await viewer?.stop().catch(() => undefined);
+          void process.close().catch(() => undefined);
+          // A SIGKILLed qemu would leave serial.sock behind (a clean exit removes it), which the
+          // guard above would then trip on the next create — unlink it on this failure path too.
+          await rm(serialSocketPath(qmpSocketPath), { force: true }).catch(() => undefined);
+          throw err instanceof LifecycleError
+            ? err
+            : new LifecycleError(err instanceof Error ? err.message : String(err));
+        }
+        // A concurrent teardown could have superseded us during the dial awaits; if so, tear down
+        // what we just started rather than clobber the new owner.
+        if (!ownsSlot()) {
+          await teardownSerialBridge(serialBridge);
+          await viewer?.stop().catch(() => undefined);
+          void process.close().catch(() => undefined);
+          throw new LifecycleError(
+            'Instance creation was superseded before it completed; the launched process was torn down.',
+          );
+        }
+      }
+
       this.#process = process;
       this.#viewer = viewer;
+      this.#serialBridge = serialBridge;
       this.#spec = spec;
       this.#accel = resolution.accel;
       // Auto-start (issues #8, #10; default flipped in ADR-0016) decides the lifecycle
@@ -857,8 +962,10 @@ export class Orchestrator {
     // hits the no-Instance guard above instead of double-closing.
     const process = this.#process;
     const viewer = this.#viewer;
+    const serialBridge = this.#serialBridge;
     this.#process = undefined;
     this.#viewer = undefined;
+    this.#serialBridge = undefined;
     this.#spec = undefined;
     this.#accel = undefined;
     this.#launchToken = undefined;
@@ -871,8 +978,12 @@ export class Orchestrator {
     logger.info('destroying Instance');
     try {
       // Stop any active recording FIRST (ADR-0017): abort the frame loop and finalize the
-      // ffmpeg output so nothing leaks a process or a half-written file.
+      // ffmpeg output — while the QMP Session is still up — so nothing leaks a process or a
+      // half-written file.
       await this.#teardownRecording();
+      // Socket-backend Serial Port (ADR-0015): stop the reader and unlink the serial socket
+      // BEFORE qemu goes away, so a SIGKILLed qemu's leftover socket can't block the next create.
+      if (serialBridge) await teardownSerialBridge(serialBridge);
       // Stop the Viewer alongside qemu — its lifetime equals the Instance's (ADR-0010).
       await viewer?.stop().catch(() => undefined);
       await process.close();
@@ -1319,6 +1430,7 @@ export class Orchestrator {
     logger.warning('Instance process exited unexpectedly; resetting state to NONE');
     const process = this.#process;
     const viewer = this.#viewer;
+    const serialBridge = this.#serialBridge;
     // Claim any active recording synchronously alongside the rest of the teardown, then
     // finalize the ffmpeg output off-tick (ADR-0017) so an unexpected qemu exit leaves a
     // valid partial file behind rather than leaking the encoder process.
@@ -1326,6 +1438,7 @@ export class Orchestrator {
     this.#recording = undefined;
     this.#process = undefined;
     this.#viewer = undefined;
+    this.#serialBridge = undefined;
     this.#spec = undefined;
     this.#accel = undefined;
     this.#launchToken = undefined;
@@ -1345,6 +1458,8 @@ export class Orchestrator {
     void process?.close().catch(() => undefined);
     // The Instance is gone: stop its Viewer too (ADR-0010).
     void viewer?.stop().catch(() => undefined);
+    // Tear down the socket-backend Serial Port bridge (stop the reader, unlink the socket).
+    if (serialBridge) void teardownSerialBridge(serialBridge).catch(() => undefined);
   }
 }
 

@@ -1,0 +1,19 @@
+{
+  "description": "Serial Port socket backend (ADR-0015): serial:true with QMP_MCP_SERIAL_BACKEND=socket emits a server-mode UNIX socket chardev (server=on,wait=off so it never blocks boot) at a serial.sock sibling of the managed QMP socket, bound to the machine's first serial port with -serial chardev. The Orchestrator dials it and pumps bytes both ways, so interactive write_serial reaches the guest. The path is server-derived (never agent/operator input). Board-agnostic. TCG.",
+  "spec": { "serial": true },
+  "options": { "accel": "tcg", "serialBackend": "socket" },
+  "expectedArgv": [
+    "-machine", "q35,accel=tcg",
+    "-cpu", "max",
+    "-smp", "1",
+    "-m", "256",
+    "-nodefaults",
+    "-nographic",
+    "-S",
+    "-chardev", "socket,id=serialbuf,path=/run/qmp-mcp/serial.sock,server=on,wait=off",
+    "-serial", "chardev:serialbuf",
+    "-netdev", "user,id=net0",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-qmp", "unix:{{QMP_SOCKET}},server=on,wait=off"
+  ]
+}

@@ -865,12 +865,21 @@ function buildShareArgs(options: ArgvOptions, raspi: boolean, machine: string): 
  * mux. Mirrors the Rust `build_serial_args`.
  */
 function buildSerialArgs(options: ArgvOptions, spec: HardwareSpec): string[] {
-  const chardev =
-    options.serialBackend === 'spool'
-      ? `file,id=${SERIAL_CHARDEV_ID},path=${escapeQemuOptsValue(
-          resolveSerialSpoolPath(options.serialSpoolDir, spec.serialSpool),
-        )}`
-      : `ringbuf,id=${SERIAL_CHARDEV_ID},size=${options.serialBufferBytes}`;
+  let chardev: string;
+  if (options.serialBackend === 'spool') {
+    chardev = `file,id=${SERIAL_CHARDEV_ID},path=${escapeQemuOptsValue(
+      resolveSerialSpoolPath(options.serialSpoolDir, spec.serialSpool),
+    )}`;
+  } else if (options.serialBackend === 'socket') {
+    // A server-owned UNIX socket QEMU listens on (`server=on,wait=off` so it never blocks boot);
+    // the Orchestrator dials it and pumps bytes both ways. The path is derived from the managed
+    // QMP socket dir — never agent/operator input — so it cannot inject an extra chardev property.
+    chardev = `socket,id=${SERIAL_CHARDEV_ID},path=${escapeQemuOptsValue(
+      serialSocketPath(options.qmpSocketPath),
+    )},server=on,wait=off`;
+  } else {
+    chardev = `ringbuf,id=${SERIAL_CHARDEV_ID},size=${options.serialBufferBytes}`;
+  }
   return ['-chardev', chardev, '-serial', `chardev:${SERIAL_CHARDEV_ID}`];
 }
 
@@ -896,6 +905,18 @@ export function resolveSerialSpoolPath(
   }
   parts.push('serial.log');
   return parts.join('/');
+}
+
+/**
+ * The server-owned UNIX socket path for the socket-backend Serial Port (ADR-0015): a `serial.sock`
+ * sibling of the managed QMP socket, so it lives in the same server-owned runtime directory.
+ * Derived purely from the QMP socket path — never agent- or operator-supplied — so it can never
+ * inject an extra chardev property. Used by both the argv generator (the `socket` chardev's
+ * `path=`) and the Orchestrator (which dials it). Mirrors the Rust `serial_socket_path`.
+ */
+export function serialSocketPath(qmpSocketPath: string): string {
+  const idx = qmpSocketPath.lastIndexOf('/');
+  return idx >= 0 ? `${qmpSocketPath.slice(0, idx)}/serial.sock` : 'serial.sock';
 }
 
 /**

@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use qmp_mcp::config::{self, Config, TransportMode};
 use qmp_mcp::http;
+use qmp_mcp::instance::catalog::{self, Catalog};
+use qmp_mcp::instance::download::{DownloadManager, DownloadManagerOptions, ReqwestFetcher};
 use qmp_mcp::instance::hardware_spec::{host_qemu_arch, probe_kvm};
 use qmp_mcp::instance::image_store::{ImageStore, ImageStoreOptions};
 use qmp_mcp::instance::iso_store::IsoStore;
@@ -61,7 +63,18 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(config, command_policy).await {
+    // Load the ISO download catalog (ADR-0018): the built-in embedded list, or the JSON file at
+    // QMP_MCP_ISO_CATALOG when set. Fail closed — with an actionable message naming the variable —
+    // on an unreadable/malformed catalog, rather than starting with a half-loaded download surface.
+    let iso_catalog = match catalog::load_catalog(config.iso_catalog.as_deref()) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match run(config, command_policy, iso_catalog).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("fatal: {err}");
@@ -81,6 +94,7 @@ async fn main() -> ExitCode {
 async fn run(
     config: Config,
     command_policy: ResolvedPolicy,
+    iso_catalog: Catalog,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The single-instance Orchestrator, shared behind an async mutex so concurrent
     // tool calls serialise on the one Instance (ADR-0011). It is wired to the real
@@ -111,7 +125,22 @@ async fn run(
         run: None,
     });
     let iso_store = IsoStore::new(config.iso_dir.clone());
-    let server = QmpMcpServer::new(Arc::clone(&orchestrator), image_store, iso_store);
+
+    // The ISO downloader (ADR-0018): fetches catalog images into the ISO Store on demand, gated by
+    // QMP_MCP_ALLOW_DOWNLOAD. Built once from the validated config + the loaded catalog, with the
+    // real reqwest-backed fetcher; downloading fails closed until the operator enables it.
+    let downloader = DownloadManager::new(DownloadManagerOptions {
+        iso_dir: config.iso_dir.clone(),
+        allow_download: config.allow_download,
+        catalog: iso_catalog,
+        fetcher: Arc::new(ReqwestFetcher::new()),
+    });
+    let server = QmpMcpServer::new(
+        Arc::clone(&orchestrator),
+        image_store,
+        iso_store,
+        downloader,
+    );
 
     // ADR-0005: the only way to serve HTTP without auth is the explicit insecure
     // override, which logs the same cleartext warning as the TS server so an operator
