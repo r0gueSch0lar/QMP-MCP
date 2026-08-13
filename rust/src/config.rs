@@ -31,6 +31,20 @@ pub const DEFAULT_EVENT_BUFFER_SIZE: u32 = 256;
 /// 1 MiB — a power of two large enough for a verbose boot log. Mirrors the TS constant.
 pub const DEFAULT_SERIAL_BUFFER_BYTES: u32 = 1 << 20;
 
+/// Default display-recording video codec (`QMP_MCP_RECORDING_CODEC`, ADR-0017): `libx264`,
+/// the one encoder guaranteed present in every bundled and mainstream distro ffmpeg. Mirrors
+/// the TS constant.
+pub const DEFAULT_RECORDING_CODEC: &str = "libx264";
+/// Default display-recording CRF / constant-quality target (`QMP_MCP_RECORDING_CRF`, ADR-0017):
+/// 22 — visually near-lossless for screen content while keeping files small.
+pub const DEFAULT_RECORDING_CRF: u32 = 22;
+/// Default display-recording max frame rate (`QMP_MCP_RECORDING_MAX_FPS`, ADR-0017): 15 fps —
+/// ample for a `screendump`-loop capture of a mostly-static Guest screen.
+pub const DEFAULT_RECORDING_MAX_FPS: u32 = 15;
+/// Default display-recording pixel format (`QMP_MCP_RECORDING_PIXFMT`, ADR-0017): 8-bit `yuv420p`,
+/// the widely-compatible default.
+pub const DEFAULT_RECORDING_PIXFMT: &str = "yuv420p";
+
 /// Fallback `qemu-system-*` binary: the arch that `machine_arch` degrades an unknown
 /// (or x86) `machine` to, i.e. what `qemu_binary_for_machine` returns for anything not
 /// mapped to ARM. The Orchestrator normally DERIVES the binary from the Instance's
@@ -273,6 +287,24 @@ pub struct Config {
     /// Operator root directory for spool-backend Serial Port logs (`QMP_MCP_SERIAL_SPOOL_DIR`),
     /// or `None`. Required when `serial_backend` is `spool` (validated at load).
     pub serial_spool_dir: Option<String>,
+    /// Resolved `ffmpeg` binary for display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017): the
+    /// explicit override when set, else `ffmpeg` located on `PATH`, or `None` when absent — in
+    /// which case the recording capability is off and `start_recording` fails closed.
+    pub ffmpeg_binary: Option<String>,
+    /// Operator root directory display recordings are written under (`QMP_MCP_RECORDING_DIR`,
+    /// ADR-0017), or `None`. Required for recording; the agent may only name a file under it
+    /// (the spool trust model, ADR-0015). An operator path, never agent-supplied.
+    pub recording_dir: Option<String>,
+    /// Display-recording video codec (`QMP_MCP_RECORDING_CODEC`, ADR-0017; default `libx264`).
+    /// The capability probe verifies it is compiled into the resolved ffmpeg build.
+    pub recording_codec: String,
+    /// Display-recording CRF / constant-quality target (`QMP_MCP_RECORDING_CRF`, ADR-0017; default 22).
+    pub recording_crf: u32,
+    /// Display-recording max frame rate the `screendump` loop is paced to
+    /// (`QMP_MCP_RECORDING_MAX_FPS`, ADR-0017; default 15).
+    pub recording_max_fps: u32,
+    /// Display-recording pixel format (`QMP_MCP_RECORDING_PIXFMT`, ADR-0017; default `yuv420p`).
+    pub recording_pixfmt: String,
     /// When true, a Hardware Spec's `extraArgs` are appended to the argv (ADR-0002).
     pub allow_raw_args: bool,
     /// The password gating the noVNC Viewer (ADR-0010), or `None` when unset.
@@ -399,6 +431,36 @@ fn parse_positive_int(var: &str, raw: Option<&str>, fallback: u32) -> Result<u32
     }
     match value.parse::<u32>() {
         Ok(n) if n >= 1 => Ok(n),
+        _ => Err(err()),
+    }
+}
+
+/// Parse an integer env var constrained to an INCLUSIVE `min..=max` range. Undefined or blank
+/// reads as the fallback; otherwise requires a base-10 integer within range and fails closed with
+/// an actionable message. Unlike [`parse_positive_int`] this admits `min = 0` (e.g. CRF 0 =
+/// lossless). Mirrors the TS `parseIntInRange` (ADR-0017).
+fn parse_int_in_range(
+    var: &str,
+    raw: Option<&str>,
+    min: u32,
+    max: u32,
+    fallback: u32,
+) -> Result<u32, ConfigError> {
+    let value = match raw {
+        None => return Ok(fallback),
+        Some(v) if v.trim().is_empty() => return Ok(fallback),
+        Some(v) => v.trim(),
+    };
+    let err = || {
+        ConfigError(format!(
+            "{var} must be an integer in {min}..{max} (got \"{value}\")."
+        ))
+    };
+    if !is_all_digits(value) {
+        return Err(err());
+    }
+    match value.parse::<u32>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
         _ => Err(err()),
     }
 }
@@ -641,6 +703,96 @@ pub fn resolve_serial_spool_dir(env: &EnvMap) -> Result<Option<String>, ConfigEr
     Ok(Some(value.to_string()))
 }
 
+/// Resolve the `ffmpeg` binary for display recording (`QMP_MCP_FFMPEG_BINARY`, ADR-0017): an
+/// explicit (trimmed, non-blank) override wins; otherwise `ffmpeg` is located on the `PATH`
+/// carried in the env map, returning its absolute path, or `None` when absent (recording is then
+/// unavailable and fails closed). This is the one resolver that consults the filesystem — but only
+/// via the env-supplied `PATH` — so it stays a function of the env map (an empty env yields `None`
+/// deterministically).
+///
+/// An EXPLICIT override is validated with the SAME charset/shape rules as
+/// [`qemu_binary_override`] (and the TS `resolveFfmpegBinary`): a bare command name or an
+/// absolute path over `[A-Za-z0-9._/+-]`, failing closed on whitespace, shell metacharacters,
+/// control characters, or a relative path so a foot-gun never reaches the spawn.
+pub fn resolve_ffmpeg_binary(env: &EnvMap) -> Result<Option<String>, ConfigError> {
+    if let Some(explicit) = trimmed_non_empty(env, "QMP_MCP_FFMPEG_BINARY") {
+        let charset_ok = explicit
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'));
+        let shape_ok = !explicit.contains('/') || explicit.starts_with('/');
+        if !charset_ok || !shape_ok {
+            return Err(ConfigError(format!(
+                "QMP_MCP_FFMPEG_BINARY must be a bare command name or an absolute path over \
+                 [A-Za-z0-9._/+-] (no whitespace, shell metacharacters, or control \
+                 characters) (got \"{explicit}\")."
+            )));
+        }
+        return Ok(Some(explicit.to_string()));
+    }
+    let Some(path) = trimmed_non_empty(env, "PATH") else {
+        return Ok(None);
+    };
+    Ok(std::env::split_paths(path)
+        .map(|dir| dir.join("ffmpeg"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned()))
+}
+
+/// Resolve the display-recording codec / ffmpeg encoder (`QMP_MCP_RECORDING_CODEC`, default
+/// `libx264`, ADR-0017). Restricted to `^[A-Za-z0-9][A-Za-z0-9._+-]*` so the value can never inject
+/// extra ffmpeg arguments; the capability probe separately confirms the encoder is compiled into
+/// the build. Mirrors the TS `resolveRecordingCodec`.
+pub fn resolve_recording_codec(env: &EnvMap) -> Result<String, ConfigError> {
+    let raw = match trimmed_non_empty(env, "QMP_MCP_RECORDING_CODEC") {
+        None => return Ok(DEFAULT_RECORDING_CODEC.to_string()),
+        Some(v) => v,
+    };
+    let mut chars = raw.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    if !ok {
+        return Err(ConfigError(format!(
+            "QMP_MCP_RECORDING_CODEC must match ^[A-Za-z0-9][A-Za-z0-9._+-]* — a single ffmpeg \
+             encoder name such as libx264, libx265, libvpx-vp9, or libsvtav1 (got \"{raw}\")."
+        )));
+    }
+    Ok(raw.to_string())
+}
+
+/// Resolve the display-recording pixel format (`QMP_MCP_RECORDING_PIXFMT`, default `yuv420p`,
+/// ADR-0017). Restricted to `^[A-Za-z0-9]+` (ffmpeg pixel-format tokens such as yuv420p, yuv444p,
+/// rgb24) so the value can never inject extra ffmpeg arguments. Mirrors the TS `resolveRecordingPixfmt`.
+pub fn resolve_recording_pixfmt(env: &EnvMap) -> Result<String, ConfigError> {
+    let raw = match trimmed_non_empty(env, "QMP_MCP_RECORDING_PIXFMT") {
+        None => return Ok(DEFAULT_RECORDING_PIXFMT.to_string()),
+        Some(v) => v,
+    };
+    if !raw.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(ConfigError(format!(
+            "QMP_MCP_RECORDING_PIXFMT must match ^[A-Za-z0-9]+ — an ffmpeg pixel-format token such \
+             as yuv420p, yuv444p, or rgb24 (got \"{raw}\")."
+        )));
+    }
+    Ok(raw.to_string())
+}
+
+/// Resolve `QMP_MCP_RECORDING_DIR` — the operator's absolute root directory display recordings are
+/// written under (ADR-0017). A blank value reads as unset; a relative path is rejected. Mirrors
+/// `resolve_serial_spool_dir` (the same spool trust model), and the TS `resolveRecordingDir`.
+pub fn resolve_recording_dir(env: &EnvMap) -> Result<Option<String>, ConfigError> {
+    let value = match trimmed_non_empty(env, "QMP_MCP_RECORDING_DIR") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if !value.starts_with('/') {
+        return Err(ConfigError(format!(
+            "QMP_MCP_RECORDING_DIR must be an absolute path (got \"{value}\"). It is the host \
+             directory display recordings are written under."
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Build a validated [`Config`] from an environment map. Returns a [`ConfigError`]
 /// on any invalid value, and — per ADR-0005 — when the HTTP transport is selected
 /// without configured auth and without an explicit insecure override.
@@ -796,6 +948,27 @@ pub fn load_config(env: &EnvMap) -> Result<Config, ConfigError> {
         )?,
         serial_backend,
         serial_spool_dir,
+        // Display recording (ADR-0017): the ffmpeg binary is resolved (charset-validated override
+        // or PATH) and the output root validated as an absolute path; codec/pixfmt are
+        // charset-validated and CRF/max-fps are range-checked (CRF 0..=63, max-fps 1..=60).
+        ffmpeg_binary: resolve_ffmpeg_binary(env)?,
+        recording_dir: resolve_recording_dir(env)?,
+        recording_codec: resolve_recording_codec(env)?,
+        recording_crf: parse_int_in_range(
+            "QMP_MCP_RECORDING_CRF",
+            get(env, "QMP_MCP_RECORDING_CRF"),
+            0,
+            63,
+            DEFAULT_RECORDING_CRF,
+        )?,
+        recording_max_fps: parse_int_in_range(
+            "QMP_MCP_RECORDING_MAX_FPS",
+            get(env, "QMP_MCP_RECORDING_MAX_FPS"),
+            1,
+            60,
+            DEFAULT_RECORDING_MAX_FPS,
+        )?,
+        recording_pixfmt: resolve_recording_pixfmt(env)?,
         allow_raw_args: parse_boolean(
             "QMP_MCP_ALLOW_RAW_ARGS",
             get(env, "QMP_MCP_ALLOW_RAW_ARGS"),
@@ -863,6 +1036,12 @@ mod tests {
             allow_serial_write: false,
             serial_backend: SerialBackend::Ringbuf,
             serial_spool_dir: None,
+            ffmpeg_binary: None,
+            recording_dir: None,
+            recording_codec: "libx264".into(),
+            recording_crf: 22,
+            recording_max_fps: 15,
+            recording_pixfmt: "yuv420p".into(),
             allow_raw_args: false,
             viewer_password: None,
             viewer_user: None,
@@ -1443,6 +1622,102 @@ mod tests {
         assert_eq!(c.serial_backend, SerialBackend::Socket);
         assert!(c.serial_backend.is_socket() && !c.serial_backend.is_spool());
         assert_eq!(SerialBackend::Socket.as_str(), "socket");
+    }
+
+    #[test]
+    fn recording_defaults_and_reads() {
+        // ADR-0017: recording is off by default (no ffmpeg override, no output dir), with the
+        // documented codec/CRF/fps/pixfmt defaults.
+        let c = load_config(&env(&[])).unwrap();
+        assert_eq!(c.ffmpeg_binary, None);
+        assert_eq!(c.recording_dir, None);
+        assert_eq!(c.recording_codec, "libx264");
+        assert_eq!(c.recording_crf, 22);
+        assert_eq!(c.recording_max_fps, 15);
+        assert_eq!(c.recording_pixfmt, "yuv420p");
+
+        // An explicit ffmpeg binary override wins over any PATH lookup.
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_FFMPEG_BINARY", " /opt/bin/ffmpeg ")]))
+                .unwrap()
+                .ffmpeg_binary
+                .as_deref(),
+            Some("/opt/bin/ffmpeg")
+        );
+
+        // The output root and format knobs read and override.
+        let c = load_config(&env(&[
+            ("QMP_MCP_RECORDING_DIR", "/var/recordings"),
+            ("QMP_MCP_RECORDING_CODEC", "libx265"),
+            ("QMP_MCP_RECORDING_CRF", "28"),
+            ("QMP_MCP_RECORDING_MAX_FPS", "30"),
+            ("QMP_MCP_RECORDING_PIXFMT", "yuv444p"),
+        ]))
+        .unwrap();
+        assert_eq!(c.recording_dir.as_deref(), Some("/var/recordings"));
+        assert_eq!(c.recording_codec, "libx265");
+        assert_eq!(c.recording_crf, 28);
+        assert_eq!(c.recording_max_fps, 30);
+        assert_eq!(c.recording_pixfmt, "yuv444p");
+    }
+
+    #[test]
+    fn recording_dir_must_be_absolute_and_crf_fps_fail_closed() {
+        // A relative output root fails closed naming the variable (mirrors the spool dir).
+        let e = load_config(&env(&[("QMP_MCP_RECORDING_DIR", "rel/out")])).unwrap_err();
+        assert!(e.0.contains("QMP_MCP_RECORDING_DIR"), "got: {}", e.0);
+
+        // CRF: garbage and out-of-range (64) fail closed; 0 (lossless) is accepted (0..=63).
+        assert!(load_config(&env(&[("QMP_MCP_RECORDING_CRF", "hi")]))
+            .unwrap_err()
+            .0
+            .contains("QMP_MCP_RECORDING_CRF"));
+        assert!(load_config(&env(&[("QMP_MCP_RECORDING_CRF", "64")]))
+            .unwrap_err()
+            .0
+            .contains("QMP_MCP_RECORDING_CRF"));
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_RECORDING_CRF", "0")]))
+                .unwrap()
+                .recording_crf,
+            0
+        );
+
+        // MAX_FPS: 0 and 61 are out of the inclusive 1..=60 range; 60 is accepted.
+        assert!(load_config(&env(&[("QMP_MCP_RECORDING_MAX_FPS", "0")]))
+            .unwrap_err()
+            .0
+            .contains("QMP_MCP_RECORDING_MAX_FPS"));
+        assert!(load_config(&env(&[("QMP_MCP_RECORDING_MAX_FPS", "61")]))
+            .unwrap_err()
+            .0
+            .contains("QMP_MCP_RECORDING_MAX_FPS"));
+        assert_eq!(
+            load_config(&env(&[("QMP_MCP_RECORDING_MAX_FPS", "60")]))
+                .unwrap()
+                .recording_max_fps,
+            60
+        );
+
+        // Codec / pixfmt / ffmpeg-binary charset validation (parity with the TS resolvers).
+        assert!(
+            load_config(&env(&[("QMP_MCP_RECORDING_CODEC", "libx264; rm")]))
+                .unwrap_err()
+                .0
+                .contains("QMP_MCP_RECORDING_CODEC")
+        );
+        assert!(
+            load_config(&env(&[("QMP_MCP_RECORDING_PIXFMT", "yuv420p!")]))
+                .unwrap_err()
+                .0
+                .contains("QMP_MCP_RECORDING_PIXFMT")
+        );
+        assert!(
+            load_config(&env(&[("QMP_MCP_FFMPEG_BINARY", "ff mpeg; rm -rf /")]))
+                .unwrap_err()
+                .0
+                .contains("QMP_MCP_FFMPEG_BINARY")
+        );
     }
 
     #[test]

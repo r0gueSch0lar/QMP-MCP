@@ -1,0 +1,26 @@
+{
+  "description": "libvpx-vp9 at CRF 0 (lossless is allowed) and maxFps 60 (the pacing-cap upper bound); maxFps never leaks into argv.",
+  "codec": "libvpx-vp9",
+  "crf": 0,
+  "maxFps": 60,
+  "pixfmt": "yuv420p",
+  "out": "/rec/lossless.mkv",
+  "expectedArgv": [
+    "-f",
+    "image2pipe",
+    "-use_wallclock_as_timestamps",
+    "1",
+    "-i",
+    "pipe:0",
+    "-c:v",
+    "libvpx-vp9",
+    "-crf",
+    "0",
+    "-pix_fmt",
+    "yuv420p",
+    "-fps_mode",
+    "vfr",
+    "-y",
+    "/rec/lossless.mkv"
+  ]
+}

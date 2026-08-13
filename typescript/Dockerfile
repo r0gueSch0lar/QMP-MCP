@@ -16,6 +16,11 @@
 FROM node:22-trixie-slim AS build
 WORKDIR /app
 
+# With PNPM_HOME set, pnpm's content-addressable store defaults to $PNPM_HOME/store,
+# which the BuildKit cache mounts below persist across builds (pnpm.io/docker).
+ENV PNPM_HOME="/pnpm" \
+    PATH="/pnpm:$PATH"
+
 # Activate pnpm via corepack, pinned by the `packageManager` field in package.json.
 RUN corepack enable
 
@@ -23,8 +28,12 @@ RUN corepack enable
 # reproducible build. Copy only the manifests first so this layer caches until the
 # dependency set actually changes. pnpm-workspace.yaml carries the `allowBuilds`
 # opt-in without which pnpm's pre-script deps check fails on esbuild's build script.
+# Cache mounts: the pnpm store (packages hard-link out of it into node_modules) and
+# corepack's cache (the pnpm distribution itself, fetched on first invocation).
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    --mount=type=cache,id=corepack,target=/root/.cache/node/corepack \
+    pnpm install --frozen-lockfile
 
 # Compile the server (tsc -> dist/). Only the inputs the build needs are copied.
 COPY tsconfig.json ./
@@ -41,15 +50,27 @@ FROM node:22-trixie-slim AS runtime
 # `qemu-system` metapackage ships every qemu-system-* (arm/aarch64, x86, ppc, mips,
 # sparc, riscv/s390x, ...) so QMP_MCP_QEMU_BINARY can select any guest architecture
 # the Hardware Spec supports — e.g. `qemu-system-aarch64` for the raspi* boards.
-# There is no official QEMU image (ADR-0007). Clean the apt lists in the same layer.
-RUN apt-get update \
+# There is no official QEMU image (ADR-0007). The .deb downloads and index lists
+# live in BuildKit cache mounts (sharing=locked serializes dpkg across concurrent
+# builds), so nothing needs cleaning out of the layer and repeat builds skip the
+# downloads. Debian's stock docker-clean hook would delete the cached .debs, so it
+# is disabled first.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
   && apt-get install -y --no-install-recommends \
        qemu-system \
        qemu-utils \
-  && rm -rf /var/lib/apt/lists/*
+       ffmpeg
 
 ENV NODE_ENV=production
 WORKDIR /app
+
+# Same store setup as the build stage so both installs share one pnpm store cache.
+ENV PNPM_HOME="/pnpm" \
+    PATH="/pnpm:$PATH"
 
 # Activate pnpm via corepack (pinned by the `packageManager` field), matching the
 # build stage's toolchain.
@@ -58,7 +79,9 @@ RUN corepack enable
 # Production dependencies ONLY — the dev toolchain (tsc, vitest, biome) never ships
 # in the runtime image. The lockfile pins the same versions resolved at build time.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --prod --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    --mount=type=cache,id=corepack,target=/root/.cache/node/corepack \
+    pnpm install --prod --frozen-lockfile
 
 # The compiled server. package.json is already present above, so the runtime
 # version lookup (`../package.json` relative to dist/index.js) resolves correctly.
